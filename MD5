@@ -1,0 +1,16 @@
+1cbba86513106abfdf405427e16c80ea *DESCRIPTION
+818b337764f6af7d89554fd3d976c05e *LICENSE
+16daf4be71f266564ecd444df3ebe93b *NAMESPACE
+a5cc0286b3024ece48e3a99abdb4acb0 *NEWS.md
+954cad6f0cd0414a921186eebb4b4cdc *R/fabricQueryR-package.R
+f99b599d8d0344962750308f3a092dc4 *R/fabric_onelake_read_delta_table.R
+74b53701cbf21597461efcdbaaf383cf *R/fabric_pbi_dax_query.R
+dcdf0fcd88d1c1d9051cad4d8d3125d8 *R/fabric_sql_connect.R
+1c3ca97a0c302b659d69a08696d6db7f *README.md
+f397934c193d5107ae1ebdd67f47e112 *man/fabricQueryR-package.Rd
+da5d45bdc36e21d19dd15dddf23725b8 *man/fabric_onelake_read_delta_table.Rd
+7fd2113d4a010dbc27b05c60292e9ec2 *man/fabric_pbi_dax_query.Rd
+b5ce69a274fd8e6e7f749872d007f3a0 *man/fabric_sql_connect.Rd
+416b7ba9980372106221cb731c754859 *man/fabric_sql_query.Rd
+de29bde3d2a9ffb337cf0f458bfd7b8c *tests/testthat.R
+6cfb0bc726793b5b566440ae4157b7d4 *tests/testthat/test-fabric_pbi_dax_query.R
