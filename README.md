@@ -6,10 +6,12 @@
 <!-- badges: start -->
 
 [![R-CMD-check](https://github.com/kennispunttwente/fabricQueryR/actions/workflows/R-CMD-check.yaml/badge.svg)](https://github.com/kennispunttwente/fabricQueryR/actions/workflows/R-CMD-check.yaml)
+[![CRAN
+status](https://www.r-pkg.org/badges/version/fabricQueryR)](https://CRAN.R-project.org/package=fabricQueryR)
 <!-- badges: end -->
 
 ‘fabricQueryR’ is an R package which helps you to query data from
-Microsoft Fabric in R. It comes with three methods which help you to get
+Microsoft Fabric in R. It comes with four methods which help you to get
 your Microsoft Fabric data into R:
 
 1.  Create a connection to a SQL endpoint (e.g., from a `Lakehouse` or
@@ -27,6 +29,10 @@ your Microsoft Fabric data into R:
     underlying Parquet files from the Delta table stored in OneLake
     (ADLS Gen2) and returns the data as a ‘tibble’ dataframe.
 
+4.  Execute a Livy API query: `fabric_livy_query()`. With this, you can
+    remotely execute Spark/Spark SQL/SparkR/PySpark code in Microsoft
+    Fabric and get a list with the results in your local R session.
+
 ## Installation
 
 You can install the development version of ‘fabricQueryR’ like so:
@@ -39,7 +45,7 @@ if (!requireNamespace("remotes", quietly = TRUE)) {
 remotes::install_github("kennispunttwente/fabricQueryR")
 ```
 
-Or, install the latest version from CRAN (once available):
+Or, install the latest release from CRAN:
 
 ``` r
 install.packages("fabricQueryR")
@@ -51,7 +57,7 @@ See the
 [reference](https://kennispunttwente.github.io/fabricQueryR/reference/index.html)
 for the full documentation of all functions.
 
-Below is a code snippet showing how to use the three methods to get data
+Below is a code snippet showing how to use the four methods to get data
 from Fabric into R:
 
 ``` r
@@ -62,13 +68,15 @@ from Fabric into R:
 # The AzureAuth package is used to acquire tokens; you may be redirected
 #   to a browser window to sign in the first time
 
+library(fabricQueryR)
+
 # Sys.setenv(FABRICQUERYR_TENANT_ID = "...")
 # Sys.setenv(FABRICQUERYR_CLIENT_ID = "...")
 
 # SQL connection to Data Warehouse or Lakehouse --------------------------------
 
 # Find your SQL connection string in Fabric by going to a Lakehouse or Data
-#   Warehouse item; then Settings -> SQL analytics endpoint
+#   Warehouse item, then go to 'Settings' -> 'SQL analytics endpoint'
 # Ensure that the account/principal you authenticate with has access to
 #   the workspace 
 
@@ -111,6 +119,8 @@ df_onelake <- fabric_onelake_read_delta_table(
 
 # DAX query against Semantic Model ---------------------------------------------
 
+# Find your connection string in Fabric by going to a 'Semantic Model' item,
+#   then go to 'File' -> 'Settings' -> 'Server settings'
 # Ensure that the account you use to authenticate has access to the workspace,
 #   or that you have been granted 'Build' permissions on the dataset (via share)
 
@@ -121,6 +131,22 @@ df_dax <- fabric_pbi_dax_query(
   ),
   dax = "EVALUATE TOPN(100000, 'Sheet1')"
 )
+
+
+# Livy API query to execute Spark code -----------------------------------------
+
+# Find your connection string in Fabric by going to a 'Lakehouse' item,
+#   then go to 'Settings' -> 'Livy Endpoint' -> 'Session job connection string'
+# Ensure that the account you use to authenticate has access to the workspace
+
+# Run a Livy SparkR query
+livy_sparkr_result <- fabric_livy_query(
+  livy_url = "https://api.fabric.microsoft.com/v1/workspaces/.../lakehouses/.../livyapi/..."
+  kind = "sparkr",
+  code = "print(1+2)"
+)
+
+# (See example in `?fabric_livy_query` for how to get data from the Lakehouse to R with Spark)
 ```
 
 ## Background
@@ -132,7 +158,7 @@ integrates with Power BI for analytics and reporting. Microsoft is
 actively promoting Fabric as the next-generation data platform for
 organizations using Microsoft Azure and Power BI.
 
-As my organization started working with Microsoft Fabric, I found that
+As our organization started working with Microsoft Fabric, I found that
 that loading data into R from Fabric was not yet straightforward, and
 took some effort to get working. To help others in the same situation, I
 decided to share the functions I created to make this easier.
