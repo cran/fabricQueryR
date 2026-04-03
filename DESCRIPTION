@@ -1,11 +1,11 @@
 Package: fabricQueryR
 Title: Query Data in 'Microsoft Fabric'
-Version: 0.2.0
+Version: 0.2.1
 Authors@R: 
     c(person(given = "Luka",
              family = "Koning",
              role = c("aut", "cre", "cph"),
-             email = "l.koning@kennispunttwente.nl"),
+             email = "koningluka@gmail.com"),
       person(given = "Kennispunt Twente",
              role = "fnd",
              email = "info@kennispunttwente.nl"))
@@ -19,7 +19,7 @@ License: MIT + file LICENSE
 Suggests: AzureStor, DBI, odbc, readr, fs, arrow, testthat (>= 3.0.0)
 Config/testthat/edition: 3
 Encoding: UTF-8
-RoxygenNote: 7.3.2
+RoxygenNote: 7.3.3
 Imports: AzureAuth, httr2, dplyr, tibble, purrr, stringr, jsonlite,
         cli, rlang, utils
 URL: https://github.com/kennispunttwente/fabricQueryR,
@@ -27,9 +27,9 @@ URL: https://github.com/kennispunttwente/fabricQueryR,
 BugReports: https://github.com/kennispunttwente/fabricQueryR/issues
 Depends: R (>= 4.1.0)
 NeedsCompilation: no
-Packaged: 2025-09-15 13:05:08 UTC; dhrko
+Packaged: 2026-04-03 17:11:16 UTC; dhrko
 Author: Luka Koning [aut, cre, cph],
   Kennispunt Twente [fnd]
-Maintainer: Luka Koning <l.koning@kennispunttwente.nl>
+Maintainer: Luka Koning <koningluka@gmail.com>
 Repository: CRAN
-Date/Publication: 2025-09-15 13:20:02 UTC
+Date/Publication: 2026-04-03 21:50:20 UTC
