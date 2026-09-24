@@ -1,0 +1,813 @@
+test_that("fabric_function_invoke sends scalar and structured parameters", {
+  captured <- NULL
+  audiences <- character()
+  httr2::local_mocked_responses(function(req) {
+    captured <<- req
+    function_test_response(
+      function_success_body(
+        output = list(
+          text = "Ada",
+          values = list(2L, 3L),
+          metadata = list(active = TRUE)
+        )
+      ),
+      url = req$url
+    )
+  })
+
+  result <- fabric_function_invoke(
+    function_test_url,
+    parameters = list(
+      text = "Ada",
+      count = 2L,
+      values = I(c(2L, 3L)),
+      metadata = list(active = TRUE, note = NULL)
+    ),
+    timeout = 17,
+    token = function(audience, force_refresh = FALSE) {
+      audiences <<- c(audiences, audience)
+      "function-token"
+    }
+  )
+
+  expect_s3_class(result, "fabric_function_result")
+  expect_identical(result$function_name, "echoInput")
+  expect_identical(
+    result$invocation_id,
+    "c63f7f60-1ce4-4b30-9694-dcdcec871bba"
+  )
+  expect_identical(result$status, "Succeeded")
+  expect_equal(result$output$metadata$active, TRUE)
+  expect_length(result$errors, 0L)
+  expect_identical(result$http_status, 200L)
+  expect_identical(result$response$functionName, "echoInput")
+  expect_identical(
+    audiences,
+    .fabric_audience$user_data_function
+  )
+  expect_equal(captured$options$timeout_ms, 17000)
+  expect_identical(captured$headers$accept, "application/json")
+  expect_identical(captured$body$content_type, "application/json")
+
+  request_body <- jsonlite::fromJSON(
+    rawToChar(captured$body$data),
+    simplifyVector = FALSE
+  )
+  expect_identical(request_body$text, "Ada")
+  expect_identical(request_body$count, 2L)
+  expect_equal(unlist(request_body$values), c(2L, 3L))
+  expect_true(request_body$metadata$active)
+  expect_null(request_body$metadata$note)
+})
+
+test_that("function parameters support empty, named-vector, and data-frame objects", {
+  expect_identical(function_serialize_parameters(list()), "{}")
+  expect_identical(
+    function_serialize_parameters(c(first = 1L, second = 2L)),
+    '{"first":1,"second":2}'
+  )
+  expect_identical(
+    function_serialize_parameters(data.frame(
+      id = 1:2,
+      label = c("a", "b")
+    )),
+    '{"id":[1,2],"label":["a","b"]}'
+  )
+})
+
+test_that("function invocation rejects implicit datetime conversion before auth", {
+  stamp <- as.POSIXct("2026-09-14 12:34:56", tz = "Europe/Amsterdam") + 0.123456
+  for (value in list(
+    list(eventTime = stamp),
+    list(eventTime = as.POSIXlt(stamp)),
+    list(payload = list(events = list(stamp))),
+    list(events = data.frame(eventTime = stamp)),
+    data.frame(eventTime = stamp),
+    stats::setNames(stamp, "eventTime")
+  )) {
+    error <- rlang::catch_cnd(fabric_function_invoke(
+      function_test_url,
+      parameters = value,
+      token = function(...) stop("Authentication must not be attempted")
+    ))
+    expect_s3_class(error, "fabric_function_parameters_error")
+    expect_match(conditionMessage(error), "ISO 8601 strings", fixed = TRUE)
+  }
+})
+
+test_that("function invocation preserves explicit datetime strings", {
+  stamp <- "2026-09-14T12:34:56.123456+02:00"
+  captured <- NULL
+  httr2::local_mocked_responses(function(req) {
+    captured <<- jsonlite::fromJSON(rawToChar(req$body$data))
+    function_test_response(function_success_body(), url = req$url)
+  })
+  fabric_function_invoke(
+    function_test_url,
+    parameters = list(
+      eventTime = stamp,
+      events = data.frame(eventTime = stamp)
+    ),
+    token = "token"
+  )
+  expect_identical(captured$eventTime, stamp)
+  expect_identical(captured$events$eventTime, stamp)
+})
+
+test_that("function parameters preserve finite doubles across their full range", {
+  values <- c(
+    pi,
+    1 / 3,
+    0.1,
+    1.2345678901234567,
+    1 - .Machine$double.eps / 2,
+    1 + .Machine$double.eps,
+    2^53 - 1,
+    2^53,
+    2^53 + 2,
+    .Machine$double.xmin,
+    .Machine$double.xmax,
+    .Machine$double.xmin * .Machine$double.eps,
+    1e-100,
+    1e100,
+    0
+  )
+  values <- c(values, -values)
+  encoded <- function_serialize_parameters(list(values = values))
+  decoded <- jsonlite::fromJSON(encoded)
+
+  expect_identical(as.double(decoded$values), values)
+  for (value in values) {
+    scalar <- jsonlite::fromJSON(function_serialize_parameters(list(
+      value = value
+    )))
+    expect_identical(as.double(scalar$value), value)
+  }
+})
+
+test_that("function parameters preserve sampled doubles without display rounding", {
+  withr::local_seed(42)
+  withr::local_options(digits = 3, scipen = 999, OutDec = ",")
+  values <- stats::runif(1000, -1, 1) * 10^stats::runif(1000, -300, 300)
+
+  encoded <- function_serialize_parameters(list(values = values))
+
+  expect_identical(jsonlite::fromJSON(encoded)$values, values)
+})
+
+test_that("function request JSON preserves recursive negative zero", {
+  negative_zero <- -0
+  captured <- NULL
+  httr2::local_mocked_responses(function(req) {
+    captured <<- rawToChar(req$body$data)
+    function_test_response(function_success_body(), url = req$url)
+  })
+
+  fabric_function_invoke(
+    function_test_url,
+    parameters = list(
+      negativeZero = negative_zero,
+      nested = list(values = c(0, negative_zero)),
+      text = "-0"
+    ),
+    token = "token"
+  )
+
+  expect_match(captured, '"negativeZero":-0.0', fixed = TRUE)
+  expect_match(captured, '"values":[0,-0.0]', fixed = TRUE)
+  expect_match(captured, '"text":"-0"', fixed = TRUE)
+})
+
+test_that("function numeric parameters retain precision in nested and tabular objects", {
+  values <- c(pi, 1 / 3, 1 + .Machine$double.eps)
+  parameters <- list(
+    scalar = pi,
+    array = I(pi),
+    nested = list(rows = list(list(value = pi), list(value = 1 / 3))),
+    frame = data.frame(value = values),
+    matrix = matrix(values, nrow = 1)
+  )
+  decoded <- jsonlite::fromJSON(
+    function_serialize_parameters(parameters),
+    simplifyVector = FALSE
+  )
+
+  expect_identical(decoded$scalar, pi)
+  expect_identical(decoded$array, list(pi))
+  expect_identical(decoded$nested$rows, parameters$nested$rows)
+  expect_identical(decoded$frame$value, as.list(values))
+  expect_identical(decoded$matrix, list(as.list(values)))
+  expect_identical(
+    jsonlite::fromJSON(function_serialize_parameters(c(
+      first = pi,
+      second = 1 / 3
+    ))),
+    list(first = pi, second = 1 / 3)
+  )
+})
+
+test_that("function precision handling retains exact integer and decimal inputs", {
+  identifiers <- bit64::as.integer64(c(
+    "9007199254740993",
+    "9223372036854775807",
+    "-9223372036854775807"
+  ))
+  decimal <- "12345678901234567890.123456789012345"
+  encoded <- function_serialize_parameters(list(
+    identifiers = identifiers,
+    decimal = decimal,
+    missing = c(NA_real_, NaN, Inf, -Inf),
+    nullable = c(pi, NA_real_)
+  ))
+  decoded <- jsonlite::fromJSON(encoded, bigint_as_char = TRUE)
+
+  expect_identical(decoded$identifiers, as.character(identifiers))
+  expect_identical(decoded$decimal, decimal)
+  expect_identical(decoded$missing, rep(NA, 4))
+  expect_identical(decoded$nullable, c(pi, NA_real_))
+})
+
+test_that("function invocation sends precise numeric JSON through the public API", {
+  captured <- NULL
+  httr2::local_mocked_responses(function(req) {
+    captured <<- jsonlite::fromJSON(rawToChar(req$body$data))
+    function_test_response(function_success_body(), url = req$url)
+  })
+  values <- c(pi, 1 / 3, .Machine$double.xmin, .Machine$double.xmax)
+
+  fabric_function_invoke(
+    function_test_url,
+    parameters = list(scalar = pi, values = values),
+    token = "function-token"
+  )
+
+  expect_identical(captured$scalar, pi)
+  expect_identical(captured$values, values)
+})
+
+test_that("function parameters enforce Fabric camelCase naming", {
+  expect_identical(
+    function_serialize_parameters(list(orderId = 1L, line2Value = "ok")),
+    '{"orderId":1,"line2Value":"ok"}'
+  )
+
+  invalid_names <- c(
+    "snake_case",
+    "PascalCase",
+    "2value",
+    "class",
+    "for",
+    "req",
+    "context",
+    "reqInvocationId"
+  )
+  for (parameter_name in invalid_names) {
+    error <- rlang::catch_cnd(function_serialize_parameters(
+      stats::setNames(list(1L), parameter_name)
+    ))
+    expect_s3_class(error, "fabric_function_parameters_error")
+    expect_identical(error$invalid_parameter_names, parameter_name)
+  }
+})
+
+test_that("public function URLs enforce the documented trusted route", {
+  expect_identical(function_validate_url(function_test_url), function_test_url)
+  expect_identical(
+    function_validate_url(paste0(function_test_url, "/")),
+    function_test_url
+  )
+  expect_identical(
+    function_validate_url(
+      sub(
+        "api.fabric.microsoft.com",
+        "trusted.example",
+        function_test_url,
+        fixed = TRUE
+      )
+    ),
+    sub(
+      "api.fabric.microsoft.com",
+      "trusted.example",
+      function_test_url,
+      fixed = TRUE
+    )
+  )
+
+  expect_error(
+    function_validate_url(sub(
+      "https",
+      "http",
+      function_test_url,
+      fixed = TRUE
+    )),
+    "valid HTTPS",
+    fixed = TRUE
+  )
+  expect_identical(
+    function_validate_url(sub(
+      "api.fabric.microsoft.com",
+      "api.fabric.microsoft.com.attacker.example",
+      function_test_url,
+      fixed = TRUE
+    )),
+    sub(
+      "api.fabric.microsoft.com",
+      "api.fabric.microsoft.com.attacker.example",
+      function_test_url,
+      fixed = TRUE
+    )
+  )
+  expect_error(
+    function_validate_url(paste0(function_test_url, "?token=secret")),
+    "valid HTTPS",
+    fixed = TRUE
+  )
+  expect_error(
+    function_validate_url(sub("/invoke", "/status", function_test_url)),
+    "documented public function invocation route",
+    fixed = TRUE
+  )
+  expect_error(
+    function_validate_url(sub("echoInput", "echo%2Finput", function_test_url)),
+    "documented public function invocation route",
+    fixed = TRUE
+  )
+  expect_error(
+    fabric_function_invoke(
+      list(
+        id = "5b218778-e7a5-4d73-8187-f10824047715",
+        type = "UserDataFunction"
+      ),
+      token = "token"
+    ),
+    "function_url must be one non-empty string",
+    fixed = TRUE
+  )
+})
+
+test_that("custom function hosts require an explicit credential", {
+  custom_url <- sub(
+    "api.fabric.microsoft.com",
+    "functions.example",
+    function_test_url,
+    fixed = TRUE
+  )
+
+  error <- rlang::catch_cnd(fabric_function_invoke(custom_url))
+
+  expect_s3_class(error, "fabric_custom_endpoint_requires_token")
+  expect_identical(error$endpoint_host, "functions.example")
+  expect_identical(error$argument, "function_url")
+})
+
+test_that("function envelopes retain explicit null output", {
+  body <- list(
+    functionName = "raiseValidation",
+    invocationId = "invocation-id",
+    status = "Failed",
+    output = NULL,
+    errors = list(list(name = "UserThrown", message = "Invalid value"))
+  )
+  result <- function_parse_response(function_test_response(body, status = 422L))
+  expect_named(result$response, names(body))
+  expect_identical(function_is_result_envelope(result$response), TRUE)
+  expect_null(result$output)
+  expect_identical(
+    jsonlite::fromJSON(jsonlite::toJSON(result$response, null = "null"))$output,
+    NULL
+  )
+})
+
+test_that("function execution failures remain inspectable results", {
+  responses <- list(
+    function_test_response(
+      list(
+        functionName = "echoInput",
+        invocationId = "disabled-id",
+        status = "BadRequest",
+        output = NULL,
+        errors = list(list(
+          name = "PublicAccessDisabled",
+          message = "Public access is disabled",
+          properties = list(setting = "isPublicEndpointEnabled")
+        ))
+      ),
+      status = 400L
+    ),
+    function_test_response(
+      list(
+        functionName = "raiseValidation",
+        invocationId = "user-error-id",
+        status = "Failed",
+        output = NULL,
+        errors = list(list(
+          errorCode = "UserThrown",
+          message = "Value is invalid",
+          properties = list(value = -1L)
+        ))
+      ),
+      status = 422L
+    ),
+    function_test_response(
+      list(
+        functionName = "slowFunction",
+        invocationId = "timeout-id",
+        status = "Timeout",
+        output = NULL,
+        errors = list(list(
+          name = "FunctionTimeout",
+          message = "Execution exceeded the public endpoint limit"
+        ))
+      ),
+      status = 408L
+    ),
+    function_test_response(
+      list(
+        functionName = "largeFunction",
+        invocationId = "large-id",
+        status = "ResponseTooLarge",
+        output = NULL,
+        errors = list(list(
+          name = "ResponseTooLarge",
+          message = "The return value exceeded the service limit"
+        ))
+      ),
+      status = 403L
+    )
+  )
+  index <- 0L
+  httr2::local_mocked_responses(function(req) {
+    index <<- index + 1L
+    responses[[index]]
+  })
+
+  disabled <- fabric_function_invoke(function_test_url, token = "token")
+  user_error <- fabric_function_invoke(function_test_url, token = "token")
+  timed_out <- fabric_function_invoke(function_test_url, token = "token")
+  too_large <- fabric_function_invoke(function_test_url, token = "token")
+
+  expect_identical(disabled$status, "BadRequest")
+  expect_identical(disabled$http_status, 400L)
+  expect_identical(disabled$errors[[1L]]$name, "PublicAccessDisabled")
+  expect_identical(user_error$status, "Failed")
+  expect_identical(user_error$http_status, 422L)
+  expect_identical(user_error$errors[[1L]]$name, "UserThrown")
+  expect_identical(user_error$errors[[1L]]$errorCode, "UserThrown")
+  expect_equal(user_error$errors[[1L]]$properties$value, -1L)
+  expect_identical(timed_out$status, "Timeout")
+  expect_identical(timed_out$http_status, 408L)
+  expect_identical(too_large$status, "ResponseTooLarge")
+  expect_identical(too_large$http_status, 403L)
+})
+
+test_that("function responses preserve future fields and exact large integers", {
+  local_mocked_bindings(
+    .httr2_perform = function(req, ...) {
+      function_test_response(charToRaw(paste0(
+        '{"functionName":"futureFunction",',
+        '"invocationId":"future-id","status":"FutureStatus",',
+        '"output":{"identifier":9007199254740993,',
+        '"uint64":[18446744073709551615,18446744073709551614]},',
+        '"errors":[{"errorCode":"FutureError"}],',
+        '"future":{"mode":"new"}}'
+      )))
+    }
+  )
+
+  result <- fabric_function_invoke(function_test_url, token = "token")
+
+  expect_identical(result$status, "FutureStatus")
+  expect_identical(result$output$identifier, "9007199254740993")
+  expect_identical(
+    unlist(result$output$uint64, use.names = FALSE),
+    c("18446744073709551615", "18446744073709551614")
+  )
+  expect_identical(result$response$output, result$output)
+  expect_identical(result$errors[[1L]]$name, "FutureError")
+  expect_identical(result$response$future$mode, "new")
+})
+
+test_that("function retries require an explicit idempotency decision", {
+  calls <- 0L
+  httr2::local_mocked_responses(function(req) {
+    calls <<- calls + 1L
+    function_test_response(
+      list(errorCode = "TooManyRequests", message = "try later"),
+      status = 429L,
+      headers = list("retry-after" = "0")
+    )
+  })
+  expect_error(
+    fabric_function_invoke(function_test_url, token = "token"),
+    class = "fabric_http_error"
+  )
+  expect_identical(calls, 1L)
+
+  calls <- 0L
+  httr2::local_mocked_responses(function(req) {
+    calls <<- calls + 1L
+    if (calls == 1L) {
+      return(function_test_response(
+        list(errorCode = "TooManyRequests", message = "try later"),
+        status = 429L,
+        headers = list("retry-after" = "0")
+      ))
+    }
+    function_test_response(function_success_body(), url = req$url)
+  })
+
+  result <- fabric_function_invoke(
+    function_test_url,
+    token = "token",
+    idempotent = TRUE
+  )
+  expect_identical(calls, 2L)
+  expect_identical(result$status, "Succeeded")
+})
+
+test_that("function response limits check headers and actual body bytes", {
+  httr2::local_mocked_responses(function(req) {
+    function_test_response(
+      function_success_body(),
+      headers = list("content-length" = "1000")
+    )
+  })
+  header_error <- expect_error(
+    fabric_function_invoke(
+      function_test_url,
+      token = "token",
+      max_response_bytes = 100
+    ),
+    class = "fabric_function_response_too_large"
+  )
+  expect_identical(header_error$response_bytes, 1000)
+  expect_identical(header_error$max_response_bytes, 100)
+
+  httr2::local_mocked_responses(function(req) {
+    function_test_response(function_success_body(output = strrep("x", 200)))
+  })
+  body_error <- expect_error(
+    fabric_function_invoke(
+      function_test_url,
+      token = "token",
+      max_response_bytes = 100
+    ),
+    class = "fabric_function_response_too_large"
+  )
+  expect_gt(body_error$response_bytes, 100)
+})
+
+test_that("function response size is bounded during transport", {
+  request <- NULL
+  curl_error <- structure(
+    list(
+      message = "La taille maximale du fichier a ete depassee",
+      call = NULL
+    ),
+    class = c(
+      "curl_error_filesize_exceeded",
+      "curl_error",
+      "error",
+      "condition"
+    )
+  )
+  transport_error <- rlang::error_cnd(
+    class = "httr2_failure",
+    message = "La requete HTTP a echoue",
+    parent = curl_error,
+    request = list(authorization = "synthetic-private-request-token")
+  )
+  local_mocked_bindings(
+    req_perform = function(req, ...) {
+      request <<- req
+      rlang::cnd_signal(transport_error)
+    },
+    .package = "httr2"
+  )
+
+  error <- expect_error(
+    fabric_function_invoke(
+      function_test_url,
+      token = "token",
+      max_response_bytes = 1024
+    ),
+    class = "fabric_function_response_too_large"
+  )
+  expect_identical(request$options$maxfilesize_large, 1024)
+  expect_true(is.na(error$response_bytes))
+  expect_identical(error$max_response_bytes, 1024)
+  expect_identical(error$parent$curl_code, 63L)
+  expect_null(error$parent$parent)
+  expect_identical(
+    grepl(
+      "synthetic-private-request-token",
+      rawToChar(serialize(error, NULL, ascii = TRUE)),
+      fixed = TRUE
+    ),
+    FALSE
+  )
+})
+
+test_that("response size classification uses curl metadata, not messages", {
+  coded <- structure(
+    list(message = "Limite depassee", call = NULL, code = 63L),
+    class = c("curl_error", "error", "condition")
+  )
+  unrelated <- simpleError("Maximum file size exceeded")
+
+  expect_true(function_is_response_too_large_error(coded))
+  expect_false(function_is_response_too_large_error(unrelated))
+})
+
+test_that("function output is preserved while conditions redact secrets", {
+  domain_value <- "function-domain-token"
+  httr2::local_mocked_responses(function(req) {
+    function_test_response(function_success_body(
+      output = list(
+        token = domain_value,
+        password = "legitimate-output-field",
+        nested = list(
+          safe = "visible",
+          message = paste("Bearer", domain_value)
+        )
+      )
+    ))
+  })
+
+  result <- fabric_function_invoke(function_test_url, token = "request-token")
+  expect_identical(result$output$token, domain_value)
+  expect_identical(result$output$password, "legitimate-output-field")
+  expect_identical(result$output$nested$safe, "visible")
+  expect_identical(result$output$nested$message, paste("Bearer", domain_value))
+  expect_identical(result$response$output, result$output)
+
+  secret <- "function-super-secret"
+  httr2::local_mocked_responses(function(req) {
+    function_test_response(
+      list(
+        message = paste("Authorization: Bearer", secret),
+        token = secret
+      ),
+      status = 401L
+    )
+  })
+  error <- expect_error(
+    fabric_function_invoke(function_test_url, token = "request-token"),
+    class = "fabric_http_error"
+  )
+  expect_false(grepl(secret, conditionMessage(error), fixed = TRUE))
+  expect_identical(error$response_metadata$body$token, "<redacted>")
+})
+
+test_that("function authentication chooses flow-appropriate audiences", {
+  calls <- list()
+  local_mocked_bindings(
+    get_azure_token = function(...) {
+      calls[[length(calls) + 1L]] <<- list(...)
+      function_fake_azure_token()
+    },
+    .package = "AzureAuth"
+  )
+  httr2::local_mocked_responses(function(req) {
+    function_test_response(function_success_body(), url = req$url)
+  })
+
+  fabric_function_invoke(
+    function_test_url,
+    tenant_id = "tenant",
+    client_id = "client",
+    auth_args = list(password = "secret", auth_type = "client_credentials")
+  )
+  fabric_function_invoke(
+    function_test_url,
+    tenant_id = "tenant",
+    client_id = "client",
+    auth_args = list(auth_type = "device_code", use_cache = FALSE)
+  )
+
+  expect_identical(calls[[1L]]$resource, .fabric_audience$power_bi)
+  expect_equal(
+    calls[[2L]]$resource,
+    c(.fabric_audience$user_data_function, "offline_access")
+  )
+  expect_identical(
+    .fabric_audience$user_data_function,
+    paste0(
+      "https://analysis.windows.net/powerbi/api/",
+      "UserDataFunction.Execute.All"
+    )
+  )
+  broader <- paste0(
+    "https://analysis.windows.net/powerbi/api/",
+    "Item.Execute.All"
+  )
+  expect_identical(
+    function_resolve_audience(broader, token = "token", auth_args = list()),
+    broader
+  )
+
+  credential <- fabric_credential(
+    tenant_id = "tenant",
+    client_id = "client",
+    auth_args = list(password = "secret", auth_type = "client_credentials")
+  )
+  fabric_function_invoke(function_test_url, token = credential)
+  expect_identical(calls[[3L]]$resource, .fabric_audience$power_bi)
+  expect_identical(
+    function_resolve_audience(broader, token = credential, auth_args = list()),
+    broader
+  )
+})
+
+test_that("function invocation validates arguments before authentication", {
+  expect_identical(formals(fabric_function_invoke)$timeout, 110)
+  expect_identical(
+    formals(fabric_function_invoke)$max_response_bytes,
+    quote(.fabric_function_response_limit)
+  )
+
+  invalid <- list(
+    list(parameters = list(1L), pattern = "unique, non-empty names"),
+    list(
+      parameters = structure(list(1L, 2L), names = c("x", "x")),
+      pattern = "unique, non-empty names"
+    ),
+    list(parameters = "scalar", pattern = "named R object")
+  )
+  for (case in invalid) {
+    expect_error(
+      fabric_function_invoke(
+        function_test_url,
+        parameters = case$parameters,
+        token = "token"
+      ),
+      case$pattern,
+      fixed = TRUE
+    )
+  }
+  expect_error(
+    fabric_function_invoke(function_test_url, timeout = 0, token = "token"),
+    "timeout must be one positive number",
+    fixed = TRUE
+  )
+  expect_error(
+    fabric_function_invoke(
+      function_test_url,
+      idempotent = NA,
+      token = "token"
+    ),
+    "idempotent must be TRUE or FALSE",
+    fixed = TRUE
+  )
+  expect_error(
+    fabric_function_invoke(
+      function_test_url,
+      max_response_bytes = 1.5,
+      token = "token"
+    ),
+    "max_response_bytes must be one positive whole number",
+    fixed = TRUE
+  )
+
+  request_error <- expect_error(
+    fabric_function_invoke(
+      function_test_url,
+      parameters = list(
+        value = strrep(
+          "x",
+          .fabric_function_request_limit + 1L
+        )
+      ),
+      token = function(...) stop("authentication should not run")
+    ),
+    class = "fabric_function_request_too_large"
+  )
+  expect_gt(request_error$request_bytes, .fabric_function_request_limit)
+})
+
+test_that("malformed function responses keep standard safe HTTP behavior", {
+  httr2::local_mocked_responses(function(req) {
+    function_test_response(list(message = "service unavailable"), status = 500L)
+  })
+  expect_error(
+    fabric_function_invoke(function_test_url, token = "token"),
+    class = "fabric_http_error"
+  )
+
+  httr2::local_mocked_responses(function(req) {
+    function_test_response(function_success_body(), status = 401L)
+  })
+  expect_error(
+    fabric_function_invoke(function_test_url, token = "token"),
+    class = "fabric_http_error"
+  )
+
+  httr2::local_mocked_responses(function(req) {
+    function_test_response(list(status = "Succeeded"), status = 200L)
+  })
+  error <- expect_error(
+    fabric_function_invoke(function_test_url, token = "token"),
+    class = "fabric_function_response_error"
+  )
+  expect_identical(error$response_metadata$status, 200L)
+})

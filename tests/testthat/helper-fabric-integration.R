@@ -1,0 +1,514 @@
+fabric_test_required <- function() {
+  tolower(Sys.getenv("FABRIC_INTEGRATION_REQUIRED")) %in%
+    c("1", "true", "yes")
+}
+
+# Opt-in feature lanes fail for missing prerequisites instead of silently
+# contributing a skip to an otherwise successful service-principal run.
+fabric_test_feature_required <- function(feature) {
+  required <- trimws(strsplit(
+    Sys.getenv("FABRIC_TEST_REQUIRED_FEATURES"),
+    ",",
+    fixed = TRUE
+  )[[1L]])
+  known <- c(
+    "all",
+    "introspection",
+    "functions",
+    "packed-livy",
+    "delegated-livy",
+    "livy-languages",
+    "authorization",
+    "job-options",
+    "shortcut-transforms",
+    "shortcut-cache",
+    "external-shortcuts",
+    "kql-cancellation",
+    "nonutc-schedules",
+    "workload-schedules"
+  )
+  unknown <- setdiff(required[nzchar(required)], known)
+  if (length(unknown)) {
+    stop(paste(
+      "Unknown required Fabric features:",
+      paste(unknown, collapse = ", ")
+    ))
+  }
+  feature %in% required || "all" %in% required
+}
+
+fabric_test_feature_unavailable <- function(feature, message) {
+  if (fabric_test_feature_required(feature)) {
+    rlang::abort(message)
+  }
+  testthat::skip(message)
+}
+
+fabric_test_feature_environment <- function(feature, variable) {
+  value <- Sys.getenv(variable)
+  if (!nzchar(value)) {
+    fabric_test_feature_unavailable(
+      feature,
+      paste(feature, "requires", variable)
+    )
+  }
+  value
+}
+
+fabric_test_skip_or_fail <- function(condition, message) {
+  if (!isTRUE(condition)) {
+    return(invisible(FALSE))
+  }
+  if (fabric_test_required()) {
+    rlang::abort(message)
+  }
+  testthat::skip(message)
+}
+
+fabric_test_eventually_summary <- function(value) {
+  if (is.null(value)) {
+    return(NULL)
+  }
+
+  count <- if (is.data.frame(value)) nrow(value) else length(value)
+  parts <- paste0("count=", count)
+  safe_fields <- intersect(
+    c("id", "state", "livy_state", "plugin_state", "scheduler_state"),
+    names(value)
+  )
+  for (field in safe_fields) {
+    values <- as.character(unlist(value[[field]], use.names = FALSE))
+    values <- unique(values[!is.na(values) & nzchar(values)])
+    if (length(values) == 0L) {
+      next
+    }
+    suffix <- if (length(values) > 10L) ", ..." else ""
+    parts <- c(
+      parts,
+      paste0(field, "=", paste(head(values, 10L), collapse = ", "), suffix)
+    )
+  }
+  paste(parts, collapse = "; ")
+}
+
+fabric_test_eventually <- function(
+  callback,
+  attempts = 36L,
+  delay = 5,
+  ready = function(value) !is.null(value)
+) {
+  last_error <- NULL
+  last_value <- NULL
+  for (attempt in seq_len(attempts)) {
+    failed <- FALSE
+    value <- tryCatch(callback(), error = function(error) {
+      failed <<- TRUE
+      last_error <<- error
+      NULL
+    })
+    if (!failed) {
+      last_error <- NULL
+    }
+    if (!is.null(value)) {
+      last_value <- value
+    }
+    if (isTRUE(ready(value))) {
+      return(value)
+    }
+    if (attempt < attempts) Sys.sleep(delay)
+  }
+  summary <- fabric_test_eventually_summary(last_value)
+  message <- "Fabric did not expose the expected state before the integration deadline"
+  if (!is.null(summary)) {
+    message <- paste0(message, ". Last successful result: ", summary)
+  }
+  rlang::abort(
+    message,
+    parent = last_error
+  )
+}
+
+# Only use for fixture statements that are safe to execute more than once.
+# Retry submission, never a failed wait or Spark execution on an accepted ID.
+fabric_test_livy_run_idempotent <- function(
+  session,
+  code,
+  kind = "pyspark",
+  timeout = 300,
+  poll_interval = 2,
+  attempts = 3L,
+  delay = 5
+) {
+  for (attempt in seq_len(attempts)) {
+    statement <- tryCatch(
+      session$submit(code, kind = kind),
+      fabric_http_error = function(error) {
+        if (
+          attempt == attempts ||
+            isFALSE(error$is_retriable) ||
+            !error$status %in% c(408L, 429L, 500L, 502L, 503L, 504L)
+        ) {
+          stop(error)
+        }
+        message(
+          "Retrying repeatable Livy fixture submission after HTTP ",
+          error$status,
+          " (attempt ",
+          attempt + 1L,
+          "/",
+          attempts,
+          ")"
+        )
+        Sys.sleep(delay * attempt)
+        NULL
+      }
+    )
+    if (!is.null(statement)) break
+  }
+  statement$wait(timeout = timeout, poll_interval = poll_interval)
+  statement$result(refresh = FALSE)
+}
+
+fabric_test_repository_root <- function(start = getwd()) {
+  current <- normalizePath(start, winslash = "/", mustWork = TRUE)
+  repeat {
+    description <- file.path(current, "DESCRIPTION")
+    if (file.exists(description)) {
+      package <- tryCatch(
+        read.dcf(description, fields = "Package")[[1L]],
+        error = function(error) ""
+      )
+      if (identical(package, "fabricQueryR")) {
+        return(current)
+      }
+    }
+    parent <- dirname(current)
+    if (identical(parent, current)) {
+      rlang::abort(
+        paste("Could not locate the fabricQueryR repository from", start)
+      )
+    }
+    current <- parent
+  }
+}
+
+fabric_test_manifest_path <- function(
+  start = getwd(),
+  configured = Sys.getenv("FABRIC_TEST_MANIFEST")
+) {
+  if (nzchar(configured)) {
+    return(configured)
+  }
+  root <- tryCatch(
+    fabric_test_repository_root(start),
+    error = function(error) {
+      normalizePath(start, winslash = "/", mustWork = TRUE)
+    }
+  )
+  file.path(
+    root,
+    ".fabric-test-manifest.json"
+  )
+}
+
+fabric_test_manifest <- function() {
+  if (
+    !fabric_test_required() &&
+      !tolower(Sys.getenv("FABRIC_INTEGRATION_ENABLED")) %in%
+        c("1", "true", "yes")
+  ) {
+    testthat::skip(
+      "Live Fabric integration is disabled; set FABRIC_INTEGRATION_ENABLED=true to opt in"
+    )
+  }
+  path <- fabric_test_manifest_path()
+  fabric_test_skip_or_fail(
+    !file.exists(path),
+    paste("Fabric integration manifest not found:", path)
+  )
+  manifest <- jsonlite::fromJSON(path, simplifyVector = FALSE)
+  fabric_test_skip_or_fail(
+    is.null(manifest$fixture_revision) ||
+      !is.character(manifest$fixture_revision) ||
+      length(manifest$fixture_revision) != 1L ||
+      !nzchar(manifest$fixture_revision),
+    paste(
+      "Fabric integration manifest has no verified fixture revision;",
+      "rebuild or reseed the sandbox"
+    )
+  )
+  runtime_fields <- c(
+    "lane",
+    "fabric_runtime",
+    "spark_version",
+    "delta_version"
+  )
+  runtime <- manifest$runtime
+  fabric_test_skip_or_fail(
+    !is.list(runtime) ||
+      !setequal(names(runtime), runtime_fields) ||
+      any(vapply(
+        runtime_fields,
+        function(field) {
+          value <- runtime[[field]]
+          !is.character(value) || length(value) != 1L || !nzchar(value)
+        },
+        logical(1)
+      )),
+    paste(
+      "Fabric integration manifest has no verified runtime contract;",
+      "rebuild or reseed the sandbox"
+    )
+  )
+  manifest
+}
+
+fabric_test_token_variables <- c(
+  "https://api.fabric.microsoft.com/.default" = "FABRIC_TEST_API_TOKEN",
+  "https://analysis.windows.net/powerbi/api/.default" = "FABRIC_TEST_PBI_TOKEN",
+  "https://database.windows.net//.default" = "FABRIC_TEST_SQL_TOKEN",
+  "https://storage.azure.com/.default" = "FABRIC_TEST_STORAGE_TOKEN",
+  "https://api.kusto.windows.net/.default" = "FABRIC_TEST_KUSTO_TOKEN"
+)
+
+fabric_test_token <- function(variable, force_refresh = FALSE) {
+  provider <- getOption("fabricQueryR.integration_token_provider")
+  token <- if (is.null(provider)) {
+    Sys.getenv(variable)
+  } else {
+    if (!is.function(provider)) {
+      rlang::abort(
+        "fabricQueryR.integration_token_provider must be a function"
+      )
+    }
+    fabric_call_token_provider(
+      provider,
+      fabric_test_token_audience(variable),
+      force_refresh
+    )
+  }
+  fabric_test_skip_or_fail(
+    !nzchar(token),
+    paste("Fabric integration token not set:", variable)
+  )
+  token
+}
+
+fabric_test_token_variable <- function(audience) {
+  index <- match(audience, names(fabric_test_token_variables))
+  if (is.na(index)) {
+    rlang::abort(
+      paste("No provisioned Fabric integration token for audience:", audience)
+    )
+  }
+  unname(fabric_test_token_variables[[index]])
+}
+
+fabric_test_token_audience <- function(variable) {
+  index <- match(variable, unname(fabric_test_token_variables))
+  if (is.na(index)) {
+    rlang::abort(
+      paste("No Fabric integration audience for token variable:", variable)
+    )
+  }
+  names(fabric_test_token_variables)[[index]]
+}
+
+fabric_test_provisioned_token <- function(audience, force_refresh = FALSE) {
+  fabric_test_token(fabric_test_token_variable(audience), force_refresh)
+}
+
+fabric_test_token_provider <- function(
+  acquire = fabric_test_provisioned_token
+) {
+  # The underlying credential owns expiry-aware caching. Caching bearer strings
+  # here would hide expiry and prevent rejected-token retries from refreshing it.
+  function(audience, force_refresh = FALSE) {
+    fabric_call_token_provider(acquire, audience, force_refresh)
+  }
+}
+
+fabric_test_azure_auth_config <- function() {
+  local <- getOption("fabricQueryR.integration_auth_config")
+  if (!is.null(local)) {
+    required <- c("tenant_id", "client_id", "auth_args")
+    if (
+      !is.list(local) ||
+        !all(required %in% names(local)) ||
+        !nzchar(local$tenant_id) ||
+        !nzchar(local$client_id) ||
+        !is.list(local$auth_args)
+    ) {
+      rlang::abort(
+        "fabricQueryR.integration_auth_config is invalid"
+      )
+    }
+    return(local)
+  }
+
+  secret <- Sys.getenv("FABRIC_TEST_AUTH_CLIENT_SECRET")
+  fabric_test_skip_or_fail(
+    !nzchar(secret),
+    paste(
+      "AzureAuth integration is optional; set",
+      "FABRIC_TEST_AUTH_CLIENT_SECRET to enable it"
+    )
+  )
+  tenant_id <- Sys.getenv("FABRIC_TEST_AUTH_TENANT_ID")
+  client_id <- Sys.getenv("FABRIC_TEST_AUTH_CLIENT_ID")
+  missing <- c(
+    FABRIC_TEST_AUTH_TENANT_ID = tenant_id,
+    FABRIC_TEST_AUTH_CLIENT_ID = client_id
+  )
+  missing <- names(missing)[!nzchar(missing)]
+  if (length(missing)) {
+    rlang::abort(paste(
+      "AzureAuth integration configuration is incomplete; missing",
+      paste(missing, collapse = ", ")
+    ))
+  }
+  list(
+    tenant_id = tenant_id,
+    client_id = client_id,
+    auth_args = list(
+      password = secret,
+      auth_type = "client_credentials",
+      use_cache = FALSE
+    )
+  )
+}
+
+fabric_test_is_delegated_auth <- function(config) {
+  is.list(config) &&
+    is.list(config$auth_args) &&
+    !identical(config$auth_args$auth_type, "client_credentials") &&
+    is.null(config$auth_args$password) &&
+    is.null(config$auth_args$certificate)
+}
+
+fabric_test_delegated_auth_config <- function() {
+  config <- getOption("fabricQueryR.integration_auth_config")
+  if (!fabric_test_is_delegated_auth(config)) {
+    if (
+      tolower(Sys.getenv("FABRIC_DELEGATED_INTEGRATION_REQUIRED")) %in%
+        c("1", "true", "yes")
+    ) {
+      rlang::abort(
+        "Delegated Fabric integration requires an interactive user identity"
+      )
+    }
+    testthat::skip(
+      paste(
+        "Delegated identity coverage is opt-in; run through",
+        "tools/fabric-sandbox/local-integration.R with interactive sign-in"
+      )
+    )
+  }
+  config
+}
+
+fabric_test_optional_environment <- function(variable, purpose) {
+  value <- Sys.getenv(variable)
+  if (!nzchar(value)) {
+    testthat::skip(paste(purpose, "is opt-in; set", variable, "to enable it"))
+  }
+  value
+}
+
+fabric_test_required_environment <- function(variable, purpose) {
+  value <- Sys.getenv(variable)
+  fabric_test_skip_or_fail(
+    !nzchar(value),
+    paste(purpose, "requires", variable)
+  )
+  value
+}
+
+fabric_test_runtime_lane <- function(expected) {
+  lane <- fabric_test_required_environment(
+    "FABRIC_SPARK_RUNTIME_LANE",
+    "Spark runtime compatibility coverage"
+  )
+  version <- fabric_test_required_environment(
+    "FABRIC_SPARK_RUNTIME_VERSION",
+    "Spark runtime compatibility coverage"
+  )
+  versions <- c(core = "1.3", runtime2 = "2.0", preview = "2.0")
+  if (!lane %in% names(versions)) {
+    rlang::abort(paste0(
+      "FABRIC_SPARK_RUNTIME_LANE must be 'core' or 'runtime2' ",
+      "('preview' remains an alias), not '",
+      lane,
+      "'"
+    ))
+  }
+  fabric_test_skip_or_fail(
+    !identical(version, unname(versions[[lane]])),
+    paste0(
+      "Spark runtime lane '",
+      lane,
+      "' requires version ",
+      versions[[lane]],
+      ", not ",
+      version
+    )
+  )
+  canonical <- c(core = "core", runtime2 = "runtime2", preview = "runtime2")
+  if (!identical(unname(canonical[[lane]]), unname(canonical[[expected]]))) {
+    testthat::skip(paste("Test belongs to Spark runtime lane", expected))
+  }
+  invisible(TRUE)
+}
+
+fabric_test_require_package <- function(package) {
+  if (identical(package, "adbi")) {
+    testthat::skip_on_cran()
+  }
+  fabric_test_skip_or_fail(
+    !requireNamespace(package, quietly = TRUE),
+    paste("Fabric integration package is not installed:", package)
+  )
+  invisible(TRUE)
+}
+
+fabric_test_sql_backends <- function() {
+  for (package in c(
+    "DBI",
+    "odbc",
+    "adbi",
+    "adbcdrivermanager",
+    "nanoarrow",
+    "arrow"
+  )) {
+    fabric_test_require_package(package)
+  }
+  c("odbc", "adbc")
+}
+
+fabric_test_spark_table <- function(manifest, lakehouse) {
+  paste(
+    sprintf(
+      "`%s`",
+      c(
+        manifest$workspace_name,
+        lakehouse$display_name,
+        lakehouse$schema,
+        lakehouse$tables$basic
+      )
+    ),
+    collapse = "."
+  )
+}
+
+fabric_test_manifest_item <- function(manifest, name) {
+  item <- manifest$items[[name]]
+  if (is.null(item)) {
+    rlang::abort(
+      sprintf(
+        "Fabric integration manifest does not provision required item '%s'",
+        name
+      )
+    )
+  }
+  item
+}

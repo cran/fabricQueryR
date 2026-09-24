@@ -2,75 +2,198 @@
 % Please edit documentation in R/fabric_sql_connect.R
 \name{fabric_sql_query}
 \alias{fabric_sql_query}
-\title{Run a SQL query against a Microsoft Fabric SQL endpoint (opening & closing connection)}
+\title{Run a parameterized query against Microsoft Fabric SQL}
 \usage{
 fabric_sql_query(
   server,
   sql,
-  database = "Lakehouse",
+  params = NULL,
+  result = c("tibble", "arrow_stream"),
+  database = NULL,
+  target_type = c("auto", "lakehouse", "warehouse", "sql_database",
+    "sql_analytics_endpoint"),
+  backend = c("odbc", "adbc"),
   tenant_id = Sys.getenv("FABRICQUERYR_TENANT_ID"),
   client_id = Sys.getenv("FABRICQUERYR_CLIENT_ID", unset =
     "04b07795-8ddb-461a-bbee-02f9e1bf7b46"),
-  access_token = NULL,
+  token = NULL,
+  auth_args = list(),
   odbc_driver = getOption("fabricqueryr.sql.driver", "ODBC Driver 18 for SQL Server"),
-  port = 1433L,
+  adbc_driver = getOption("fabricqueryr.sql.adbc_driver", "mssql"),
+  port = NULL,
   encrypt = "yes",
   trust_server_certificate = "no",
   timeout = 30L,
+  read_only = FALSE,
   verbose = TRUE,
+  max_tries = 3L,
+  retry_delay = 5,
+  idempotent = FALSE,
+  numeric_policy = c("auto", "exact", "driver"),
   ...
 )
 }
 \arguments{
-\item{server}{Character. Microsoft Fabric SQL connection string or \code{Server=...} string
-(see details).}
+\item{server}{A Fabric SQL server name, a complete connection string copied
+from the Fabric portal, or one Lakehouse, Warehouse, Warehouse snapshot,
+or SQL Database object returned by a discovery function. A discovered
+object is usually simplest because it also supplies the database name}
 
-\item{sql}{Character scalar. The SQL to run.}
+\item{sql}{One result-producing T-SQL \code{SELECT} statement, optionally beginning
+with a common-table-expression \code{WITH} clause. For DDL or DML, open a
+connection with \code{\link[=fabric_sql_connect]{fabric_sql_connect()}} and call \code{\link[DBI:dbExecute]{DBI::dbExecute()}}. A
+Lakehouse SQL analytics endpoint is read-only and does not support
+\code{INSERT}, \code{UPDATE}, or \code{DELETE}}
 
-\item{database}{Character. Database name. Defaults to \code{"Lakehouse"}.}
+\item{params}{Optional list of values for \verb{?} placeholders in \code{sql}. Values
+are sent separately from the SQL text, which is safer and easier to quote
+correctly than building a query with \code{paste()}. Factors are bound as their
+character labels on both backends. For ODBC, \code{bit64::integer64} parameters
+are sent as exact decimal text and their placeholders are cast to \code{bigint}
+in SQL, preserving numeric operations and missing values. ADBC binds them
+natively. This normalization applies to this query helper; direct DBI
+calls on \code{\link[=fabric_sql_connect]{fabric_sql_connect()}} use the driver's parameter conversion.}
 
-\item{tenant_id}{Character. Entra ID (AAD) tenant GUID. Defaults to
-\code{Sys.getenv("FABRICQUERYR_TENANT_ID")}.}
+\item{result}{Return a \code{"tibble"} for ordinary R analysis, or a single-use
+\code{"arrow_stream"}. ADBC streams retain native Arrow types. ODBC streams are
+converted from R data frames and cannot recover values lost by the driver.
+The 'adbi' driver may fetch the complete result before returning
+the stream, so this option does not guarantee bounded-memory retrieval.
+An Arrow stream owns its DBI result and connection until the stream is
+released; consume it promptly or release it explicitly with
+\code{\link[nanoarrow:nanoarrow_pointer_release]{nanoarrow::nanoarrow_pointer_release()}}}
 
-\item{client_id}{Character. App registration (client) ID. Defaults to
-\code{Sys.getenv("FABRICQUERYR_CLIENT_ID")}, falling back to the Azure CLI app id
-\code{"04b07795-8ddb-461a-bbee-02f9e1bf7b46"} if unset.}
+\item{database}{Optional catalog/database. An explicit value overrides a
+database found in \code{server}. For a bare endpoint, supply the item database
+shown with its connection string in Fabric. If omitted, Warehouse and SQL
+analytics endpoints open Fabric's \code{master} context, which is useful for
+discovery but does not select the item's tables}
 
-\item{access_token}{Optional character. If supplied, use this bearer token
-instead of acquiring a new one via \code{{AzureAuth}}.}
+\item{target_type}{Kind of Fabric SQL item. Keep \code{"auto"} unless a custom
+hostname prevents 'fabricQueryR' from identifying it}
 
-\item{odbc_driver}{Character. ODBC driver name. Defaults to
-\code{getOption("fabricqueryr.sql.driver", "ODBC Driver 18 for SQL Server")}.}
+\item{backend}{Connection driver. Use \code{"odbc"} for ordinary 'DBI' work or
+\code{"adbc"} for a native Arrow path after installing its \code{mssql} driver}
 
-\item{port}{Integer. TCP port (default 1433).}
+\item{tenant_id}{Microsoft Entra tenant ID. Defaults to
+\code{FABRICQUERYR_TENANT_ID}}
 
-\item{encrypt, trust_server_certificate}{Character flags passed to ODBC.
-Defaults \code{"yes"} and \code{"no"}, respectively.}
+\item{client_id}{Microsoft Entra application/client ID. Defaults to
+\code{FABRICQUERYR_CLIENT_ID}, then the Azure CLI application ID}
 
-\item{timeout}{Integer. Login/connect timeout in seconds. Default 30.}
+\item{token}{Optional access token or token-provider function. Leave \code{NULL}
+to let 'fabricQueryR' use its normal sign-in flow}
 
-\item{verbose}{Logical. Emit progress via \code{{cli}}. Default \code{TRUE}.}
+\item{auth_args}{Additional sign-in options passed to
+\code{\link[AzureAuth:get_azure_token]{AzureAuth::get_azure_token()}}}
 
-\item{...}{Additional arguments forwarded to \code{\link[DBI:dbConnect]{DBI::dbConnect()}}.}
+\item{odbc_driver}{ODBC driver name. ODBC Driver 18 for SQL Server is the
+default}
+
+\item{adbc_driver}{ADBC driver name or shared-library path. The separately
+installed ADBC Driver Foundry \code{mssql} driver version 1.5.0 or newer is the
+default requirement}
+
+\item{port}{Optional TCP port. An explicit value overrides a port in
+\code{server}; otherwise the standard SQL port, 1433, is used}
+
+\item{encrypt}{Whether the driver encrypts the connection. Keep the secure
+default, \code{"yes"}, for Fabric}
+
+\item{trust_server_certificate}{Whether to accept a server certificate
+without validating its trust chain. Keep the secure default, \code{"no"},
+unless diagnosing a controlled test environment}
+
+\item{timeout}{Non-negative whole-number login/connect timeout in seconds;
+\code{0} lets the driver use an unlimited or driver-specific timeout}
+
+\item{read_only}{Whether to ask the driver for a read-only connection. This
+is a connection hint, not a replacement for Fabric or SQL permissions}
+
+\item{verbose}{Logical. Show authentication, retry, and connection progress}
+
+\item{max_tries}{Maximum attempts after temporary Fabric SQL failures}
+
+\item{retry_delay}{Initial delay in seconds before retrying. Later retries
+wait progressively longer, up to 60 seconds}
+
+\item{idempotent}{Logical. Set to \code{TRUE} only if running the entire statement
+a second time has no unwanted effect (usually a plain \code{SELECT}). This
+permits a retry when it is unclear whether Fabric executed the first
+attempt}
+
+\item{numeric_policy}{\code{"auto"} (default) uses \code{"driver"} for ODBC and
+\code{"exact"} for ADBC. Automatic ODBC conversion warns once per R session
+about possible numeric precision loss. Set \code{"driver"} explicitly to
+accept the driver's conversions without this warning, or use \code{"exact"}
+to reject unsafe ODBC results before fetching
+
+\code{"exact"} preserves ADBC decimals as character and BIGINT as
+\code{bit64::integer64}, using character for columns
+containing the minimum BIGINT. INT columns containing \code{-2147483648} use
+exact doubles. Nested lists retain character decimals and 64-bit integers,
+and double 32-bit integers. Null struct parents require
+\code{result = "arrow_stream"}; exact tibble collection raises
+\code{fabric_arrow_null_struct_error} to preserve their distinction from valid
+structs with all-null fields. ODBC rejects DECIMAL, NUMERIC, INT and BIGINT
+columns before fetching: its conversion can round or truncate values
+or turn valid integer boundaries into missing values. Cast these columns
+to \code{varchar} in SQL or use ADBC. \code{"driver"} explicitly accepts the backend's
+conversions, including possible rounding and missing values, for either
+output format. This policy applies to this query helper; direct DBI calls
+on \code{\link[=fabric_sql_connect]{fabric_sql_connect()}} use the selected driver's conversion settings}
+
+\item{...}{Additional arguments forwarded to \code{\link[DBI:dbConnect]{DBI::dbConnect()}}. The former
+named \code{access_token} argument is consumed here as a deprecated alias for
+\code{token} and is not forwarded. For ODBC, a caller-supplied \code{attributes}
+named list is merged with the package-managed \code{azure_token}; that protected
+attribute cannot be overridden. ODBC authentication, target, driver, and
+TLS options cannot be supplied through \code{...} because the package validates
+and constructs those settings before attaching the access token. This also
+excludes raw \code{.connection_string}, \code{DSN}, and \code{FileDSN} arguments
+ADBC defaults to \code{bigint = "integer64"}, so ordinary BIGINT values do not
+have to fit an R 32-bit integer. Supply another \code{bigint} policy explicitly
+through \code{...} if needed. Direct DBI reads with \code{integer64} cannot represent
+the minimum signed BIGINT because 'bit64' reserves that value for \code{NA}.
+Direct ODBC binding can misinterpret \code{integer64} parameters as doubles.
+Use \code{\link[=fabric_sql_query]{fabric_sql_query()}} for its exact parameter handling, use ADBC, or
+supply character parameters with explicit SQL \code{bigint} casts.}
 }
 \value{
-A tibble with the query results (0 rows if none).
+With \code{result = "tibble"}, a tibble containing the returned rows and
+column types determined by \code{numeric_policy}. With \code{result = "arrow_stream"},
+a single-use \code{nanoarrow_array_stream} for Arrow-compatible tools
 }
 \description{
-Convenience wrapper that opens a connection with
-\code{\link[=fabric_sql_connect]{fabric_sql_connect()}}, executes \code{sql}, and returns a tibble. The
-connection is closed on exit.
+Runs one SQL query and returns its rows, opening and closing the connection
+automatically. Use \code{\link[=fabric_sql_connect]{fabric_sql_connect()}} instead when several operations
+should share a connection. Supply changing values through \code{params} rather
+than pasting them into the SQL text
 }
 \examples{
-# Example is not executed since it requires configured credentials for Fabric
 \dontrun{
-df <- fabric_sql_query(
-  server    = "2gxz...qiy.datawarehouse.fabric.microsoft.com",
-  database  = "Lakehouse",
-  sql       = "SELECT TOP 100 * FROM sys.objects",
-  tenant_id = Sys.getenv("FABRICQUERYR_TENANT_ID"),
-  client_id = Sys.getenv("FABRICQUERYR_CLIENT_ID")
+# Discover the Warehouse that will receive the query
+workspace <- fabric_workspaces()[[1L]]
+warehouse <- fabric_warehouses(workspace)[[1L]]
+
+# Discover and quote a table name through a short 'DBI' connection
+con <- fabric_sql_connect(warehouse)
+table <- DBI::dbListTables(con)[[1L]]
+table <- DBI::dbQuoteIdentifier(con, table)
+DBI::dbDisconnect(con)
+sql <- paste("SELECT TOP 100 * FROM", table)
+
+# Run the resulting read-only query and collect a tibble
+result <- fabric_sql_query(warehouse, sql, backend = "adbc")
+
+# Return Arrow-native batches instead of converting to a data frame
+stream <- fabric_sql_query(
+  warehouse,
+  sql,
+  backend = "adbc",
+  result = "arrow_stream"
 )
-dplyr::glimpse(df)
+reader <- arrow::as_record_batch_reader(stream)
+table <- reader$read_table()
 }
 }

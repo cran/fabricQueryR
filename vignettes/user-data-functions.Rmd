@@ -1,0 +1,166 @@
+---
+title: "Invoke Fabric user data functions (experimental)"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Invoke Fabric user data functions (experimental)}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", eval = FALSE)
+```
+
+A Fabric *user data function* is reusable Python code that Fabric hosts and
+runs. It can accept inputs, perform a task, and return a result. With
+'fabricQueryR', an R session can call the published function and receive its
+structured response.
+
+## Lifecycle
+
+The package's User Data Function discovery and invocation APIs are
+experimental. Their validation, request construction, and response handling
+are covered by offline tests, and lightweight Core item discovery is exercised
+against Fabric. However, the package cannot currently maintain repeatable
+end-to-end coverage for detailed User Data Function discovery and public
+function invocation.
+
+The persistent sandbox is provisioned with a service principal. Microsoft's
+User Data Function create, update-definition, detailed Get, and delete APIs
+currently support delegated users, but not service principals or managed
+identities. The sandbox therefore cannot provision, publish, fully inspect, and
+remove its own disposable public-function fixtures. Until repeatable end-to-end
+coverage is possible, treat these APIs and their returned service shapes as
+subject to change.
+
+This guide prepares a function for external use, makes one small call, and then
+introduces structured parameters and safe retries. Start with a simple function
+whose output you can verify in the Fabric portal.
+
+## Prepare the function in Fabric
+
+In the Fabric portal, publish the user data functions item, switch to *Run
+only* mode, open the function's properties, enable *Public access*, and copy
+the *Public URL*. Each function has its own URL.
+
+`fabric_user_data_functions()` and `workspace$user_data_functions()` default to
+`detail = FALSE`. This uses the Core item listing, which supports delegated
+users, service principals, and managed identities, and returns a read-only
+`FabricItem` R6 object. `$details()` calls `fabric_item()` to refresh its item
+record. To force the workload-specific Get API, use `$details(detail = TRUE)`
+or rediscover with `detail = TRUE`; Microsoft documents that API for delegated
+users only, not service principals or managed identities. Neither response
+includes enough information to derive each public function URL, so pass the
+copied URL to `fabric_function_invoke()`.
+
+You could store the URL in an environment variable (rather than hardcoding it):
+
+```{r, eval = FALSE}
+function_url <- Sys.getenv("FABRIC_FUNCTION_URL")
+```
+
+The caller needs Execute permission on the item. A delegated sign-in also needs
+one Power BI delegated permission. By default, 'fabricQueryR' requests the
+least-privilege `UserDataFunction.Execute.All` scope. Microsoft also accepts
+the broader `Item.Execute.All` scope, but it does not replace the caller's item
+Execute permission. If the app registration grants only that broader scope,
+select it explicitly:
+
+```{r, eval = FALSE}
+result <- fabric_function_invoke(
+  function_url,
+  parameters = list(customerName = "Ada", priority = 2L),
+  audience = paste0(
+    "https://analysis.windows.net/powerbi/api/",
+    "Item.Execute.All"
+  )
+)
+```
+
+If sign-in succeeds but the call is denied, ask the item owner or Fabric
+administrator to check item Execute access and the relevant tenant setting.
+
+## Make a first call
+
+Parameter names must match the published Python function.
+For a function with `customerName` and `priority` inputs:
+
+```{r, eval = FALSE}
+result <- fabric_function_invoke(
+  function_url,
+  parameters = list(
+    customerName = "Ada",
+    priority = 2L
+  )
+)
+
+result$status
+result$output
+```
+
+## Send structured parameters
+
+The request body is one named JSON object. Its names must match the published
+function's camelCase parameters:
+
+```{r, eval = FALSE}
+structured_result <- fabric_function_invoke(
+  function_url,
+  parameters = list(
+    customerName = "Ada",
+    priority = 2L,
+    lineIds = I(c(101L, 102L)),
+    metadata = list(source = "R", approved = TRUE, note = NULL)
+  )
+)
+```
+
+One-element R values normally become JSON scalars. Wrap a one-element value in
+`I()` when the Python signature expects a list. Named atomic vectors and data
+frames are also accepted as top-level parameter objects; a named list gives the
+clearest control over nested JSON shapes.
+
+The result is a list which can be inspected:
+
+```{r, eval = FALSE}
+structured_result$function_name
+structured_result$invocation_id
+structured_result$status
+structured_result$output
+structured_result$errors
+structured_result$http_status
+```
+
+The response keeps the function status, output, and any structured errors
+together. Inspect these fields before using the output in a later step.
+
+## Retry only safe functions
+
+A function can write data or call another service, so invocation POSTs are not
+retried by default. If a function is read-only or implements its own durable
+idempotency key, opt in explicitly:
+
+```{r, eval = FALSE}
+result <- fabric_function_invoke(
+  function_url,
+  parameters = list(requestId = "stable-business-key"),
+  idempotent = TRUE
+)
+```
+
+Opted-in calls use bounded retries for transport failures, throttling, and
+transient HTTP responses.
+
+## Limits
+
+Public function calls have request-size, execution-time, and response-size
+limits. Keep calls focused and pass large data through a Fabric data store
+instead of function parameters. See the service-limits link below for current
+values.
+
+## More information
+
+See Microsoft's [external invocation
+tutorial](https://learn.microsoft.com/en-us/fabric/data-engineering/user-data-functions/tutorial-invoke-from-python-app),
+[programming model](https://learn.microsoft.com/en-us/fabric/data-engineering/user-data-functions/python-programming-model),
+and [service limits](https://learn.microsoft.com/en-us/fabric/data-engineering/user-data-functions/user-data-functions-service-limits).

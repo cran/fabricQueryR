@@ -1,0 +1,701 @@
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta charset="utf-8" />
+<meta name="generator" content="pandoc" />
+<meta http-equiv="X-UA-Compatible" content="IE=EDGE" />
+
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+
+
+
+<title>Bring Fabric data into R</title>
+
+<script>// Pandoc 2.9 adds attributes on both header and div. We remove the former (to
+// be compatible with the behavior of Pandoc < 2.8).
+document.addEventListener('DOMContentLoaded', function(e) {
+  var hs = document.querySelectorAll("div.section[class*='level'] > :first-child");
+  var i, h, a;
+  for (i = 0; i < hs.length; i++) {
+    h = hs[i];
+    if (!/^h[1-6]$/i.test(h.tagName)) continue;  // it should be a header h1-h6
+    a = h.attributes;
+    while (a.length > 0) h.removeAttribute(a[0].name);
+  }
+});
+</script>
+
+<style type="text/css">
+code{white-space: pre-wrap;}
+span.smallcaps{font-variant: small-caps;}
+span.underline{text-decoration: underline;}
+div.column{display: inline-block; vertical-align: top; width: 50%;}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+</style>
+
+
+
+<style type="text/css">
+code {
+white-space: pre;
+}
+.sourceCode {
+overflow: visible;
+}
+</style>
+<style type="text/css" data-origin="pandoc">
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+{ counter-reset: source-line 0; }
+pre.numberSource code > span
+{ position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+{ content: counter(source-line);
+position: relative; left: -1em; text-align: right; vertical-align: baseline;
+border: none; display: inline-block;
+-webkit-touch-callout: none; -webkit-user-select: none;
+-khtml-user-select: none; -moz-user-select: none;
+-ms-user-select: none; user-select: none;
+padding: 0 4px; width: 4em;
+color: #aaaaaa;
+}
+pre.numberSource { margin-left: 3em; border-left: 1px solid #aaaaaa; padding-left: 4px; }
+div.sourceCode
+{ }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+code span.al { color: #ff0000; font-weight: bold; } 
+code span.an { color: #60a0b0; font-weight: bold; font-style: italic; } 
+code span.at { color: #7d9029; } 
+code span.bn { color: #40a070; } 
+code span.bu { color: #008000; } 
+code span.cf { color: #007020; font-weight: bold; } 
+code span.ch { color: #4070a0; } 
+code span.cn { color: #880000; } 
+code span.co { color: #60a0b0; font-style: italic; } 
+code span.cv { color: #60a0b0; font-weight: bold; font-style: italic; } 
+code span.do { color: #ba2121; font-style: italic; } 
+code span.dt { color: #902000; } 
+code span.dv { color: #40a070; } 
+code span.er { color: #ff0000; font-weight: bold; } 
+code span.ex { } 
+code span.fl { color: #40a070; } 
+code span.fu { color: #06287e; } 
+code span.im { color: #008000; font-weight: bold; } 
+code span.in { color: #60a0b0; font-weight: bold; font-style: italic; } 
+code span.kw { color: #007020; font-weight: bold; } 
+code span.op { color: #666666; } 
+code span.ot { color: #007020; } 
+code span.pp { color: #bc7a00; } 
+code span.sc { color: #4070a0; } 
+code span.ss { color: #bb6688; } 
+code span.st { color: #4070a0; } 
+code span.va { color: #19177c; } 
+code span.vs { color: #4070a0; } 
+code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; } 
+</style>
+<script>
+// apply pandoc div.sourceCode style to pre.sourceCode instead
+(function() {
+  var sheets = document.styleSheets;
+  for (var i = 0; i < sheets.length; i++) {
+    if (sheets[i].ownerNode.dataset["origin"] !== "pandoc") continue;
+    try { var rules = sheets[i].cssRules; } catch (e) { continue; }
+    var j = 0;
+    while (j < rules.length) {
+      var rule = rules[j];
+      // check if there is a div.sourceCode rule
+      if (rule.type !== rule.STYLE_RULE || rule.selectorText !== "div.sourceCode") {
+        j++;
+        continue;
+      }
+      var style = rule.style.cssText;
+      // check if color or background-color is set
+      if (rule.style.color === '' && rule.style.backgroundColor === '') {
+        j++;
+        continue;
+      }
+      // replace div.sourceCode by a pre.sourceCode rule
+      sheets[i].deleteRule(j);
+      sheets[i].insertRule('pre.sourceCode{' + style + '}', j);
+    }
+  }
+})();
+</script>
+
+
+
+
+<style type="text/css">body {
+background-color: #fff;
+margin: 1em auto;
+max-width: 700px;
+overflow: visible;
+padding-left: 2em;
+padding-right: 2em;
+font-family: "Open Sans", "Helvetica Neue", Helvetica, Arial, sans-serif;
+font-size: 14px;
+line-height: 1.35;
+}
+#TOC {
+clear: both;
+margin: 0 0 10px 10px;
+padding: 4px;
+width: 400px;
+border: 1px solid #CCCCCC;
+border-radius: 5px;
+background-color: #f6f6f6;
+font-size: 13px;
+line-height: 1.3;
+}
+#TOC .toctitle {
+font-weight: bold;
+font-size: 15px;
+margin-left: 5px;
+}
+#TOC ul {
+padding-left: 40px;
+margin-left: -1.5em;
+margin-top: 5px;
+margin-bottom: 5px;
+}
+#TOC ul ul {
+margin-left: -2em;
+}
+#TOC li {
+line-height: 16px;
+}
+table {
+margin: 1em auto;
+border-width: 1px;
+border-color: #DDDDDD;
+border-style: outset;
+border-collapse: collapse;
+}
+table th {
+border-width: 2px;
+padding: 5px;
+border-style: inset;
+}
+table td {
+border-width: 1px;
+border-style: inset;
+line-height: 18px;
+padding: 5px 5px;
+}
+table, table th, table td {
+border-left-style: none;
+border-right-style: none;
+}
+table thead, table tr.even {
+background-color: #f7f7f7;
+}
+p {
+margin: 0.5em 0;
+}
+blockquote {
+background-color: #f6f6f6;
+padding: 0.25em 0.75em;
+}
+hr {
+border-style: solid;
+border: none;
+border-top: 1px solid #777;
+margin: 28px 0;
+}
+dl {
+margin-left: 0;
+}
+dl dd {
+margin-bottom: 13px;
+margin-left: 13px;
+}
+dl dt {
+font-weight: bold;
+}
+ul {
+margin-top: 0;
+}
+ul li {
+list-style: circle outside;
+}
+ul ul {
+margin-bottom: 0;
+}
+pre, code {
+background-color: #f7f7f7;
+border-radius: 3px;
+color: #333;
+white-space: pre-wrap; 
+}
+pre {
+border-radius: 3px;
+margin: 5px 0px 10px 0px;
+padding: 10px;
+}
+pre:not([class]) {
+background-color: #f7f7f7;
+}
+code {
+font-family: Consolas, Monaco, 'Courier New', monospace;
+font-size: 85%;
+}
+p > code, li > code {
+padding: 2px 0px;
+}
+div.figure {
+text-align: center;
+}
+img {
+background-color: #FFFFFF;
+padding: 2px;
+border: 1px solid #DDDDDD;
+border-radius: 3px;
+border: 1px solid #CCCCCC;
+margin: 0 5px;
+}
+h1 {
+margin-top: 0;
+font-size: 35px;
+line-height: 40px;
+}
+h2 {
+border-bottom: 4px solid #f7f7f7;
+padding-top: 10px;
+padding-bottom: 2px;
+font-size: 145%;
+}
+h3 {
+border-bottom: 2px solid #f7f7f7;
+padding-top: 10px;
+font-size: 120%;
+}
+h4 {
+border-bottom: 1px solid #f7f7f7;
+margin-left: 8px;
+font-size: 105%;
+}
+h5, h6 {
+border-bottom: 1px solid #ccc;
+font-size: 105%;
+}
+a {
+color: #0033dd;
+text-decoration: none;
+}
+a:hover {
+color: #6666ff; }
+a:visited {
+color: #800080; }
+a:visited:hover {
+color: #BB00BB; }
+a[href^="http:"] {
+text-decoration: underline; }
+a[href^="https:"] {
+text-decoration: underline; }
+
+code > span.kw { color: #555; font-weight: bold; } 
+code > span.dt { color: #902000; } 
+code > span.dv { color: #40a070; } 
+code > span.bn { color: #d14; } 
+code > span.fl { color: #d14; } 
+code > span.ch { color: #d14; } 
+code > span.st { color: #d14; } 
+code > span.co { color: #888888; font-style: italic; } 
+code > span.ot { color: #007020; } 
+code > span.al { color: #ff0000; font-weight: bold; } 
+code > span.fu { color: #900; font-weight: bold; } 
+code > span.er { color: #a61717; background-color: #e3d2d2; } 
+</style>
+
+
+
+
+</head>
+
+<body>
+
+
+
+
+<h1 class="title toc-ignore">Bring Fabric data into R</h1>
+
+
+
+<p>Microsoft Fabric stores and serves data through Lakehouses,
+Warehouses, Eventhouses, semantic models, files, and APIs.
+‘fabricQueryR’ helps you bring that data into your local R session for
+analysis, visualization, and reporting. For most everyday tasks, the
+result is a tibble (a modern R data frame).</p>
+<p>The best method depends on where the data lives and whether you need
+a whole table or a filtered result. Start with a small read and let
+Fabric filter the data when possible. Move to Arrow streaming or Spark
+only when the data is too large for local memory or the transformation
+needs distributed computing. This guide compares the common methods in
+that order.</p>
+<div id="choose-a-reading-method" class="section level2">
+<h2>Choose a reading method</h2>
+<table>
+<colgroup>
+<col width="33%" />
+<col width="33%" />
+<col width="33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Your source or goal</th>
+<th>Start with</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Warehouse, SQL Database, or a SQL-shaped Lakehouse query</td>
+<td><code>item$sql_query()</code> (<code>fabric_sql_query()</code>)</td>
+<td>Filter and summarize on the server with familiar SQL</td>
+</tr>
+<tr class="even">
+<td>One Lakehouse Delta table</td>
+<td><code>lakehouse$read_table()</code>
+(<code>fabric_lakehouse_read_table()</code>)</td>
+<td>Read a table without writing SQL</td>
+</tr>
+<tr class="odd">
+<td>One Warehouse table</td>
+<td><code>warehouse$read_table()</code>
+(<code>fabric_warehouse_read_table()</code>)</td>
+<td>Read a table by name without writing SQL</td>
+</tr>
+<tr class="even">
+<td>Eventhouse table or KQL result</td>
+<td><code>kql_database$read_table()</code>
+(<code>fabric_kql_read_table()</code>) or <code>$query()</code>
+(<code>fabric_kql_query()</code>)</td>
+<td>Use the Eventhouse query engine</td>
+</tr>
+<tr class="odd">
+<td>Power BI/Fabric semantic model</td>
+<td><code>model$dax_query()</code>
+(<code>fabric_pbi_dax_query()</code>)</td>
+<td>Use model relationships and measures</td>
+</tr>
+<tr class="even">
+<td>CSV, Parquet, or Arrow file in OneLake</td>
+<td><code>lakehouse$onelake_read_file()</code>
+(<code>fabric_onelake_read_file()</code>)</td>
+<td>Read the file itself</td>
+</tr>
+<tr class="odd">
+<td>API for GraphQL</td>
+<td><code>api$query()</code> (<code>fabric_graphql_query()</code>)</td>
+<td>Request the fields exposed by the API</td>
+</tr>
+<tr class="even">
+<td>A transformation that genuinely needs Spark</td>
+<td><code>lakehouse$livy_query()</code>
+(<code>fabric_livy_query()</code>)</td>
+<td>Run distributed code in Fabric</td>
+</tr>
+</tbody>
+</table>
+<p>SQL is a good default for relational data because Fabric does the
+filtering and R receives only the rows you need. A direct table reader
+is simpler when you want one table and do not need joins or
+grouping.</p>
+</div>
+<div id="discover-the-data-source-once" class="section level2">
+<h2>Discover the data source once</h2>
+<p>Discovery returns read-only R6 objects. They carry the IDs,
+connection details, and credential needed by their read methods. Read
+service fields such as <code>$displayName</code> and <code>$id</code>
+directly:</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb1-1"><a href="#cb1-1" tabindex="-1"></a><span class="fu">library</span>(fabricQueryR)</span>
+<span id="cb1-2"><a href="#cb1-2" tabindex="-1"></a></span>
+<span id="cb1-3"><a href="#cb1-3" tabindex="-1"></a>workspaces <span class="ot">&lt;-</span> <span class="fu">fabric_workspaces</span>()</span>
+<span id="cb1-4"><a href="#cb1-4" tabindex="-1"></a>matches <span class="ot">&lt;-</span> <span class="fu">Filter</span>(</span>
+<span id="cb1-5"><a href="#cb1-5" tabindex="-1"></a>  \(x) <span class="fu">identical</span>(x<span class="sc">$</span>displayName, <span class="st">&quot;Analytics workspace&quot;</span>),</span>
+<span id="cb1-6"><a href="#cb1-6" tabindex="-1"></a>  workspaces</span>
+<span id="cb1-7"><a href="#cb1-7" tabindex="-1"></a>)</span>
+<span id="cb1-8"><a href="#cb1-8" tabindex="-1"></a><span class="fu">stopifnot</span>(<span class="fu">length</span>(matches) <span class="sc">==</span> <span class="dv">1</span><span class="dt">L</span>)</span>
+<span id="cb1-9"><a href="#cb1-9" tabindex="-1"></a>workspace <span class="ot">&lt;-</span> matches[[<span class="dv">1</span><span class="dt">L</span>]]</span>
+<span id="cb1-10"><a href="#cb1-10" tabindex="-1"></a>lakehouse <span class="ot">&lt;-</span> workspace<span class="sc">$</span><span class="fu">lakehouses</span>()[[<span class="dv">1</span><span class="dt">L</span>]]</span>
+<span id="cb1-11"><a href="#cb1-11" tabindex="-1"></a>warehouse <span class="ot">&lt;-</span> workspace<span class="sc">$</span><span class="fu">warehouses</span>()[[<span class="dv">1</span><span class="dt">L</span>]]</span>
+<span id="cb1-12"><a href="#cb1-12" tabindex="-1"></a>kql_database <span class="ot">&lt;-</span> workspace<span class="sc">$</span><span class="fu">kql_databases</span>()[[<span class="dv">1</span><span class="dt">L</span>]]</span>
+<span id="cb1-13"><a href="#cb1-13" tabindex="-1"></a>model <span class="ot">&lt;-</span> workspace<span class="sc">$</span><span class="fu">semantic_models</span>()[[<span class="dv">1</span><span class="dt">L</span>]]</span></code></pre></div>
+<p>The workspace methods above correspond to
+<code>fabric_lakehouses()</code>, <code>fabric_warehouses()</code>,
+<code>fabric_kql_databases()</code>, and
+<code>fabric_semantic_models()</code>.</p>
+<p>Your workspace does not need to contain every item type. Discover
+only the source used by your workflow.</p>
+</div>
+<div id="read-with-sql" class="section level2">
+<h2>Read with SQL</h2>
+<p>Use an item’s <code>$sql_query()</code> method
+(<code>fabric_sql_query()</code>) for one read-only <code>SELECT</code>
+query. It opens and closes the connection for you and returns a
+tibble:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb2-1"><a href="#cb2-1" tabindex="-1"></a>recent_orders <span class="ot">&lt;-</span> warehouse<span class="sc">$</span><span class="fu">sql_query</span>(</span>
+<span id="cb2-2"><a href="#cb2-2" tabindex="-1"></a>  <span class="at">sql =</span> <span class="fu">paste</span>(</span>
+<span id="cb2-3"><a href="#cb2-3" tabindex="-1"></a>    <span class="st">&quot;SELECT TOP 100 order_id, order_date, amount&quot;</span>,</span>
+<span id="cb2-4"><a href="#cb2-4" tabindex="-1"></a>    <span class="st">&quot;FROM dbo.orders&quot;</span>,</span>
+<span id="cb2-5"><a href="#cb2-5" tabindex="-1"></a>    <span class="st">&quot;WHERE order_date &gt;= ?&quot;</span>,</span>
+<span id="cb2-6"><a href="#cb2-6" tabindex="-1"></a>    <span class="st">&quot;ORDER BY order_date DESC&quot;</span></span>
+<span id="cb2-7"><a href="#cb2-7" tabindex="-1"></a>  ),</span>
+<span id="cb2-8"><a href="#cb2-8" tabindex="-1"></a>  <span class="at">params =</span> <span class="fu">list</span>(<span class="fu">as.Date</span>(<span class="st">&quot;2026-01-01&quot;</span>))</span>
+<span id="cb2-9"><a href="#cb2-9" tabindex="-1"></a>)</span>
+<span id="cb2-10"><a href="#cb2-10" tabindex="-1"></a></span>
+<span id="cb2-11"><a href="#cb2-11" tabindex="-1"></a><span class="fu">head</span>(recent_orders)</span></code></pre></div>
+<p>The default <code>numeric_policy = &quot;auto&quot;</code> uses ODBC’s numeric
+conversion and warns once per R session that precision may be lost. Use
+<code>backend = &quot;adbc&quot;</code> for exact conversion, or
+<code>numeric_policy = &quot;exact&quot;</code> to reject ODBC results containing
+INT, BIGINT, DECIMAL, or NUMERIC columns before fetching. Casting these
+columns to <code>varchar</code> in SQL also preserves their values.
+Explicit <code>numeric_policy = &quot;driver&quot;</code> accepts driver
+conversion without the warning.</p>
+<p>The ADBC backend needs the optional ‘adbi’ and ‘adbcdrivermanager’
+packages, plus the Microsoft SQL Server ADBC driver. ‘adbi’ is available
+from the R-DBI repository while it is archived on CRAN:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb3-1"><a href="#cb3-1" tabindex="-1"></a><span class="fu">install.packages</span>(</span>
+<span id="cb3-2"><a href="#cb3-2" tabindex="-1"></a>  <span class="fu">c</span>(<span class="st">&quot;adbi&quot;</span>, <span class="st">&quot;adbcdrivermanager&quot;</span>),</span>
+<span id="cb3-3"><a href="#cb3-3" tabindex="-1"></a>  <span class="at">repos =</span> <span class="fu">c</span>(<span class="st">&quot;https://r-dbi.r-universe.dev&quot;</span>, <span class="st">&quot;https://cloud.r-project.org&quot;</span>)</span>
+<span id="cb3-4"><a href="#cb3-4" tabindex="-1"></a>)</span></code></pre></div>
+<p>Install the SQL Server driver separately with
+<code>dbc install mssql</code>. See <code>?fabric_sql_connect</code> for
+driver selection and connection options.</p>
+<p>Put changing values in <code>params</code> rather than pasting them
+into the SQL text. This handles quoting safely. Use
+<code>$sql_connect()</code> (<code>fabric_sql_connect()</code>) and
+normal ‘DBI’ functions when several queries should share one
+connection:</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb4-1"><a href="#cb4-1" tabindex="-1"></a>orders <span class="ot">&lt;-</span> <span class="fu">local</span>({</span>
+<span id="cb4-2"><a href="#cb4-2" tabindex="-1"></a>  con <span class="ot">&lt;-</span> warehouse<span class="sc">$</span><span class="fu">sql_connect</span>()</span>
+<span id="cb4-3"><a href="#cb4-3" tabindex="-1"></a>  <span class="fu">on.exit</span>(DBI<span class="sc">::</span><span class="fu">dbDisconnect</span>(con), <span class="at">add =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb4-4"><a href="#cb4-4" tabindex="-1"></a>  DBI<span class="sc">::</span><span class="fu">dbListTables</span>(con)</span>
+<span id="cb4-5"><a href="#cb4-5" tabindex="-1"></a>  DBI<span class="sc">::</span><span class="fu">dbGetQuery</span>(con, <span class="st">&quot;SELECT TOP 100 * FROM dbo.orders&quot;</span>)</span>
+<span id="cb4-6"><a href="#cb4-6" tabindex="-1"></a>})</span></code></pre></div>
+<p>Direct ‘DBI’ reads use the driver’s numeric conversion.</p>
+<p>The default SQL backend uses Microsoft ODBC Driver 18 for SQL Server.
+See <code>?fabric_sql_connect</code> for the ODBC and ADBC setup
+choices.</p>
+</div>
+<div id="read-one-table-without-writing-a-query" class="section level2">
+<h2>Read one table without writing a query</h2>
+<p>Lakehouse and Warehouse table readers accept a table name and can
+limit the data before it enters R. The <code>$read_table()</code>
+methods call <code>fabric_lakehouse_read_table()</code> and
+<code>fabric_warehouse_read_table()</code>, respectively:</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb5-1"><a href="#cb5-1" tabindex="-1"></a>lakehouse_rows <span class="ot">&lt;-</span> lakehouse<span class="sc">$</span><span class="fu">read_table</span>(</span>
+<span id="cb5-2"><a href="#cb5-2" tabindex="-1"></a>  <span class="at">table =</span> <span class="st">&quot;orders&quot;</span>,</span>
+<span id="cb5-3"><a href="#cb5-3" tabindex="-1"></a>  <span class="at">columns =</span> <span class="fu">c</span>(<span class="st">&quot;order_id&quot;</span>, <span class="st">&quot;order_date&quot;</span>, <span class="st">&quot;amount&quot;</span>),</span>
+<span id="cb5-4"><a href="#cb5-4" tabindex="-1"></a>  <span class="at">limit =</span> <span class="dv">100</span><span class="dt">L</span></span>
+<span id="cb5-5"><a href="#cb5-5" tabindex="-1"></a>)</span>
+<span id="cb5-6"><a href="#cb5-6" tabindex="-1"></a></span>
+<span id="cb5-7"><a href="#cb5-7" tabindex="-1"></a>warehouse_rows <span class="ot">&lt;-</span> warehouse<span class="sc">$</span><span class="fu">read_table</span>(</span>
+<span id="cb5-8"><a href="#cb5-8" tabindex="-1"></a>  <span class="at">table =</span> <span class="st">&quot;orders&quot;</span>,</span>
+<span id="cb5-9"><a href="#cb5-9" tabindex="-1"></a>  <span class="at">schema =</span> <span class="st">&quot;dbo&quot;</span>,</span>
+<span id="cb5-10"><a href="#cb5-10" tabindex="-1"></a>  <span class="at">limit =</span> <span class="dv">100</span><span class="dt">L</span></span>
+<span id="cb5-11"><a href="#cb5-11" tabindex="-1"></a>)</span></code></pre></div>
+<p>Warehouse reads use the same <code>numeric_policy = &quot;auto&quot;</code>
+default as SQL queries: driver conversion for ODBC, or exact conversion
+for ADBC. The ODBC precision warning is shared by queries and table
+reads and appears only once per session. Use
+<code>numeric_policy = &quot;exact&quot;</code> to reject unsafe ODBC results, or
+<code>numeric_policy = &quot;driver&quot;</code> to explicitly accept conversion
+without a warning.</p>
+<p>Use <code>lakehouse$tables()</code>
+(<code>fabric_lakehouse_tables()</code>) when you are unsure which
+Lakehouse tables or schemas are available.</p>
+<p>Direct Lakehouse reads use Python’s ‘deltalake’ and ‘nanoarrow’
+through ‘reticulate’. <strong>To enable automatic installation, restart
+R first</strong>, then explicitly select a managed environment before
+loading the package:</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb6-1"><a href="#cb6-1" tabindex="-1"></a><span class="fu">Sys.setenv</span>(<span class="at">RETICULATE_PYTHON =</span> <span class="st">&quot;managed&quot;</span>)</span>
+<span id="cb6-2"><a href="#cb6-2" tabindex="-1"></a><span class="fu">library</span>(fabricQueryR)</span>
+<span id="cb6-3"><a href="#cb6-3" tabindex="-1"></a><span class="fu">fabric_delta_config</span>(<span class="at">initialize =</span> <span class="cn">TRUE</span>)</span></code></pre></div>
+<p><code>&quot;managed&quot;</code> tells ‘reticulate’ to create or reuse an
+environment that satisfies the package’s requirements. Loading
+‘fabricQueryR’ declares them with <code>reticulate::py_require()</code>,
+and initialization uses ‘uv’ to download Python and the dependencies if
+needed. ‘reticulate’ also downloads ‘uv’ if needed. No separate
+<code>py_install()</code> call is necessary. Both entries in
+<code>available</code> should then be <code>TRUE</code>, with installed
+package versions in <code>versions</code>.</p>
+<p>Without <code>RETICULATE_PYTHON = &quot;managed&quot;</code>, an existing
+Python selected through RStudio, environment variables,
+<code>use_python()</code>, or a project virtualenv can take precedence.
+Declaring requirements does not install them into that interpreter or
+upgrade it; Python 3.9, for example, cannot satisfy this backend’s
+minimum of Python 3.10. Once Python starts, restart R before changing
+its selection. <code>reticulate::py_config()</code> reports which
+interpreter was chosen and why.</p>
+<p>To enable managed setup for future sessions in this project, add
+<code>RETICULATE_PYTHON=managed</code> to the project’s
+<code>.Renviron</code> file and restart R. Use
+<code>fabric_delta_config()</code> to inspect requirements without
+starting Python.</p>
+<p>For a reusable environment that you manage yourself, create it with
+<code>reticulate::virtualenv_create()</code> from a compatible installed
+Python, or with <code>uv venv --python 3.11 --seed</code> at a chosen
+path. Then install the dependencies with
+<code>reticulate::py_install(..., envname = ..., method = &quot;virtualenv&quot;)</code>
+and select that environment before Python starts.
+<code>py_install()</code> uses ‘pip’ in a virtualenv; it does not
+upgrade an environment’s Python version.</p>
+<p>See <code>?fabric_delta_config</code> for complete examples of both
+setup routes, and <code>?fabric_onelake_read_delta_table</code> for
+supported table features, OneLake permissions, and exact numeric
+conversions.</p>
+</div>
+<div id="read-eventhouse-data" class="section level2">
+<h2>Read Eventhouse data</h2>
+<p>An Eventhouse is optimized for event, log, and time-series data. Its
+query language is KQL. Read a whole table by name with
+<code>$read_table()</code> (<code>fabric_kql_read_table()</code>):</p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb7-1"><a href="#cb7-1" tabindex="-1"></a>events <span class="ot">&lt;-</span> kql_database<span class="sc">$</span><span class="fu">read_table</span>(</span>
+<span id="cb7-2"><a href="#cb7-2" tabindex="-1"></a>  <span class="at">table =</span> <span class="st">&quot;Events&quot;</span>,</span>
+<span id="cb7-3"><a href="#cb7-3" tabindex="-1"></a>  <span class="at">limit =</span> <span class="dv">100</span><span class="dt">L</span></span>
+<span id="cb7-4"><a href="#cb7-4" tabindex="-1"></a>)</span></code></pre></div>
+<p>Use <code>$query()</code> (<code>fabric_kql_query()</code>) when
+Fabric should filter or summarize the events first:</p>
+<div class="sourceCode" id="cb8"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb8-1"><a href="#cb8-1" tabindex="-1"></a>daily_events <span class="ot">&lt;-</span> kql_database<span class="sc">$</span><span class="fu">query</span>(</span>
+<span id="cb8-2"><a href="#cb8-2" tabindex="-1"></a>  <span class="at">query =</span> <span class="fu">paste</span>(</span>
+<span id="cb8-3"><a href="#cb8-3" tabindex="-1"></a>    <span class="st">&quot;Events&quot;</span>,</span>
+<span id="cb8-4"><a href="#cb8-4" tabindex="-1"></a>    <span class="st">&quot;| where observed_at &gt;= ago(7d)&quot;</span>,</span>
+<span id="cb8-5"><a href="#cb8-5" tabindex="-1"></a>    <span class="st">&quot;| summarize event_count = count() by bin(observed_at, 1d)&quot;</span>,</span>
+<span id="cb8-6"><a href="#cb8-6" tabindex="-1"></a>    <span class="st">&quot;| order by observed_at asc&quot;</span></span>
+<span id="cb8-7"><a href="#cb8-7" tabindex="-1"></a>  )</span>
+<span id="cb8-8"><a href="#cb8-8" tabindex="-1"></a>)</span></code></pre></div>
+</div>
+<div id="query-a-semantic-model-with-dax" class="section level2">
+<h2>Query a semantic model with DAX</h2>
+<p>A semantic model is a dataset ready for reporting, commonly used in
+Power BI. Query it with <code>$dax_query()</code>
+(<code>fabric_pbi_dax_query()</code>) and DAX (Data Analysis
+Expressions):</p>
+<div class="sourceCode" id="cb9"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb9-1"><a href="#cb9-1" tabindex="-1"></a>sales_by_region <span class="ot">&lt;-</span> model<span class="sc">$</span><span class="fu">dax_query</span>(</span>
+<span id="cb9-2"><a href="#cb9-2" tabindex="-1"></a>  <span class="at">dax =</span> <span class="fu">paste</span>(</span>
+<span id="cb9-3"><a href="#cb9-3" tabindex="-1"></a>    <span class="st">&quot;EVALUATE&quot;</span>,</span>
+<span id="cb9-4"><a href="#cb9-4" tabindex="-1"></a>    <span class="st">&quot;SUMMARIZECOLUMNS(&quot;</span>,</span>
+<span id="cb9-5"><a href="#cb9-5" tabindex="-1"></a>    <span class="st">&quot;  &#39;Region&#39;[Region],&quot;</span>,</span>
+<span id="cb9-6"><a href="#cb9-6" tabindex="-1"></a>    <span class="st">&quot;  </span><span class="sc">\&quot;</span><span class="st">Total Sales</span><span class="sc">\&quot;</span><span class="st">, [Total Sales]&quot;</span>,</span>
+<span id="cb9-7"><a href="#cb9-7" tabindex="-1"></a>    <span class="st">&quot;)&quot;</span></span>
+<span id="cb9-8"><a href="#cb9-8" tabindex="-1"></a>  )</span>
+<span id="cb9-9"><a href="#cb9-9" tabindex="-1"></a>)</span></code></pre></div>
+<p>The <a href="semantic-model-refresh.html">Semantic Models
+vignette</a> shows more things you can do with semantic models, like
+refreshing their data.</p>
+</div>
+<div id="read-a-onelake-file" class="section level2">
+<h2>Read a OneLake file</h2>
+<p>Use the file reader when the file itself is the data contract. Paths
+in a Lakehouse usually begin with <code>Files/</code>. The
+<code>$onelake_read_file()</code> method calls
+<code>fabric_onelake_read_file()</code>:</p>
+<div class="sourceCode" id="cb10"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb10-1"><a href="#cb10-1" tabindex="-1"></a>orders_file <span class="ot">&lt;-</span> lakehouse<span class="sc">$</span><span class="fu">onelake_read_file</span>(</span>
+<span id="cb10-2"><a href="#cb10-2" tabindex="-1"></a>  <span class="at">path =</span> <span class="st">&quot;Files/exports/orders.parquet&quot;</span></span>
+<span id="cb10-3"><a href="#cb10-3" tabindex="-1"></a>)</span></code></pre></div>
+<p>CSV, Parquet, and Arrow IPC files can become R or Arrow objects.
+Other file types can be downloaded as raw bytes or to disk. Use a
+Lakehouse table reader, not a file reader, for managed data below
+<code>Tables/</code>.</p>
+</div>
+<div id="read-through-graphql-or-spark" class="section level2">
+<h2>Read through GraphQL or Spark</h2>
+<p>GraphQL is useful when a Fabric API item exposes a purpose-built
+selection of fields:</p>
+<div class="sourceCode" id="cb11"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb11-1"><a href="#cb11-1" tabindex="-1"></a>api <span class="ot">&lt;-</span> workspace<span class="sc">$</span><span class="fu">graphql_apis</span>()[[<span class="dv">1</span><span class="dt">L</span>]]</span>
+<span id="cb11-2"><a href="#cb11-2" tabindex="-1"></a></span>
+<span id="cb11-3"><a href="#cb11-3" tabindex="-1"></a>response <span class="ot">&lt;-</span> api<span class="sc">$</span><span class="fu">query</span>(</span>
+<span id="cb11-4"><a href="#cb11-4" tabindex="-1"></a>  <span class="at">query =</span> <span class="st">&quot;{ products { items { id name category } } }&quot;</span></span>
+<span id="cb11-5"><a href="#cb11-5" tabindex="-1"></a>)</span>
+<span id="cb11-6"><a href="#cb11-6" tabindex="-1"></a>products <span class="ot">&lt;-</span> response<span class="sc">$</span>data<span class="sc">$</span>products<span class="sc">$</span>items</span></code></pre></div>
+<p>Use <a href="graphql-schema-and-rows.html">Working with GraphQL</a>
+for schema inspection and pagination. <code>$graphql_apis()</code> is
+the workspace method for <code>fabric_graphql_apis()</code>.</p>
+<p>Spark is the later choice for distributed transformations, Spark-only
+data formats, or logic already written for Spark:</p>
+<div class="sourceCode" id="cb12"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb12-1"><a href="#cb12-1" tabindex="-1"></a>result <span class="ot">&lt;-</span> lakehouse<span class="sc">$</span><span class="fu">livy_query</span>(</span>
+<span id="cb12-2"><a href="#cb12-2" tabindex="-1"></a>  <span class="at">kind =</span> <span class="st">&quot;sql&quot;</span>,</span>
+<span id="cb12-3"><a href="#cb12-3" tabindex="-1"></a>  <span class="at">code =</span> <span class="st">&quot;SELECT category, count(*) AS n FROM orders GROUP BY category&quot;</span></span>
+<span id="cb12-4"><a href="#cb12-4" tabindex="-1"></a>)</span>
+<span id="cb12-5"><a href="#cb12-5" tabindex="-1"></a>counts <span class="ot">&lt;-</span> result<span class="sc">$</span>output<span class="sc">$</span>parsed</span></code></pre></div>
+<p>Spark has startup cost. Prefer SQL or a direct reader for a small,
+ordinary table read.</p>
+</div>
+<div id="scale-up-with-arrow-streams" class="section level2">
+<h2>Scale up with Arrow streams</h2>
+<p>If a selected result is larger than your computer’s working memory,
+process it as a stream instead of collecting it all at once.</p>
+<p>Several readers accept <code>result = &quot;arrow_stream&quot;</code>. This can
+be used with the ‘arrow’ R package to read the data in batches. Here
+<code>$read_table()</code> calls
+<code>fabric_lakehouse_read_table()</code>:</p>
+<div class="sourceCode" id="cb13"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb13-1"><a href="#cb13-1" tabindex="-1"></a>row_count <span class="ot">&lt;-</span> <span class="fu">local</span>({</span>
+<span id="cb13-2"><a href="#cb13-2" tabindex="-1"></a>  stream <span class="ot">&lt;-</span> lakehouse<span class="sc">$</span><span class="fu">read_table</span>(</span>
+<span id="cb13-3"><a href="#cb13-3" tabindex="-1"></a>    <span class="at">table =</span> <span class="st">&quot;large_orders&quot;</span>,</span>
+<span id="cb13-4"><a href="#cb13-4" tabindex="-1"></a>    <span class="at">result =</span> <span class="st">&quot;arrow_stream&quot;</span></span>
+<span id="cb13-5"><a href="#cb13-5" tabindex="-1"></a>  )</span>
+<span id="cb13-6"><a href="#cb13-6" tabindex="-1"></a>  <span class="fu">on.exit</span>(nanoarrow<span class="sc">::</span><span class="fu">nanoarrow_pointer_release</span>(stream), <span class="at">add =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb13-7"><a href="#cb13-7" tabindex="-1"></a>  reader <span class="ot">&lt;-</span> arrow<span class="sc">::</span><span class="fu">as_record_batch_reader</span>(stream)</span>
+<span id="cb13-8"><a href="#cb13-8" tabindex="-1"></a>  <span class="fu">on.exit</span>(reader<span class="sc">$</span><span class="fu">Close</span>(), <span class="at">add =</span> <span class="cn">TRUE</span>, <span class="at">after =</span> <span class="cn">FALSE</span>)</span>
+<span id="cb13-9"><a href="#cb13-9" tabindex="-1"></a>  count <span class="ot">&lt;-</span> <span class="dv">0</span></span>
+<span id="cb13-10"><a href="#cb13-10" tabindex="-1"></a>  <span class="cf">repeat</span> {</span>
+<span id="cb13-11"><a href="#cb13-11" tabindex="-1"></a>    batch <span class="ot">&lt;-</span> reader<span class="sc">$</span><span class="fu">read_next_batch</span>()</span>
+<span id="cb13-12"><a href="#cb13-12" tabindex="-1"></a>    <span class="cf">if</span> (<span class="fu">is.null</span>(batch)) <span class="cf">break</span></span>
+<span id="cb13-13"><a href="#cb13-13" tabindex="-1"></a>    <span class="co"># Process or write this batch before reading the next one.</span></span>
+<span id="cb13-14"><a href="#cb13-14" tabindex="-1"></a>    count <span class="ot">&lt;-</span> count <span class="sc">+</span> batch<span class="sc">$</span>num_rows</span>
+<span id="cb13-15"><a href="#cb13-15" tabindex="-1"></a>  }</span>
+<span id="cb13-16"><a href="#cb13-16" tabindex="-1"></a>  count</span>
+<span id="cb13-17"><a href="#cb13-17" tabindex="-1"></a>})</span></code></pre></div>
+<p><code>reader$read_table()</code> collects every remaining batch into
+one Arrow Table; use it only when the full selected result fits in
+memory. Direct Delta reads stage the selected data to a temporary file
+before returning the stream, so allow enough local disk space even when
+processing batches.</p>
+<p>Close an Arrow reader after use. For disk-backed OneLake Delta
+streams, this also deletes the staged temporary file; when consuming one
+directly through ‘nanoarrow’, call <code>stream[[&quot;release&quot;]]()</code>
+instead.</p>
+<p>See the <a href="https://arrow.apache.org/docs/r/">‘arrow’ R
+package</a> for more information on working with Arrow streams and
+record batches.</p>
+</div>
+
+
+
+<!-- code folding -->
+
+
+<!-- dynamically load mathjax for compatibility with self-contained -->
+<script>
+  (function () {
+    var script = document.createElement("script");
+    script.type = "text/javascript";
+    script.src  = "https://mathjax.rstudio.com/latest/MathJax.js?config=TeX-AMS-MML_HTMLorMML";
+    document.getElementsByTagName("head")[0].appendChild(script);
+  })();
+</script>
+
+</body>
+</html>

@@ -2,99 +2,196 @@
 % Please edit documentation in R/fabric_onelake_read_delta_table.R
 \name{fabric_onelake_read_delta_table}
 \alias{fabric_onelake_read_delta_table}
-\title{Read a Microsoft Fabric/OneLake Delta table (ADLS Gen2)}
+\title{Read a Delta table from OneLake}
 \usage{
 fabric_onelake_read_delta_table(
   table_path,
   workspace_name,
   lakehouse_name,
   schema = NULL,
+  item_type = NULL,
   tenant_id = Sys.getenv("FABRICQUERYR_TENANT_ID"),
   client_id = Sys.getenv("FABRICQUERYR_CLIENT_ID", unset =
     "04b07795-8ddb-461a-bbee-02f9e1bf7b46"),
-  dest_dir = NULL,
+  token = NULL,
+  auth_args = list(),
+  version = NULL,
   verbose = TRUE,
-  dfs_base = "https://onelake.dfs.fabric.microsoft.com"
+  dfs_base = "https://onelake.dfs.fabric.microsoft.com",
+  columns = NULL,
+  limit = NULL,
+  result = c("tibble", "arrow_stream")
 )
 }
 \arguments{
-\item{table_path}{Character. Table name or nested path (e.g.
-\code{"Patienten"} or \code{"Patienten/patienten_hash"}). Only the last path
-segment is used as the table directory under \verb{Tables/}.}
+\item{table_path}{Table name. Supply its schema separately when needed}
 
-\item{workspace_name}{Character. Fabric workspace display name or GUID
-(this is the ADLS filesystem/container name).}
+\item{workspace_name}{Workspace name, ID, or an object returned by
+\code{\link[=fabric_workspaces]{fabric_workspaces()}}}
 
-\item{lakehouse_name}{Character. Lakehouse item name, with or without the
-\code{.Lakehouse} suffix (e.g. \code{"Lakehouse"} or \code{"Lakehouse.Lakehouse"}).}
+\item{lakehouse_name}{Lakehouse name, ID, or discovery object. Compatible
+Warehouse and mirrored database items are also accepted}
 
-\item{schema}{Character or \code{NULL}. Lakehouse schema name (e.g. \code{"dbo"}).
-When supplied, the table is resolved under \verb{Tables/<schema>/<table>}
-instead of \verb{Tables/<table>}. Schema support requires a schema-enabled
-Lakehouse (enabled by default for new lakehouses). Defaults to \code{NULL}
-(no schema, for non-schema lakehouses). (Note: schema support through this
-argument is experimental.)}
+\item{schema}{Schema containing the table, or \code{NULL}. Warehouses and mirrored
+databases default to \code{"dbo"} when discovery provides no default. Use \code{""}
+for a physical table directly below \verb{Tables/} without a schema directory}
 
-\item{tenant_id}{Character. Entra ID (Azure AD) tenant GUID. Defaults to
-\code{Sys.getenv("FABRICQUERYR_TENANT_ID")} if missing.}
+\item{item_type}{\code{"Lakehouse"}, \code{"Warehouse"}, \code{"MirroredDatabase"}, or
+\code{NULL}. Usually inferred; specify it only when using an item name without a
+type suffix}
 
-\item{client_id}{Character. App registration (client) ID. Defaults to
-\code{Sys.getenv("FABRICQUERYR_CLIENT_ID")}, falling back to the Azure CLI app id
-\code{"04b07795-8ddb-461a-bbee-02f9e1bf7b46"} if not set.}
+\item{tenant_id}{Microsoft Entra tenant ID. Defaults to
+\code{FABRICQUERYR_TENANT_ID}}
 
-\item{dest_dir}{Character or \code{NULL}. Local staging directory for Parquet
-parts. If \code{NULL} (default), a temp dir is used and cleaned up on exit.}
+\item{client_id}{Microsoft Entra application/client ID. Defaults to
+\code{FABRICQUERYR_CLIENT_ID}, then the Azure CLI application ID}
 
-\item{verbose}{Logical. Print progress messages via \code{{cli}}. Default \code{TRUE}.}
+\item{token}{Optional access token or token-provider function. Most users can
+leave this as \code{NULL} and let 'fabricQueryR' sign in}
 
-\item{dfs_base}{Character. OneLake DFS endpoint. Default
-\code{"https://onelake.dfs.fabric.microsoft.com"}.}
+\item{auth_args}{Extra sign-in options passed to
+\code{\link[AzureAuth:get_azure_token]{AzureAuth::get_azure_token()}}}
+
+\item{version}{Specific table version to read, or \code{NULL} for the latest}
+
+\item{verbose}{Whether to show authentication and read progress}
+
+\item{dfs_base}{OneLake service address. Most users should keep the default;
+a workspace-specific address discovered from Fabric is used when available}
+
+\item{columns}{Column names to return, or \code{NULL} for all columns}
+
+\item{limit}{Maximum number of rows to return, or \code{NULL} for all rows}
+
+\item{result}{\code{"tibble"} (the default) or \code{"arrow_stream"} for batch
+processing}
 }
 \value{
-A tibble with the table's current rows (0 rows if the table is empty).
+A tibble, or a disk-backed, lazy, single-use Arrow stream when
+\code{result = "arrow_stream"}. Explicitly release that stream, or close an
+'arrow' reader that takes ownership of it, to delete its temporary file
 }
 \description{
-Authenticates to OneLake (ADLS Gen2), resolves the table's
-\verb{_delta_log} to determine the \emph{current} active Parquet parts,
-downloads only those parts to a local staging directory, and
-returns the result as a tibble.
+Loads a Lakehouse or compatible Warehouse table into R. By default the result
+is a tibble; you can select columns, preview a limited number of rows, read an
+earlier table version, or return an Arrow stream for larger results
 }
-\details{
-\itemize{
-\item In Microsoft Fabric, OneLake exposes each workspace as an ADLS Gen2
-filesystem. Within a Lakehouse item, Delta tables are stored under
-\verb{Tables/<table>} (non-schema lakehouse) or \verb{Tables/<schema>/<table>}
-(schema-enabled lakehouse) with a \verb{_delta_log/} directory that tracks
-commit state. This helper replays the JSON commits to avoid
-double-counting compacted/removed files.
-\item Schema-enabled lakehouses (the default for new lakehouses) organise
-tables into named schemas. Supply the \code{schema} argument (e.g. \code{"dbo"})
-to read a table stored under a specific schema.
-\item Ensure the account/principal you authenticate with has access via
-\strong{Lakehouse -> Manage OneLake data access} (or is a member of the workspace).
-\item \pkg{AzureAuth} is used to acquire the token. Be wary of
-caching behavior; you may want to call \code{\link[AzureAuth:get_azure_token]{AzureAuth::clean_token_directory()}}
-to clear cached tokens if you run into issues
-}
-}
-\examples{
-# Example is not executed since it requires configured credentials for Fabric
-\dontrun{
-df <- fabric_onelake_read_delta_table(
-  table_path     = "Patients/PatientInfo",
-  workspace_name = "PatientsWorkspace",
-  lakehouse_name = "Lakehouse.Lakehouse",
-  tenant_id      = Sys.getenv("FABRICQUERYR_TENANT_ID"),
-  client_id      = Sys.getenv("FABRICQUERYR_CLIENT_ID")
-)
-dplyr::glimpse(df)
+\section{Basic use}{
 
-# Schema-enabled lakehouse: read from Tables/dbo/PatientInfo
-df2 <- fabric_onelake_read_delta_table(
-  table_path     = "PatientInfo",
-  workspace_name = "PatientsWorkspace",
-  lakehouse_name = "Lakehouse.Lakehouse",
-  schema         = "dbo"
+Supply the table name, workspace, and Lakehouse. Names, IDs, and discovery
+records are accepted. If the Lakehouse uses schemas, pass the schema name
+separately. The function otherwise reads the latest version and all columns
+and rows into a tibble
+
+Use \code{columns} to keep only the fields you need, \code{limit} for a quick preview,
+and \code{version} to read an earlier version. A row limit does not guarantee
+which rows are selected
+}
+
+\section{Large and nested results}{
+
+For a large table, or one containing nested data, set
+\code{result = "arrow_stream"} to process rows in batches instead of collecting
+them all into R memory. The stream is disk-backed and can be read only once,
+so enough temporary disk space must be available for the selected data.
+Release the stream deterministically when finished: call
+\code{stream[["release"]]()} when using 'nanoarrow' directly, or call
+\code{reader$Close()} after \code{arrow::as_record_batch_reader(stream)}. Do not rely
+on garbage collection to delete the staged file, particularly on Windows
+
+A refreshable credential retries the entire read once after an authentication
+failure, including a failure while spooling an Arrow stream. Partial local
+output is discarded before retrying. Each attempt uses one token for its
+complete scan; credentials are not continuously replaced during long scans.
+}
+
+\section{Column types}{
+
+Common dates, timestamps, numbers, text, and logical values are converted to
+practical R types. Values that R cannot represent exactly, including decimal
+and 64-bit integer values, are returned as character data when collecting a
+tibble. Nested columns require an Arrow stream. The complete mapping is:\tabular{lll}{
+   Delta/Arrow source \tab Arrow stream result \tab Tibble result \cr
+   Decimal (any precision/scale) \tab UTF-8 text \tab character \cr
+   Large UTF-8 / large binary \tab original large-offset type \tab character / blob list-column \cr
+   UTF-8 / binary views \tab UTF-8 / binary with 32-bit offsets \tab character / blob list-column \cr
+   List views / large-list views \tab list / large list \tab rejected as nested \cr
+   Large list \tab original large-offset list \tab rejected as nested \cr
+   Signed/unsigned 64-bit integer \tab original integer type \tab exact character \cr
+   Signed 32-bit integer \tab original integer type \tab double \cr
+   Timestamp without timezone \tab original Arrow timestamp \tab character \cr
+   Timestamp with timezone \tab original Arrow timestamp \tab UTC \code{POSIXct} \cr
+   Date, Boolean, floating point, smaller integers, UTF-8, binary \tab corresponding Arrow scalar \tab corresponding R scalar type from 'nanoarrow' \cr
+   Struct, map, list, extension/Variant \tab corresponding normalized Arrow type when supported \tab rejected; request an Arrow stream \cr
+}
+
+
+Decimal text retains its scale and digits. Arrow view types are normalized
+for R compatibility; ordinary large-offset types retain their offsets
+}
+
+\section{Permissions and supported tables}{
+
+Direct reads require OneLake data access; item \code{Read} permission by itself is
+not enough. The caller needs \code{ReadAll} or a suitable OneLake security role,
+and the tenant setting for external OneLake apps must be enabled. Callers
+restricted by row- or column-level security must use a supported Fabric
+engine instead. See the
+\href{https://learn.microsoft.com/en-us/fabric/security/permission-model}{Fabric permission model}
+and \href{https://learn.microsoft.com/en-us/fabric/admin/service-admin-portal-onelake}{OneLake tenant settings}
+
+This function uses the Python
+\href{https://pypi.org/project/deltalake/}{deltalake} reader through 'reticulate'.
+Python 3.10 or newer and compatible Python 'deltalake' and 'nanoarrow'
+packages are required. Inspect the exact requirements with
+\code{\link[=fabric_delta_config]{fabric_delta_config()}}, or call \code{fabric_delta_config(initialize = TRUE)}
+to initialize the runtime. 'reticulate' can download a managed environment
+on first use; an already initialized custom environment must provide the
+required packages itself.
+
+Some newer Delta features, including Type Widening, V2 Checkpoints, and
+shredded Fabric Variant, are not supported by that reader. The reader can
+query an unshredded Variant table only when \code{columns} explicitly excludes
+every top-level column containing Variant values. It otherwise returns
+Variant's physical binary storage instead of decoded logical values, so this
+function rejects that projection. Use SQL or Spark (Livy) for Variant values
+or when the function reports another unsupported table feature
+
+Compatible Warehouse tables can also be read through their published Delta
+logs. If the reader cannot open a Warehouse table, use \code{\link[=fabric_sql_query]{fabric_sql_query()}}
+}
+
+\examples{
+\dontrun{
+# Discover a Lakehouse and one of its Delta tables
+workspace <- fabric_workspaces()[[1L]]
+lakehouse <- fabric_lakehouses(workspace)[[1L]]
+tables <- fabric_lakehouse_tables(lakehouse)
+table <- tables[1L, ]
+
+# Read the discovered table into a tibble
+rows <- fabric_lakehouse_read_table(
+  lakehouse = lakehouse,
+  table = table
 )
+
+# Stream the same table when it may not fit in R memory
+row_count <- local({
+  stream <- fabric_lakehouse_read_table(
+    lakehouse = lakehouse,
+    table = table,
+    result = "arrow_stream"
+  )
+  on.exit(nanoarrow::nanoarrow_pointer_release(stream), add = TRUE)
+  reader <- arrow::as_record_batch_reader(stream)
+  on.exit(reader$Close(), add = TRUE, after = FALSE)
+  count <- 0
+  repeat {
+    batch <- reader$read_next_batch()
+    if (is.null(batch)) break
+    count <- count + batch$num_rows
+  }
+  count
+})
 }
 }

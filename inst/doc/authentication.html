@@ -1,0 +1,709 @@
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta charset="utf-8" />
+<meta name="generator" content="pandoc" />
+<meta http-equiv="X-UA-Compatible" content="IE=EDGE" />
+
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+
+
+
+<title>Get started with Microsoft Fabric authentication</title>
+
+<script>// Pandoc 2.9 adds attributes on both header and div. We remove the former (to
+// be compatible with the behavior of Pandoc < 2.8).
+document.addEventListener('DOMContentLoaded', function(e) {
+  var hs = document.querySelectorAll("div.section[class*='level'] > :first-child");
+  var i, h, a;
+  for (i = 0; i < hs.length; i++) {
+    h = hs[i];
+    if (!/^h[1-6]$/i.test(h.tagName)) continue;  // it should be a header h1-h6
+    a = h.attributes;
+    while (a.length > 0) h.removeAttribute(a[0].name);
+  }
+});
+</script>
+
+<style type="text/css">
+code{white-space: pre-wrap;}
+span.smallcaps{font-variant: small-caps;}
+span.underline{text-decoration: underline;}
+div.column{display: inline-block; vertical-align: top; width: 50%;}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+</style>
+
+
+
+<style type="text/css">
+code {
+white-space: pre;
+}
+.sourceCode {
+overflow: visible;
+}
+</style>
+<style type="text/css" data-origin="pandoc">
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+{ counter-reset: source-line 0; }
+pre.numberSource code > span
+{ position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+{ content: counter(source-line);
+position: relative; left: -1em; text-align: right; vertical-align: baseline;
+border: none; display: inline-block;
+-webkit-touch-callout: none; -webkit-user-select: none;
+-khtml-user-select: none; -moz-user-select: none;
+-ms-user-select: none; user-select: none;
+padding: 0 4px; width: 4em;
+color: #aaaaaa;
+}
+pre.numberSource { margin-left: 3em; border-left: 1px solid #aaaaaa; padding-left: 4px; }
+div.sourceCode
+{ }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+code span.al { color: #ff0000; font-weight: bold; } 
+code span.an { color: #60a0b0; font-weight: bold; font-style: italic; } 
+code span.at { color: #7d9029; } 
+code span.bn { color: #40a070; } 
+code span.bu { color: #008000; } 
+code span.cf { color: #007020; font-weight: bold; } 
+code span.ch { color: #4070a0; } 
+code span.cn { color: #880000; } 
+code span.co { color: #60a0b0; font-style: italic; } 
+code span.cv { color: #60a0b0; font-weight: bold; font-style: italic; } 
+code span.do { color: #ba2121; font-style: italic; } 
+code span.dt { color: #902000; } 
+code span.dv { color: #40a070; } 
+code span.er { color: #ff0000; font-weight: bold; } 
+code span.ex { } 
+code span.fl { color: #40a070; } 
+code span.fu { color: #06287e; } 
+code span.im { color: #008000; font-weight: bold; } 
+code span.in { color: #60a0b0; font-weight: bold; font-style: italic; } 
+code span.kw { color: #007020; font-weight: bold; } 
+code span.op { color: #666666; } 
+code span.ot { color: #007020; } 
+code span.pp { color: #bc7a00; } 
+code span.sc { color: #4070a0; } 
+code span.ss { color: #bb6688; } 
+code span.st { color: #4070a0; } 
+code span.va { color: #19177c; } 
+code span.vs { color: #4070a0; } 
+code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; } 
+</style>
+<script>
+// apply pandoc div.sourceCode style to pre.sourceCode instead
+(function() {
+  var sheets = document.styleSheets;
+  for (var i = 0; i < sheets.length; i++) {
+    if (sheets[i].ownerNode.dataset["origin"] !== "pandoc") continue;
+    try { var rules = sheets[i].cssRules; } catch (e) { continue; }
+    var j = 0;
+    while (j < rules.length) {
+      var rule = rules[j];
+      // check if there is a div.sourceCode rule
+      if (rule.type !== rule.STYLE_RULE || rule.selectorText !== "div.sourceCode") {
+        j++;
+        continue;
+      }
+      var style = rule.style.cssText;
+      // check if color or background-color is set
+      if (rule.style.color === '' && rule.style.backgroundColor === '') {
+        j++;
+        continue;
+      }
+      // replace div.sourceCode by a pre.sourceCode rule
+      sheets[i].deleteRule(j);
+      sheets[i].insertRule('pre.sourceCode{' + style + '}', j);
+    }
+  }
+})();
+</script>
+
+
+
+
+<style type="text/css">body {
+background-color: #fff;
+margin: 1em auto;
+max-width: 700px;
+overflow: visible;
+padding-left: 2em;
+padding-right: 2em;
+font-family: "Open Sans", "Helvetica Neue", Helvetica, Arial, sans-serif;
+font-size: 14px;
+line-height: 1.35;
+}
+#TOC {
+clear: both;
+margin: 0 0 10px 10px;
+padding: 4px;
+width: 400px;
+border: 1px solid #CCCCCC;
+border-radius: 5px;
+background-color: #f6f6f6;
+font-size: 13px;
+line-height: 1.3;
+}
+#TOC .toctitle {
+font-weight: bold;
+font-size: 15px;
+margin-left: 5px;
+}
+#TOC ul {
+padding-left: 40px;
+margin-left: -1.5em;
+margin-top: 5px;
+margin-bottom: 5px;
+}
+#TOC ul ul {
+margin-left: -2em;
+}
+#TOC li {
+line-height: 16px;
+}
+table {
+margin: 1em auto;
+border-width: 1px;
+border-color: #DDDDDD;
+border-style: outset;
+border-collapse: collapse;
+}
+table th {
+border-width: 2px;
+padding: 5px;
+border-style: inset;
+}
+table td {
+border-width: 1px;
+border-style: inset;
+line-height: 18px;
+padding: 5px 5px;
+}
+table, table th, table td {
+border-left-style: none;
+border-right-style: none;
+}
+table thead, table tr.even {
+background-color: #f7f7f7;
+}
+p {
+margin: 0.5em 0;
+}
+blockquote {
+background-color: #f6f6f6;
+padding: 0.25em 0.75em;
+}
+hr {
+border-style: solid;
+border: none;
+border-top: 1px solid #777;
+margin: 28px 0;
+}
+dl {
+margin-left: 0;
+}
+dl dd {
+margin-bottom: 13px;
+margin-left: 13px;
+}
+dl dt {
+font-weight: bold;
+}
+ul {
+margin-top: 0;
+}
+ul li {
+list-style: circle outside;
+}
+ul ul {
+margin-bottom: 0;
+}
+pre, code {
+background-color: #f7f7f7;
+border-radius: 3px;
+color: #333;
+white-space: pre-wrap; 
+}
+pre {
+border-radius: 3px;
+margin: 5px 0px 10px 0px;
+padding: 10px;
+}
+pre:not([class]) {
+background-color: #f7f7f7;
+}
+code {
+font-family: Consolas, Monaco, 'Courier New', monospace;
+font-size: 85%;
+}
+p > code, li > code {
+padding: 2px 0px;
+}
+div.figure {
+text-align: center;
+}
+img {
+background-color: #FFFFFF;
+padding: 2px;
+border: 1px solid #DDDDDD;
+border-radius: 3px;
+border: 1px solid #CCCCCC;
+margin: 0 5px;
+}
+h1 {
+margin-top: 0;
+font-size: 35px;
+line-height: 40px;
+}
+h2 {
+border-bottom: 4px solid #f7f7f7;
+padding-top: 10px;
+padding-bottom: 2px;
+font-size: 145%;
+}
+h3 {
+border-bottom: 2px solid #f7f7f7;
+padding-top: 10px;
+font-size: 120%;
+}
+h4 {
+border-bottom: 1px solid #f7f7f7;
+margin-left: 8px;
+font-size: 105%;
+}
+h5, h6 {
+border-bottom: 1px solid #ccc;
+font-size: 105%;
+}
+a {
+color: #0033dd;
+text-decoration: none;
+}
+a:hover {
+color: #6666ff; }
+a:visited {
+color: #800080; }
+a:visited:hover {
+color: #BB00BB; }
+a[href^="http:"] {
+text-decoration: underline; }
+a[href^="https:"] {
+text-decoration: underline; }
+
+code > span.kw { color: #555; font-weight: bold; } 
+code > span.dt { color: #902000; } 
+code > span.dv { color: #40a070; } 
+code > span.bn { color: #d14; } 
+code > span.fl { color: #d14; } 
+code > span.ch { color: #d14; } 
+code > span.st { color: #d14; } 
+code > span.co { color: #888888; font-style: italic; } 
+code > span.ot { color: #007020; } 
+code > span.al { color: #ff0000; font-weight: bold; } 
+code > span.fu { color: #900; font-weight: bold; } 
+code > span.er { color: #a61717; background-color: #e3d2d2; } 
+</style>
+
+
+
+
+</head>
+
+<body>
+
+
+
+
+<h1 class="title toc-ignore">Get started with Microsoft Fabric
+authentication</h1>
+
+
+
+<p>When you want to use ‘fabricQueryR’ to access Microsoft Fabric, you
+always start with authentication.</p>
+<p>Authentication is how Microsoft Fabric confirms <em>who you are</em>.
+Authorization is what that person or application is allowed to see and
+do. You need both: signing in successfully does not automatically grant
+access to a workspace or its data.</p>
+<p>This guide starts with the normal setup for a person using R
+interactively. That is the best place to begin. Later sections cover app
+registrations, service principals, managed identities, custom tokens,
+and other options for automated or advanced use.</p>
+<div id="quick-start-sign-in-as-yourself" class="section level2">
+<h2>Quick start: sign in as yourself</h2>
+<p>For a normal interactive login, you need:</p>
+<ul>
+<li>a work or school Microsoft account that can sign in to your
+organization’s Fabric portal;</li>
+<li>your organization’s Microsoft Entra <em>tenant ID</em>;</li>
+<li>access to at least one Fabric workspace or item; and</li>
+<li>sometimes, a <em>client ID</em> supplied by your administrator.</li>
+</ul>
+<p>You do <em>not</em> need a client secret, certificate, or manually
+copied access token for this first setup.</p>
+<div id="find-your-tenant-id" class="section level3">
+<h3>1. Find your tenant ID</h3>
+<p>The tenant ID identifies your organization. It is a GUID that looks
+like <code>12345678-1234-1234-1234-123456789abc</code>.</p>
+<p>You may be able to find the tenant ID in the <a href="https://app.fabric.microsoft.com">Fabric portal</a>. Open your
+profile (top-right corner) and hover over the tooltip icon near ‘Tenant
+Name’; this will then show ‘Tenant ID: <your-tenant-id>’.</p>
+<p>Alternatively, follow Microsoft’s <a href="https://learn.microsoft.com/en-us/entra/fundamentals/how-to-find-tenant">tenant
+ID guide</a> for the Microsoft Entra admin center, Azure portal,
+PowerShell, or Azure CLI. The value may also be called the <em>Directory
+(tenant) ID</em>.</p>
+<p>If you do not have access to your tenant ID through either portal,
+ask your Microsoft 365, Azure, or Fabric administrator for the tenant
+ID.</p>
+</div>
+<div id="set-the-tenant-id-in-r" class="section level3">
+<h3>2. Set the tenant ID in R</h3>
+<p>For a first test, set it in the current R session:</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb1-1"><a href="#cb1-1" tabindex="-1"></a><span class="fu">Sys.setenv</span>(<span class="at">FABRICQUERYR_TENANT_ID =</span> <span class="st">&quot;&lt;your-tenant-id&gt;&quot;</span>)</span>
+<span id="cb1-2"><a href="#cb1-2" tabindex="-1"></a></span>
+<span id="cb1-3"><a href="#cb1-3" tabindex="-1"></a><span class="fu">library</span>(fabricQueryR)</span></code></pre></div>
+<p>If your administrator has given you an app-registration client ID,
+set that as well:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb2-1"><a href="#cb2-1" tabindex="-1"></a><span class="fu">Sys.setenv</span>(<span class="at">FABRICQUERYR_CLIENT_ID =</span> <span class="st">&quot;&lt;your-client-id&gt;&quot;</span>)</span></code></pre></div>
+<p>When <code>FABRICQUERYR_CLIENT_ID</code> is not set, ‘fabricQueryR’
+tries the public Azure CLI client ID. Some organizations allow this and
+some do not. If sign-in is blocked or your organization requires an
+approved application, ask the administrator for a dedicated client
+ID.</p>
+</div>
+<div id="test-the-connection" class="section level3">
+<h3>3. Test the connection</h3>
+<p>Start with workspace discovery because it is a simple way to check
+both sign-in and basic Fabric access:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb3-1"><a href="#cb3-1" tabindex="-1"></a>workspaces <span class="ot">&lt;-</span> <span class="fu">fabric_workspaces</span>()</span>
+<span id="cb3-2"><a href="#cb3-2" tabindex="-1"></a></span>
+<span id="cb3-3"><a href="#cb3-3" tabindex="-1"></a>workspaces</span>
+<span id="cb3-4"><a href="#cb3-4" tabindex="-1"></a>workspace <span class="ot">&lt;-</span> workspaces[[<span class="dv">1</span><span class="dt">L</span>]]</span>
+<span id="cb3-5"><a href="#cb3-5" tabindex="-1"></a>workspace<span class="sc">$</span>displayName</span>
+<span id="cb3-6"><a href="#cb3-6" tabindex="-1"></a>workspace<span class="sc">$</span>id</span></code></pre></div>
+<p>On the first call, a browser may open and ask you to sign in and
+approve access. Use the same organizational account that you use in the
+Fabric portal. Multifactor authentication and your organization’s
+Conditional Access rules still apply.</p>
+<p>If the call succeeds, <code>workspaces</code> is a list of read-only
+<code>FabricWorkspace</code> R6 objects available to that account. The
+service fields are available directly with <code>$</code>. Workspace
+methods such as <code>$items()</code> call the corresponding discovery
+function—in this case, <code>fabric_items()</code>—without requiring
+copied IDs. Item discovery returns <code>FabricItem</code> objects or
+type-specific subclasses:</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb4-1"><a href="#cb4-1" tabindex="-1"></a>items <span class="ot">&lt;-</span> workspace<span class="sc">$</span><span class="fu">items</span>()</span>
+<span id="cb4-2"><a href="#cb4-2" tabindex="-1"></a>items</span>
+<span id="cb4-3"><a href="#cb4-3" tabindex="-1"></a>item <span class="ot">&lt;-</span> items[[<span class="dv">1</span><span class="dt">L</span>]]</span>
+<span id="cb4-4"><a href="#cb4-4" tabindex="-1"></a>item<span class="sc">$</span>displayName</span>
+<span id="cb4-5"><a href="#cb4-5" tabindex="-1"></a>item<span class="sc">$</span>type</span>
+<span id="cb4-6"><a href="#cb4-6" tabindex="-1"></a>item<span class="sc">$</span>id</span></code></pre></div>
+<p>Actionable subclasses add methods for their workload. For example,
+<code>workspace$lakehouses()</code> corresponds to
+<code>fabric_lakehouses()</code>, and the returned Lakehouse’s
+<code>$tables()</code> method corresponds to
+<code>fabric_lakehouse_tables()</code>. The object reuses the credential
+acquired during discovery. Call <code>$as_list()</code> or
+<code>as.list()</code>, or request <code>output = &quot;list&quot;</code>, only
+when a plain record is specifically needed.</p>
+<p>An empty result does not necessarily mean sign-in failed. It can mean
+that the account has not been given access to a Fabric workspace.</p>
+</div>
+<div id="save-the-settings-for-future-r-sessions" class="section level3">
+<h3>4. Save the settings for future R sessions</h3>
+<p><code>Sys.setenv()</code> only changes the current R session. To load
+the IDs automatically, add them to your user-level
+<code>.Renviron</code> file:</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb5-1"><a href="#cb5-1" tabindex="-1"></a><span class="fu">file.edit</span>(<span class="st">&quot;~/.Renviron&quot;</span>)</span></code></pre></div>
+<p>Add one or both lines, without R code around them:</p>
+<pre class="text"><code>FABRICQUERYR_TENANT_ID=&lt;your-tenant-id&gt;
+FABRICQUERYR_CLIENT_ID=&lt;your-client-id&gt;</code></pre>
+<p>Omit the client-ID line if the default client works for your
+organization. Save the file and restart R. Confirm that R can read the
+values:</p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb7-1"><a href="#cb7-1" tabindex="-1"></a><span class="fu">Sys.getenv</span>(<span class="st">&quot;FABRICQUERYR_TENANT_ID&quot;</span>)</span>
+<span id="cb7-2"><a href="#cb7-2" tabindex="-1"></a><span class="fu">Sys.getenv</span>(<span class="st">&quot;FABRICQUERYR_CLIENT_ID&quot;</span>)</span></code></pre></div>
+<p>Use the <code>.Renviron</code> file in your user home directory, not
+one committed with a project. Tenant and client IDs are not passwords,
+but keeping machine-specific configuration out of source control is
+still good practice.</p>
+</div>
+</div>
+<div id="make-sure-fabric-access-has-been-granted" class="section level2">
+<h2>Make sure Fabric access has been granted</h2>
+<p>‘fabricQueryR’ cannot grant Fabric permissions. The signed-in account
+must already be able to access the relevant workspace, item, and
+data.</p>
+<p>For an initial test, ask a workspace administrator to do one of the
+following:</p>
+<ol style="list-style-type: decimal">
+<li>add your account to the Fabric workspace, normally with the
+least-privileged role that supports your task; or</li>
+<li>share the specific Fabric item with your account and grant any
+additional data permission it needs.</li>
+</ol>
+<p>Workspace visibility and data access are not always the same
+permission. For example, a semantic model normally needs Read and Build
+access, while OneLake data can require an additional data permission. If
+discovery works but a read does not, ask the item owner which permission
+that workload requires.</p>
+</div>
+<div id="first-login-troubleshooting" class="section level2">
+<h2>First-login troubleshooting</h2>
+<p>These are the most common starting problems:</p>
+<table>
+<colgroup>
+<col width="50%" />
+<col width="50%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>What you see</th>
+<th>What to check</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>tenant_id is required</code></td>
+<td>Set <code>FABRICQUERYR_TENANT_ID</code> and check for spelling
+mistakes in the environment-variable name.</td>
+</tr>
+<tr class="even">
+<td>The browser signs in to the wrong account</td>
+<td>Sign out of the unwanted Microsoft account, or retry without the
+token cache as shown below.</td>
+</tr>
+<tr class="odd">
+<td>Your organization blocks the application or asks for admin
+approval</td>
+<td>Ask an Entra administrator for an approved app-registration client
+ID and any required consent.</td>
+</tr>
+<tr class="even">
+<td>Login succeeds but no workspaces appear</td>
+<td>Confirm that the same account can open the expected workspace in the
+Fabric portal and has been added or invited to it.</td>
+</tr>
+<tr class="odd">
+<td>HTTP 401</td>
+<td>The login/token is invalid for this operation, expired, or belongs
+to the wrong tenant or resource.</td>
+</tr>
+<tr class="even">
+<td>HTTP 403</td>
+<td>Fabric knows who you are, but the account lacks a required
+workspace, item, or data permission.</td>
+</tr>
+</tbody>
+</table>
+<p>If a cached login is using the wrong account, retry once without
+reading or writing the cache:</p>
+<div class="sourceCode" id="cb8"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb8-1"><a href="#cb8-1" tabindex="-1"></a>workspaces <span class="ot">&lt;-</span> <span class="fu">fabric_workspaces</span>(</span>
+<span id="cb8-2"><a href="#cb8-2" tabindex="-1"></a>  <span class="at">auth_args =</span> <span class="fu">list</span>(<span class="at">use_cache =</span> <span class="cn">FALSE</span>)</span>
+<span id="cb8-3"><a href="#cb8-3" tabindex="-1"></a>)</span></code></pre></div>
+<p>For R running on a remote machine where no local browser can open,
+use a device code:</p>
+<div class="sourceCode" id="cb9"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb9-1"><a href="#cb9-1" tabindex="-1"></a>workspaces <span class="ot">&lt;-</span> <span class="fu">fabric_workspaces</span>(</span>
+<span id="cb9-2"><a href="#cb9-2" tabindex="-1"></a>  <span class="at">auth_args =</span> <span class="fu">list</span>(<span class="at">auth_type =</span> <span class="st">&quot;device_code&quot;</span>)</span>
+<span id="cb9-3"><a href="#cb9-3" tabindex="-1"></a>)</span></code></pre></div>
+<p>R prints a code and a Microsoft sign-in address. Open that address in
+any browser, enter the code, and sign in with the intended account.</p>
+</div>
+<div id="how-authentication-works" class="section level2">
+<h2>How authentication works</h2>
+<p>‘fabricQueryR’ uses <a href="https://azure.r-universe.dev/AzureAuth/doc/token.html">‘AzureAuth’</a>
+to sign in to Microsoft Entra. Most functions accept the same
+authentication arguments:</p>
+<ul>
+<li><code>tenant_id</code> identifies the organization;</li>
+<li><code>client_id</code> identifies the application;</li>
+<li><code>token</code> supplies an existing token or token-provider
+function; and</li>
+<li><code>auth_args</code> customizes automatic sign-in.</li>
+</ul>
+<p>Most interactive users only need the tenant ID. ‘AzureAuth’ opens a
+browser or uses device-code login, caches the resulting token, and
+refreshes it when needed. ‘fabricQueryR’ chooses the correct token
+audience for each Fabric service.</p>
+<p>Leave <code>token = NULL</code> for automatic sign-in. When you
+supply <code>token</code>, it becomes responsible for authentication and
+<code>auth_args</code> is not used. See <code>?fabric_workspaces</code>
+and the ‘AzureAuth’ <a href="https://azure.r-universe.dev/AzureAuth/doc/scenarios.html">authentication
+scenarios</a> for the complete argument details. Supply the bearer token
+exactly as issued: leading, trailing, or embedded whitespace and control
+characters are rejected rather than trimmed or sent in an HTTP
+header.</p>
+<p>A bearer-token string and an <code>AzureAuth::AzureToken</code> each
+represent one OAuth audience. ‘fabricQueryR’ binds either form to the
+first service audience that uses it and stops before reusing it for a
+different service. For example, an operation that resolves a Fabric item
+and then reads OneLake needs both Fabric and Azure Storage tokens.
+Supply the function’s <code>storage_token</code> or
+<code>sql_token</code> argument when available, or pass an
+audience-aware token-provider function that returns the appropriate
+token for its <code>audience</code> argument. Automatic sign-in already
+acquires and caches a separate token for each audience.</p>
+</div>
+<div id="treat-endpoint-urls-as-credential-boundaries" class="section level2">
+<h2>Treat endpoint URLs as credential boundaries</h2>
+<p>Prefer discovered objects when a method or function accepts them.
+When discovery cannot provide an invocation endpoint, copy the complete
+URL from the Fabric portal. These routes keep both the service address
+and the Fabric item identity visible to the caller.</p>
+<p>A custom host, including one fronted by your organization through
+Azure API Management or another gateway, is an explicit opt-in.
+‘fabricQueryR’ refuses to acquire and forward its normal Fabric
+credential automatically; supply <code>token</code> as a bearer token or
+token-provider function. Use a custom endpoint only when your
+organization controls the host, and use a token issued for the gateway’s
+intended audience. Set <code>audience</code> explicitly when the token
+provider uses that argument to acquire the gateway credential.</p>
+<p>HTTPS and URL-shape validation reject malformed endpoint input, but
+do not prove that your organization owns the hostname, that the gateway
+forwards a request safely, or that a supplied token has the correct
+audience. Confirm those properties with the gateway owner before sending
+credentials or data.</p>
+</div>
+<div id="choosing-an-advanced-authentication-method" class="section level2">
+<h2>Choosing an advanced authentication method</h2>
+<p>If the quick start works and you are using R interactively, you can
+continue using it. Choose one of the options below only when the way R
+runs requires it.</p>
+<table>
+<colgroup>
+<col width="33%" />
+<col width="33%" />
+<col width="33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Method</th>
+<th>Best suited to</th>
+<th>Credential</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Interactive user login</td>
+<td>A person working in a local or remote R session</td>
+<td>Browser login or device code</td>
+</tr>
+<tr class="even">
+<td>Service principal</td>
+<td>Scheduled scripts, CI/CD, or applications with no person
+present</td>
+<td>Client secret or certificate</td>
+</tr>
+<tr class="odd">
+<td>Managed identity</td>
+<td>R running in a supported Azure-hosted environment</td>
+<td>Identity managed by Azure</td>
+</tr>
+<tr class="even">
+<td>Existing token or provider</td>
+<td>An organization with its own token broker or workload-identity
+system</td>
+<td>Supplied by that system</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div id="advanced-authentication-for-automation" class="section level2">
+<h2>Advanced: authentication for automation</h2>
+<p>Automated code cannot wait for a person to complete a browser login.
+A service principal is an application identity that can sign in on its
+own. It requires a dedicated app registration and a secret or
+certificate, and the service principal itself must be granted access in
+Fabric.</p>
+<div id="service-principal-with-a-client-secret" class="section level3">
+<h3>Service principal with a client secret</h3>
+<p>‘AzureAuth’ calls this the <code>client_credentials</code> flow. Keep
+the secret outside source code:</p>
+<div class="sourceCode" id="cb10"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb10-1"><a href="#cb10-1" tabindex="-1"></a>workspaces <span class="ot">&lt;-</span> <span class="fu">fabric_workspaces</span>(</span>
+<span id="cb10-2"><a href="#cb10-2" tabindex="-1"></a>  <span class="at">tenant_id =</span> <span class="fu">Sys.getenv</span>(<span class="st">&quot;FABRICQUERYR_TENANT_ID&quot;</span>),</span>
+<span id="cb10-3"><a href="#cb10-3" tabindex="-1"></a>  <span class="at">client_id =</span> <span class="fu">Sys.getenv</span>(<span class="st">&quot;FABRICQUERYR_CLIENT_ID&quot;</span>),</span>
+<span id="cb10-4"><a href="#cb10-4" tabindex="-1"></a>  <span class="at">auth_args =</span> <span class="fu">list</span>(</span>
+<span id="cb10-5"><a href="#cb10-5" tabindex="-1"></a>    <span class="at">password =</span> <span class="fu">Sys.getenv</span>(<span class="st">&quot;FABRIC_CLIENT_SECRET&quot;</span>),</span>
+<span id="cb10-6"><a href="#cb10-6" tabindex="-1"></a>    <span class="at">auth_type =</span> <span class="st">&quot;client_credentials&quot;</span></span>
+<span id="cb10-7"><a href="#cb10-7" tabindex="-1"></a>  )</span>
+<span id="cb10-8"><a href="#cb10-8" tabindex="-1"></a>)</span></code></pre></div>
+<p>Keep secrets outside source code and grant the service principal
+access to the Fabric workspace or item. A certificate can replace the
+client secret when your organization requires it.</p>
+</div>
+<div id="managed-identities-and-custom-token-providers" class="section level3">
+<h3>Managed identities and custom token providers</h3>
+<p>Some Fabric APIs support managed identities. Other environments may
+use workload identity federation or an organization-specific token
+broker. Pass an existing token or a token-provider function through
+<code>token</code> for these cases. Support is API-specific, so check
+the relevant Fabric <a href="https://learn.microsoft.com/en-us/rest/api/fabric/articles/identity-support">identity-support
+documentation</a> and <code>?fabric_workspaces</code> before choosing
+this route.</p>
+</div>
+</div>
+<div id="set-fabric-permissions-by-workload" class="section level2">
+<h2>Set Fabric permissions by workload</h2>
+<p>Getting a token proves an identity; it does not grant access to
+Fabric data. For a production workflow, check three layers:</p>
+<ol style="list-style-type: decimal">
+<li>the tenant setting allows that identity type to use the API;</li>
+<li>the user or application can access the workspace or item; and</li>
+<li>the workload-specific data permission allows the requested
+operation.</li>
+</ol>
+<p>Use the least-privileged role that supports the task. Fabric’s <a href="https://learn.microsoft.com/en-us/fabric/fundamentals/roles-workspaces">workspace-role
+documentation</a> explains the standard roles; each workload guide lists
+its additional access requirements.</p>
+</div>
+<div id="signing-out-token-cache" class="section level2">
+<h2>Signing out (token cache)</h2>
+<p>‘AzureAuth’ stores cached user tokens in its user-specific ‘AzureR’
+data directory, never in the package project. Use
+<code>AzureAuth::list_azure_tokens()</code> to inspect the cache and
+remove only the relevant token with
+<code>AzureAuth::delete_azure_token()</code>. Use
+<code>AzureAuth::clean_token_directory()</code> for signing out of every
+cached ‘AzureR’ session.</p>
+</div>
+
+
+
+<!-- code folding -->
+
+
+<!-- dynamically load mathjax for compatibility with self-contained -->
+<script>
+  (function () {
+    var script = document.createElement("script");
+    script.type = "text/javascript";
+    script.src  = "https://mathjax.rstudio.com/latest/MathJax.js?config=TeX-AMS-MML_HTMLorMML";
+    document.getElementsByTagName("head")[0].appendChild(script);
+  })();
+</script>
+
+</body>
+</html>

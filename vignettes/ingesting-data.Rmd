@@ -1,0 +1,220 @@
+---
+title: "Bring R data into Microsoft Fabric"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Bring R data into Microsoft Fabric}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", eval = FALSE)
+```
+
+'fabricQueryR' helps you send data from R to Lakehouses, Warehouses,
+Eventhouses, and OneLake. The source can be an ordinary R data frame, an Arrow
+object, or a file that already exists on disk or in Fabric.
+
+The right writer depends on how the data will be used after it arrives. This
+guide starts with a small data frame and a managed Lakehouse table, then shows
+the other common destinations. Larger Arrow workflows come last.
+
+## Choose a destination
+
+| What you want in Fabric | Start with | Good fit |
+|---|---|---|
+| A managed Lakehouse Delta table | `lakehouse$write_table()` (`fabric_lakehouse_write_table()`) | General analytics and data-engineering tables |
+| An ordinary file in OneLake | `lakehouse$onelake_write_file()` (`fabric_onelake_write_file()`) | Exchange files, exports, and non-tabular artifacts |
+| A relational Warehouse table | `warehouse$write_table()` (`fabric_warehouse_write_table()`) | SQL reporting and warehouse workloads |
+| An Eventhouse KQL table | `kql_database$write_table()` (`fabric_kql_write_table()`) | Event, log, and time-series data |
+| A Lakehouse table from files already in `Files/` | `lakehouse$load_table()` (`fabric_lakehouse_load_table()`) | Existing CSV or Parquet staging data |
+
+For a first ingestion, a Lakehouse table is the most direct general-purpose
+workflow. The high-level writers accept ordinary data frames and handle their
+own temporary Parquet staging.
+
+## Prepare a small R data frame
+
+Create a small data frame and select a Lakehouse in a workspace:
+
+```{r, eval = FALSE}
+library(fabricQueryR)
+
+orders <- data.frame(
+  order_id = 1:3,
+  order_date = as.Date(c("2026-08-12", "2026-08-13", "2026-08-14")),
+  amount = c(10.50, 20, 30.25)
+)
+
+workspaces <- fabric_workspaces()
+matches <- Filter(
+  \(x) identical(x$displayName, "Analytics workspace"),
+  workspaces
+)
+stopifnot(length(matches) == 1L)
+workspace <- matches[[1L]]
+
+lakehouse <- workspace$lakehouses()[[1L]]
+```
+
+`workspace` and `lakehouse` are read-only R6 objects returned by discovery.
+Read their Fabric fields through `$`; their methods use the IDs and credential
+needed for the next operation. `$lakehouses()` is the workspace method for
+`fabric_lakehouses()`.
+
+## Write a Lakehouse table
+
+Call `$write_table()` (`fabric_lakehouse_write_table()`) on the discovered
+Lakehouse:
+
+```{r, eval = FALSE}
+write_result <- lakehouse$write_table(
+  table = "orders_from_r",
+  data = orders,
+  mode = "Overwrite"
+)
+
+write_result$rows
+write_result$staging_retained
+```
+
+The function writes temporary Parquet files, loads them as a managed Delta
+table, waits for Fabric to finish, and removes successful staging files. It can
+create the destination table; Fabric infers its columns from the source.
+
+Read back a few rows with `$read_table()`
+(`fabric_lakehouse_read_table()`) to verify the result:
+
+```{r, eval = FALSE}
+check <- lakehouse$read_table(
+  table = "orders_from_r",
+  limit = 10L
+)
+
+check
+```
+
+Use `mode = "Append"` only when the source columns are compatible with an
+existing table. `mode = "Overwrite"` replaces the table through Fabric's
+managed load behavior.
+
+## Write an ordinary OneLake file
+
+A file is different from a managed table. Choose this route when another
+process expects a specific file or when the content is not tabular:
+
+```{r, eval = FALSE}
+lakehouse$onelake_write_file(
+  path = "Files/exports/orders.parquet",
+  data = orders
+)
+```
+
+`$onelake_write_file()` (`fabric_onelake_write_file()`) serializes supported R
+or Arrow objects. Use `$onelake_upload()` (`fabric_onelake_upload()`) when a
+file already exists on local disk:
+
+```{r, eval = FALSE}
+lakehouse$onelake_upload(
+  path = "Files/incoming/orders.csv",
+  source = "orders.csv"
+)
+```
+
+Do not upload directly below a managed table's `Tables/` directory. Delta
+tables contain a transaction log and must be changed through a table-aware
+writer.
+
+## Write a Warehouse table
+
+A Warehouse writer uses a Lakehouse `Files/` directory for temporary staging,
+then asks the Warehouse to load it efficiently. Discover Warehouses with
+`$warehouses()` (`fabric_warehouses()`), then write with `$write_table()`
+(`fabric_warehouse_write_table()`):
+
+```{r, eval = FALSE}
+warehouse <- workspace$warehouses()[[1L]]
+
+warehouse_result <- warehouse$write_table(
+  table = "orders_from_r",
+  data = orders,
+  staging_lakehouse = lakehouse,
+  schema = "dbo",
+  create_if_missing = TRUE,
+  mode = "Append"
+)
+```
+
+For a missing table, Fabric can infer a basic definition. Pre-create the table
+when exact SQL types, lengths, constraints, or grants matter.
+
+[Working with Fabric Warehouses](warehouse.html) explains overwrite
+choices, transactions, and larger Arrow inputs.
+
+## Write an Eventhouse table
+
+Use Eventhouse for event or time-series data that will be queried with KQL.
+Discover KQL databases with `$kql_databases()` (`fabric_kql_databases()`), then
+write with `$write_table()` (`fabric_kql_write_table()`):
+
+```{r, eval = FALSE}
+kql_database <- workspace$kql_databases()[[1L]]
+
+kql_result <- kql_database$write_table(
+  table = "OrdersFromR",
+  data = orders,
+  create_if_missing = TRUE
+)
+
+kql_result$status$state
+```
+
+The high-level writer stages the R object, submits tracked ingestion, and waits.
+With the default `cleanup = TRUE`, service-owned Storage sources can be deleted
+after download, before ingestion succeeds. OneLake staging is deleted only
+after confirmed success. Use `cleanup = FALSE` to retain staging for recovery.
+
+[Working with Fabric Eventhouses (real-time data)](eventhouse-ingestion.html)
+covers predefined mappings, existing storage files, idempotency keys, and
+failure recovery.
+
+## Load a file that is already in a Lakehouse
+
+If CSV or Parquet data already exists below the same Lakehouse's `Files/` area,
+you can load it without downloading it to R. The `$load_table()` method calls
+`fabric_lakehouse_load_table()`:
+
+```{r, eval = FALSE}
+operation <- lakehouse$load_table(
+  table = "orders_from_file",
+  path = "Files/incoming/orders.csv",
+  format = "Csv",
+  header = TRUE,
+  mode = "Overwrite"
+)
+
+completed <- fabric_operation_wait(operation, timeout = 900)
+```
+
+This route is useful for file-based pipelines. It does not upload a local file;
+use `$onelake_upload()` (`fabric_onelake_upload()`) first when necessary.
+
+## Scale up with Arrow
+
+When you are moving larger amounts of data, consider using Arrow.
+
+The Lakehouse, Warehouse, and Eventhouse writers accept Arrow Tables and
+RecordBatches. They can also consume lazy Arrow Datasets, Scanners, queries,
+and streams in batches, without collecting the full input as an R data frame:
+
+This example again uses `$write_table()`
+(`fabric_lakehouse_write_table()`):
+
+```{r, eval = FALSE}
+dataset <- arrow::open_dataset("local-parquet-directory")
+
+lakehouse$write_table(
+  table = "large_orders",
+  data = dataset
+)
+```

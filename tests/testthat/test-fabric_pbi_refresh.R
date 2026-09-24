@@ -1,0 +1,1592 @@
+test_that("discovered models retain automatic identity for default refresh", {
+  payloads <- list()
+  local_mocked_bindings(
+    .pbi_refresh_request = function(
+      method,
+      url,
+      credential,
+      payload = NULL,
+      ...
+    ) {
+      payloads[length(payloads) + 1L] <<- list(payload)
+      list(status_code = 202L, request_id = pbi_refresh_id, body = list())
+    }
+  )
+  for (application in c(FALSE, TRUE)) {
+    credential <- fabric_credential(
+      "test-tenant",
+      "test-client",
+      auth_args = if (application) list(password = "test-secret") else list()
+    )
+    model <- fabric_r6_record(
+      pbi_refresh_test_model(),
+      c("fabric_item", "list"),
+      credential
+    )
+    refresh <- model$refresh()
+    expect_s3_class(refresh, "fabric_pbi_refresh")
+    expect_identical(refresh$mode, "standard")
+  }
+  expect_equal(payloads[[1L]], list(notifyOption = "NoNotification"))
+  expect_length(payloads[[2L]], 0L)
+})
+
+test_that("service-principal standard refresh uses the RequestId header", {
+  requests <- list()
+  local_mocked_bindings(
+    .httr2_perform = function(req, ...) {
+      requests[[length(requests) + 1L]] <<- list(req = req, args = list(...))
+      httr2::new_response(
+        method = req$method,
+        url = req$url,
+        status_code = 202L,
+        headers = list(RequestId = pbi_refresh_id, `Retry-After` = "7"),
+        body = charToRaw("")
+      )
+    }
+  )
+
+  refresh <- fabric_pbi_refresh(
+    pbi_refresh_test_model(),
+    token = "test-token",
+    api_base = "https://powerbi.test/v1.0/myorg",
+    principal_type = "service_principal"
+  )
+
+  expect_s3_class(refresh, "fabric_pbi_refresh")
+  expect_identical(refresh$id, pbi_refresh_id)
+  expect_identical(refresh$mode, "standard")
+  expect_identical(refresh$workspace_id, pbi_refresh_workspace_id)
+  expect_identical(refresh$dataset_id, pbi_refresh_dataset_id)
+  expect_identical(refresh$retry_after, 7)
+  expect_length(requests, 1L)
+  submission <- requests[[1L]]
+  expect_identical(submission$req$method, "POST")
+  expect_false(submission$args$idempotent)
+  expect_match(
+    submission$req$url,
+    paste0(
+      "/groups/",
+      pbi_refresh_workspace_id,
+      "/datasets/",
+      pbi_refresh_dataset_id,
+      "/refreshes"
+    ),
+    fixed = TRUE
+  )
+  expect_identical(submission$req$body$type, "raw")
+  expect_length(submission$req$body$data, 0L)
+})
+
+test_that("standard refresh defaults follow the known principal type", {
+  payloads <- list()
+  credential <- fabric_credential(token = "test-token")
+  local_mocked_bindings(
+    fabric_credential = function(...) credential,
+    .pbi_refresh_request = function(
+      method,
+      url,
+      credential,
+      payload = NULL,
+      ...
+    ) {
+      payloads[[length(payloads) + 1L]] <<- payload
+      list(
+        status_code = 202L,
+        location = paste0(url, "/", pbi_refresh_id),
+        request_id = pbi_refresh_id,
+        retry_after = NULL,
+        body = list()
+      )
+    }
+  )
+
+  fabric_pbi_refresh(
+    pbi_refresh_test_model(),
+    tenant_id = "tenant-id",
+    client_id = "client-id",
+    api_base = "https://powerbi.test/v1.0/myorg"
+  )
+  fabric_pbi_refresh(
+    pbi_refresh_test_model(),
+    tenant_id = "tenant-id",
+    client_id = "client-id",
+    auth_args = list(auth_type = "client_credentials", password = "secret"),
+    api_base = "https://powerbi.test/v1.0/myorg"
+  )
+  fabric_pbi_refresh(
+    pbi_refresh_test_model(),
+    token = "opaque-token",
+    principal_type = "service_principal",
+    api_base = "https://powerbi.test/v1.0/myorg"
+  )
+  fabric_pbi_refresh(
+    pbi_refresh_test_model(),
+    token = function(...) "opaque-callback-token",
+    principal_type = "service_principal",
+    api_base = "https://powerbi.test/v1.0/myorg"
+  )
+  fabric_pbi_refresh(
+    pbi_refresh_test_model(),
+    token = "delegated-token",
+    principal_type = "delegated",
+    api_base = "https://powerbi.test/v1.0/myorg"
+  )
+  fabric_pbi_refresh(
+    pbi_refresh_test_model(),
+    notify_option = "MailOnFailure",
+    token = "delegated-token",
+    api_base = "https://powerbi.test/v1.0/myorg"
+  )
+
+  expect_equal(payloads[[1L]], list(notifyOption = "NoNotification"))
+  expect_length(payloads[[2L]], 0L)
+  expect_length(payloads[[3L]], 0L)
+  expect_length(payloads[[4L]], 0L)
+  expect_equal(payloads[[5L]], list(notifyOption = "NoNotification"))
+  expect_equal(payloads[[6L]], list(notifyOption = "MailOnFailure"))
+})
+
+test_that("opaque standard refresh credentials require principal context", {
+  calls <- 0L
+  local_mocked_bindings(
+    .pbi_refresh_request = function(...) {
+      calls <<- calls + 1L
+      stop("unexpected request")
+    }
+  )
+
+  for (token in list("opaque-token", function(...) "provider-token")) {
+    expect_error(
+      fabric_pbi_refresh(
+        pbi_refresh_test_model(),
+        token = token,
+        api_base = "https://powerbi.test/v1.0/myorg"
+      ),
+      class = "fabric_pbi_refresh_auth_error"
+    )
+  }
+  expect_error(
+    fabric_pbi_refresh(
+      pbi_refresh_test_model(),
+      notify_option = "NoNotification",
+      token = "service-principal-token",
+      principal_type = "service_principal",
+      api_base = "https://powerbi.test/v1.0/myorg"
+    ),
+    class = "fabric_pbi_refresh_auth_error"
+  )
+  expect_identical(calls, 0L)
+})
+
+test_that("delegated standard refresh serializes its required notification", {
+  request <- NULL
+  local_mocked_bindings(
+    .httr2_perform = function(req, ...) {
+      request <<- req
+      httr2::new_response(
+        method = req$method,
+        url = req$url,
+        status_code = 202L,
+        headers = list(RequestId = pbi_refresh_id),
+        body = charToRaw("")
+      )
+    }
+  )
+
+  fabric_pbi_refresh(
+    pbi_refresh_test_model(),
+    tenant_id = "tenant-id",
+    client_id = "client-id",
+    api_base = "https://powerbi.test/v1.0/myorg"
+  )
+
+  expect_identical(request$body$type, "json")
+  expect_equal(request$body$data, list(notifyOption = "NoNotification"))
+})
+
+test_that("enhanced refresh builds documented processing controls", {
+  payload <- NULL
+  url <- NULL
+  local_mocked_bindings(
+    .pbi_refresh_request = function(method, request_url, credential, ...) {
+      args <- list(...)
+      payload <<- args$payload
+      url <<- request_url
+      list(
+        status_code = 202L,
+        location = NULL,
+        request_id = pbi_refresh_id,
+        retry_after = NULL,
+        body = list()
+      )
+    }
+  )
+
+  refresh <- fabric_pbi_refresh(
+    workspace_id = pbi_refresh_workspace_id,
+    dataset_id = pbi_refresh_dataset_id,
+    mode = "enhanced",
+    type = "full",
+    commit_mode = "transactional",
+    objects = list(
+      list(table = "Sales", partition = "2026"),
+      list(table = "Customers")
+    ),
+    apply_refresh_policy = FALSE,
+    effective_date = as.Date("2026-08-13"),
+    max_parallelism = 4L,
+    retry_count = 2L,
+    timeout = "02:00:00",
+    token = "test-token",
+    api_base = "https://powerbi.test/v1.0/myorg"
+  )
+
+  expect_identical(refresh$mode, "enhanced")
+  expect_equal(
+    payload,
+    list(
+      type = "Full",
+      commitMode = "Transactional",
+      objects = list(
+        list(table = "Sales", partition = "2026"),
+        list(table = "Customers")
+      ),
+      applyRefreshPolicy = FALSE,
+      effectiveDate = "2026-08-13T00:00:00Z",
+      maxParallelism = 4L,
+      retryCount = 2L,
+      timeout = "02:00:00"
+    )
+  )
+  expect_match(url, paste0("/groups/", pbi_refresh_workspace_id), fixed = TRUE)
+})
+
+test_that("named enhanced refresh objects serialize as arrays", {
+  requests <- list()
+  local_mocked_bindings(
+    .httr2_perform = function(req, ...) {
+      requests[[length(requests) + 1L]] <<- req
+      httr2::new_response(
+        method = req$method,
+        url = req$url,
+        status_code = 202L,
+        headers = list(RequestId = pbi_refresh_id),
+        body = charToRaw("")
+      )
+    }
+  )
+  object_cases <- list(
+    list(list(table = "Sales")),
+    list(list(table = "Sales"), list(table = "Customers")),
+    list(Sales = list(table = "Sales")),
+    list(
+      Sales = list(table = "Sales"),
+      Customers = list(table = "Customers")
+    )
+  )
+
+  for (objects in object_cases) {
+    fabric_pbi_refresh(
+      pbi_refresh_test_model(),
+      mode = "enhanced",
+      objects = objects,
+      token = "test-token",
+      api_base = "https://powerbi.test/v1.0/myorg"
+    )
+  }
+
+  encoded <- vapply(
+    requests,
+    function(req) {
+      jsonlite::toJSON(req$body$data, auto_unbox = TRUE, null = "null")
+    },
+    character(1)
+  )
+  expect_match(encoded, '"objects":\\[')
+  lengths <- vapply(
+    encoded,
+    function(body) {
+      length(jsonlite::fromJSON(body, simplifyVector = FALSE)$objects)
+    },
+    integer(1)
+  )
+  expect_identical(unname(lengths), c(1L, 2L, 1L, 2L))
+})
+
+test_that("automatic mode infers enhanced and My Workspace routes", {
+  call <- NULL
+  local_mocked_bindings(
+    .pbi_refresh_request = function(method, url, credential, payload, ...) {
+      call <<- list(url = url, payload = payload)
+      list(
+        status_code = 202L,
+        location = paste0(url, "/", pbi_refresh_id),
+        request_id = NULL,
+        retry_after = NULL,
+        body = list()
+      )
+    }
+  )
+
+  refresh <- fabric_pbi_refresh(
+    dataset_id = pbi_refresh_dataset_id,
+    my_workspace = TRUE,
+    objects = c("Facts", "Calendar"),
+    token = "test-token",
+    api_base = "https://powerbi.test/v1.0/myorg"
+  )
+
+  expect_identical(refresh$mode, "enhanced")
+  expect_true(refresh$my_workspace)
+  expect_match(
+    call$url,
+    paste0("/myorg/datasets/", pbi_refresh_dataset_id, "/refreshes"),
+    fixed = TRUE
+  )
+  expect_equal(
+    call$payload$objects,
+    list(list(table = "Facts"), list(table = "Calendar"))
+  )
+})
+
+test_that("refresh payload validation enforces Power BI contracts", {
+  expect_error(
+    .pbi_refresh_payload(
+      "standard",
+      NULL,
+      "Full",
+      NULL,
+      NULL,
+      NULL,
+      NULL,
+      NULL,
+      NULL,
+      NULL
+    ),
+    "Enhanced refresh options"
+  )
+  expect_error(
+    .pbi_refresh_payload(
+      "enhanced",
+      "MailOnFailure",
+      NULL,
+      NULL,
+      NULL,
+      NULL,
+      NULL,
+      NULL,
+      NULL,
+      NULL
+    ),
+    "notify_option"
+  )
+  expect_error(
+    .pbi_refresh_payload(
+      "enhanced",
+      NULL,
+      NULL,
+      "PartialBatch",
+      NULL,
+      TRUE,
+      NULL,
+      NULL,
+      NULL,
+      NULL
+    ),
+    "Transactional"
+  )
+  expect_no_error(
+    .pbi_refresh_payload(
+      "enhanced",
+      NULL,
+      NULL,
+      NULL,
+      NULL,
+      NULL,
+      NULL,
+      NULL,
+      2L,
+      "09:00:00"
+    )
+  )
+  expect_no_error(
+    .pbi_refresh_payload(
+      "enhanced",
+      NULL,
+      NULL,
+      NULL,
+      NULL,
+      NULL,
+      NULL,
+      NULL,
+      4L,
+      NULL
+    )
+  )
+  expect_no_error(.pbi_refresh_payload(
+    "enhanced",
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    3L,
+    NULL
+  ))
+  expect_error(.pbi_refresh_timeout("24:00:00"), "HH:MM:SS")
+  expect_error(.pbi_refresh_timeout("1:2:03"), "HH:MM:SS")
+  expect_error(.pbi_refresh_objects(list(list(partition = "p"))), "table")
+  expect_error(
+    .pbi_refresh_objects(list(list(table = "t", future = "x"))),
+    "optional partition"
+  )
+  expect_error(
+    .pbi_refresh_effective_date("2026-08-13"),
+    "ISO 8601"
+  )
+  expect_error(
+    .pbi_refresh_effective_date("2026-02-30T00:00:00Z"),
+    "valid ISO 8601"
+  )
+
+  defaults <- .pbi_refresh_payload(
+    "enhanced",
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+  )
+  expect_equal(defaults$payload, list(type = "Automatic"))
+
+  partial_batch <- .pbi_refresh_payload(
+    "enhanced",
+    NULL,
+    NULL,
+    "PartialBatch",
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+  )
+  expect_identical(partial_batch$payload$applyRefreshPolicy, FALSE)
+})
+
+test_that("refresh response IDs are validated and reconciled", {
+  expect_identical(
+    .pbi_refresh_response_id(list(
+      location = paste0("https://example.test/refreshes/", pbi_refresh_id),
+      request_id = NULL
+    )),
+    pbi_refresh_id
+  )
+  expect_error(
+    .pbi_refresh_response_id(list(location = NULL, request_id = NULL)),
+    class = "fabric_pbi_refresh_protocol_error"
+  )
+  expect_error(
+    .pbi_refresh_response_id(list(
+      location = paste0("https://example.test/refreshes/", pbi_refresh_id),
+      request_id = "44444444-4444-4444-8444-444444444444"
+    )),
+    "conflicting refresh IDs"
+  )
+})
+
+test_that("refresh parsing rejects malformed JSON shapes", {
+  handle <- pbi_refresh_test_handle()
+  expect_error(
+    .pbi_refresh_detail("not-an-object", handle, 200L),
+    class = "fabric_pbi_refresh_protocol_error"
+  )
+  expect_error(
+    .pbi_refresh_detail(
+      list(status = "Completed", messages = list("not-an-object")),
+      handle,
+      200L
+    ),
+    class = "fabric_pbi_refresh_protocol_error"
+  )
+
+  responses <- list(
+    list(body = list()),
+    list(body = list(value = NULL)),
+    list(body = list(value = list("not-an-object")))
+  )
+  local_mocked_bindings(
+    .pbi_refresh_request = function(...) {
+      response <- responses[[1L]]
+      responses <<- responses[-1L]
+      response
+    }
+  )
+  for (i in seq_along(responses)) {
+    expect_error(
+      .pbi_refresh_history_values(
+        "https://powerbi.test/v1.0/myorg",
+        list(
+          workspace_id = pbi_refresh_workspace_id,
+          dataset_id = pbi_refresh_dataset_id,
+          my_workspace = FALSE
+        ),
+        fabric_credential(token = "test-token")
+      ),
+      class = "fabric_pbi_refresh_protocol_error"
+    )
+  }
+
+  malformed_statuses <- list(
+    list(status = c("Unknown", "Completed")),
+    list(status = NA_character_),
+    list(extendedStatus = list("InProgress"))
+  )
+  for (body in malformed_statuses) {
+    expect_error(
+      .pbi_refresh_detail(body, handle, 200L),
+      class = "fabric_pbi_refresh_protocol_error"
+    )
+  }
+})
+
+test_that("request encoding preserves arrays and sends empty standard bodies", {
+  requests <- list()
+  local_mocked_bindings(
+    .httr2_perform = function(req, ...) {
+      requests[[length(requests) + 1L]] <<- list(req = req, args = list(...))
+      response_headers <- if (length(requests) == 1L) {
+        list(RequestId = pbi_refresh_id)
+      } else {
+        list(`x-ms-request-id` = pbi_refresh_id)
+      }
+      httr2::new_response(
+        method = req$method,
+        url = req$url,
+        status_code = 202L,
+        headers = response_headers,
+        body = charToRaw("")
+      )
+    }
+  )
+
+  response <- .pbi_refresh_request(
+    "POST",
+    "https://powerbi.test/v1.0/myorg/refreshes",
+    fabric_credential(token = "test-token"),
+    payload = list(objects = list(list(table = "Facts"))),
+    idempotent = FALSE
+  )
+  empty_response <- .pbi_refresh_request(
+    "POST",
+    "https://powerbi.test/v1.0/myorg/refreshes",
+    fabric_credential(token = "test-token"),
+    payload = list(),
+    idempotent = FALSE
+  )
+
+  first <- requests[[1L]]
+  encoded <- jsonlite::toJSON(
+    first$req$body$data,
+    auto_unbox = first$req$body$params$auto_unbox,
+    null = first$req$body$params$null
+  )
+  expect_match(encoded, '"objects":\\[\\{"table":"Facts"\\}\\]')
+  expect_false(first$args$idempotent)
+  expect_identical(first$args$audience, .fabric_audience$power_bi)
+  expect_identical(response$request_id, pbi_refresh_id)
+  expect_identical(empty_response$request_id, pbi_refresh_id)
+  expect_identical(requests[[2L]]$req$body$type, "raw")
+  expect_length(requests[[2L]]$req$body$data, 0L)
+})
+
+test_that("attempt completion inference agrees with its parsed end time", {
+  start <- "2026-08-13T08:00:00Z"
+  end <- "2026-08-13T08:02:00Z"
+  for (value in list(NULL, "")) {
+    attempt <- .pbi_refresh_attempt(list(startTime = start, endTime = value))
+    expect_identical(attempt$status, "InProgress")
+    expect_null(attempt$end_time)
+  }
+  completed <- .pbi_refresh_attempt(list(startTime = start, endTime = end))
+  expect_identical(completed$status, "Completed")
+  expect_equal(
+    completed$end_time,
+    as.POSIXct(end, format = "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
+  )
+  for (value in list(NULL, "", end)) {
+    failed <- .pbi_refresh_attempt(list(
+      startTime = start,
+      endTime = value,
+      serviceExceptionJson = '{"errorCode":"Transient","errorDescription":"Failure"}'
+    ))
+    expect_identical(failed$status, "Failed")
+  }
+  explicit <- .pbi_refresh_attempt(list(
+    startTime = start,
+    endTime = "",
+    status = "Cancelled"
+  ))
+  expect_identical(explicit$status, "Cancelled")
+  expect_null(explicit$end_time)
+})
+
+test_that("history normalizes attempts, errors, times, and detail links", {
+  call <- NULL
+  local_mocked_bindings(
+    .pbi_refresh_request = function(method, url, credential, ...) {
+      call <<- list(method = method, url = url)
+      list(
+        status_code = 200L,
+        location = NULL,
+        request_id = NULL,
+        retry_after = NULL,
+        body = list(
+          value = list(list(
+            refreshType = "ViaEnhancedApi",
+            startTime = "2026-08-13T08:00:00Z",
+            endTime = "2026-08-13T08:02:00Z",
+            status = "Failed",
+            requestId = pbi_refresh_id,
+            serviceExceptionJson = paste0(
+              '{"errorCode":"ModelRefreshFailed",',
+              '"errorDescription":"source unavailable"}'
+            ),
+            refreshAttempts = list(
+              list(
+                attemptId = 1L,
+                startTime = "2026-08-13T08:00:00Z",
+                endTime = "2026-08-13T08:01:00Z",
+                type = "Data",
+                serviceExceptionJson = '{"errorCode":"Transient"}'
+              ),
+              list(
+                attemptId = 2L,
+                startTime = "2026-08-13T08:01:00Z",
+                endTime = "2026-08-13T08:02:00Z",
+                type = "Data"
+              )
+            ),
+            futureField = list(retained = TRUE)
+          ))
+        )
+      )
+    }
+  )
+
+  history <- fabric_pbi_refresh_history(
+    pbi_refresh_test_model(),
+    top = 5L,
+    token = "test-token",
+    api_base = "https://powerbi.test/v1.0/myorg"
+  )
+
+  expect_s3_class(history, "fabric_pbi_refresh_history")
+  expect_length(history, 1L)
+  detail <- history[[1L]]
+  expect_s3_class(detail, "fabric_pbi_refresh_detail")
+  expect_identical(detail$state, "Failed")
+  expect_s3_class(detail$start_time, "POSIXct")
+  expect_identical(format(detail$start_time, tz = "UTC"), "2026-08-13 08:00:00")
+  expect_length(detail$attempts, 2L)
+  expect_identical(detail$attempts[[1L]]$status, "Failed")
+  expect_identical(detail$attempts[[1L]]$service_error$errorCode, "Transient")
+  expect_identical(detail$attempts[[2L]]$status, "Completed")
+  expect_identical(detail$service_error$errorCode, "ModelRefreshFailed")
+  expect_true(detail$raw$futureField$retained)
+  expect_match(
+    detail$details_url,
+    paste0(
+      "/groups/",
+      pbi_refresh_workspace_id,
+      "/datasets/",
+      pbi_refresh_dataset_id,
+      "/refreshdetails/",
+      pbi_refresh_id
+    ),
+    fixed = TRUE
+  )
+  expect_identical(detail$refresh$mode, "enhanced")
+  expect_identical(call$method, "GET")
+  expect_match(call$url, "%24top=5")
+})
+
+test_that("history preserves an ended refresh with unknown status", {
+  handle <- pbi_refresh_test_handle(mode = "standard")
+  ended <- .pbi_refresh_detail(
+    list(
+      status = "Unknown",
+      endTime = "2026-08-13T08:02:00Z"
+    ),
+    handle,
+    status_code = 200L,
+    history = TRUE
+  )
+  active <- .pbi_refresh_detail(
+    list(status = "Unknown"),
+    handle,
+    status_code = 200L,
+    history = TRUE
+  )
+  empty_end <- .pbi_refresh_detail(
+    list(status = "Unknown", endTime = ""),
+    handle,
+    status_code = 200L,
+    history = TRUE
+  )
+
+  expect_identical(ended$state, "Unknown")
+  expect_s3_class(ended$end_time, "POSIXct")
+  expect_identical(active$state, "InProgress")
+  expect_identical(empty_end$state, "InProgress")
+})
+
+test_that("detail states preserve queue, warning, cancellation, and timeout", {
+  handle <- pbi_refresh_test_handle()
+  queued <- .pbi_refresh_detail(
+    list(status = "Unknown", extendedStatus = "NotStarted"),
+    handle,
+    202L
+  )
+  warning <- .pbi_refresh_detail(
+    list(
+      status = "Completed",
+      extendedStatus = "Completed",
+      messages = list(list(type = "Warning", message = "Measure skipped"))
+    ),
+    handle,
+    200L
+  )
+  cancelled <- .pbi_refresh_detail(
+    list(status = "Unknown", extendedStatus = "Cancelled"),
+    handle,
+    200L
+  )
+  timed_out <- .pbi_refresh_detail(
+    list(status = "Failed", extendedStatus = "TimedOut"),
+    handle,
+    200L
+  )
+
+  expect_identical(queued$state, "Queued")
+  expect_false(queued$terminal)
+  expect_identical(warning$state, "CompletedWithWarnings")
+  expect_true(warning$has_warnings)
+  expect_identical(cancelled$state, "Cancelled")
+  expect_identical(timed_out$state, "TimedOut")
+  expect_true(timed_out$terminal)
+})
+
+test_that("status accepts handles and raw request IDs", {
+  calls <- character()
+  local_mocked_bindings(
+    .pbi_refresh_request = function(method, url, credential, ...) {
+      calls <<- c(calls, url)
+      list(
+        status_code = 202L,
+        location = NULL,
+        request_id = NULL,
+        retry_after = 4,
+        body = list(
+          status = "Unknown",
+          extendedStatus = "InProgress",
+          numberOfAttempts = 1L
+        )
+      )
+    }
+  )
+  handle <- pbi_refresh_test_handle()
+
+  from_handle <- fabric_pbi_refresh_status(
+    handle,
+    .sleep = function(seconds) NULL
+  )
+  from_id <- fabric_pbi_refresh_status(
+    refresh_id = pbi_refresh_id,
+    workspace_id = pbi_refresh_workspace_id,
+    dataset_id = pbi_refresh_dataset_id,
+    token = "override-token",
+    api_base = "https://powerbi.test/v1.0/myorg",
+    .sleep = function(seconds) NULL
+  )
+
+  expect_identical(from_handle$state, "InProgress")
+  expect_identical(from_handle$retry_after, 4)
+  expect_identical(from_id$state, "InProgress")
+  expect_length(calls, 2L)
+  expect_true(all(grepl(pbi_refresh_id, calls, fixed = TRUE)))
+  expect_error(
+    fabric_pbi_refresh_status(
+      handle,
+      dataset_id = pbi_refresh_dataset_id,
+      .sleep = function(seconds) NULL
+    ),
+    "cannot be combined"
+  )
+})
+
+test_that("refresh selectors cannot be combined before lookup or cancellation", {
+  requested <- FALSE
+  local_mocked_bindings(
+    .pbi_refresh_request = function(...) {
+      requested <<- TRUE
+      stop("unexpected request")
+    }
+  )
+  handle <- pbi_refresh_test_handle()
+  detail <- structure(
+    list(refresh = handle),
+    class = "fabric_pbi_refresh_detail"
+  )
+  for (fun in list(fabric_pbi_refresh_status, fabric_pbi_refresh_cancel)) {
+    for (refresh in list(pbi_refresh_id, handle, detail)) {
+      for (alias in c(pbi_refresh_id, "99999999-9999-9999-9999-999999999999")) {
+        expect_error(
+          fun(refresh = refresh, refresh_id = alias),
+          "cannot be combined"
+        )
+      }
+    }
+  }
+  expect_false(requested)
+})
+
+test_that("wait requires context that a raw refresh ID does not carry", {
+  requested <- FALSE
+  local_mocked_bindings(
+    .pbi_refresh_request = function(...) {
+      requested <<- TRUE
+      stop("unexpected request")
+    }
+  )
+
+  expect_error(
+    fabric_pbi_refresh_wait(pbi_refresh_id),
+    "fabric_pbi_refresh handle or detail record",
+    fixed = TRUE
+  )
+  expect_false(requested)
+})
+
+test_that("standard refresh uses request details when they are available", {
+  call <- NULL
+  local_mocked_bindings(
+    .pbi_refresh_request = function(method, url, credential, ...) {
+      call <<- list(method = method, url = url, args = list(...))
+      list(
+        status_code = 200L,
+        location = NULL,
+        request_id = NULL,
+        retry_after = NULL,
+        body = list(status = "Completed", initiatedBy = "OnDemand")
+      )
+    }
+  )
+
+  detail <- fabric_pbi_refresh_status(
+    pbi_refresh_test_handle(mode = "standard"),
+    .sleep = function(seconds) NULL
+  )
+
+  expect_identical(detail$state, "Completed")
+  expect_identical(detail$refresh_type, "OnDemand")
+  expect_identical(call$method, "GET")
+  expect_true(call$args$idempotent)
+  expect_match(call$url, paste0("/refreshes/", pbi_refresh_id), fixed = TRUE)
+})
+
+test_that("unsupported standard details fall back to collection history", {
+  calls <- list()
+  local_mocked_bindings(
+    .pbi_refresh_request = function(method, url, credential, ...) {
+      calls[[length(calls) + 1L]] <<- url
+      if (grepl(paste0("/refreshes/", pbi_refresh_id), url, fixed = TRUE)) {
+        .fabric_abort(
+          "Request-specific details are unavailable",
+          class = "fabric_http_error",
+          status = 404L
+        )
+      }
+      list(
+        status_code = 200L,
+        location = NULL,
+        request_id = NULL,
+        retry_after = NULL,
+        body = list(
+          value = list(list(
+            requestId = pbi_refresh_id,
+            refreshType = "ViaApi",
+            status = "Unknown"
+          ))
+        )
+      )
+    }
+  )
+
+  detail <- fabric_pbi_refresh_status(
+    pbi_refresh_test_handle(mode = "standard"),
+    .sleep = function(seconds) NULL
+  )
+
+  expect_identical(detail$state, "InProgress")
+  expect_identical(detail$refresh_type, "ViaApi")
+  expect_length(calls, 2L)
+  expect_match(calls[[1L]], paste0("/refreshes/", pbi_refresh_id), fixed = TRUE)
+  expect_match(calls[[2L]], "/refreshes$", perl = TRUE)
+})
+
+test_that("raw standard refresh IDs resolve through collection history", {
+  calls <- list()
+  local_mocked_bindings(
+    .pbi_refresh_request = function(method, url, credential, ...) {
+      calls[[length(calls) + 1L]] <<- list(method = method, url = url)
+      if (grepl(paste0("/refreshes/", pbi_refresh_id), url, fixed = TRUE)) {
+        .fabric_abort(
+          "Request-specific details are unavailable",
+          class = "fabric_http_error",
+          status = 404L
+        )
+      }
+      list(
+        status_code = 200L,
+        location = NULL,
+        request_id = NULL,
+        retry_after = NULL,
+        body = list(
+          value = list(list(
+            requestId = toupper(pbi_refresh_id),
+            refreshType = "ViaApi",
+            status = "Completed"
+          ))
+        )
+      )
+    }
+  )
+
+  detail <- fabric_pbi_refresh_status(
+    refresh_id = pbi_refresh_id,
+    workspace_id = pbi_refresh_workspace_id,
+    dataset_id = pbi_refresh_dataset_id,
+    token = "test-token",
+    api_base = "https://powerbi.test/v1.0/myorg",
+    .sleep = function(seconds) NULL
+  )
+
+  expect_identical(detail$state, "Completed")
+  expect_identical(detail$refresh$mode, "standard")
+  expect_length(calls, 2L)
+  expect_identical(vapply(calls, `[[`, character(1), "method"), c("GET", "GET"))
+})
+
+test_that("standard detail fallback preserves transport errors", {
+  local_mocked_bindings(
+    .pbi_refresh_request = function(...) {
+      .fabric_abort(
+        "The status request lost its connection",
+        class = c("fabric_http_transport_error", "fabric_http_error")
+      )
+    }
+  )
+
+  condition <- rlang::catch_cnd(fabric_pbi_refresh_status(
+    pbi_refresh_test_handle(mode = "standard"),
+    .sleep = function(seconds) NULL
+  ))
+
+  expect_s3_class(condition, "fabric_http_transport_error")
+  expect_match(conditionMessage(condition), "lost its connection", fixed = TRUE)
+})
+
+test_that("raw refresh fallback preserves non-availability HTTP errors", {
+  calls <- 0L
+  local_mocked_bindings(
+    .pbi_refresh_request = function(...) {
+      calls <<- calls + 1L
+      .fabric_abort(
+        "The refresh service is unavailable",
+        class = "fabric_http_error",
+        status = 503L
+      )
+    }
+  )
+
+  condition <- rlang::catch_cnd(fabric_pbi_refresh_status(
+    refresh_id = pbi_refresh_id,
+    workspace_id = pbi_refresh_workspace_id,
+    dataset_id = pbi_refresh_dataset_id,
+    token = "test-token",
+    api_base = "https://powerbi.test/v1.0/myorg",
+    .sleep = function(seconds) NULL
+  ))
+
+  expect_s3_class(condition, "fabric_http_error")
+  expect_identical(condition$status, 503L)
+  expect_identical(calls, 1L)
+})
+
+test_that("standard refresh wait retries missing history until completion", {
+  item_calls <- 0L
+  history_calls <- 0L
+  now <- as.POSIXct("2026-08-13 08:00:00", tz = "UTC")
+  local_mocked_bindings(
+    .pbi_refresh_request = function(method, url, credential, ...) {
+      if (grepl(paste0("/refreshes/", pbi_refresh_id), url, fixed = TRUE)) {
+        item_calls <<- item_calls + 1L
+        .fabric_abort(
+          "Request-specific details are unavailable",
+          class = "fabric_http_error",
+          status = 404L
+        )
+      }
+      history_calls <<- history_calls + 1L
+      value <- if (history_calls == 1L) {
+        list()
+      } else {
+        list(list(
+          requestId = pbi_refresh_id,
+          refreshType = "ViaApi",
+          status = if (history_calls == 2L) "Unknown" else "Completed"
+        ))
+      }
+      list(
+        status_code = 200L,
+        location = NULL,
+        request_id = NULL,
+        retry_after = NULL,
+        body = list(value = value)
+      )
+    }
+  )
+
+  detail <- fabric_pbi_refresh_wait(
+    pbi_refresh_test_handle(mode = "standard"),
+    poll_interval = 0,
+    timeout = 1,
+    .sleep = function(seconds) {
+      now <<- now + seconds
+    },
+    .now = function() now
+  )
+
+  expect_identical(detail$state, "Completed")
+  expect_identical(item_calls, 3L)
+  expect_identical(history_calls, 3L)
+})
+
+test_that("wait observes active attempts and returns completion", {
+  responses <- list(
+    list(
+      status_code = 202L,
+      retry_after = 0,
+      body = list(
+        status = "Unknown",
+        extendedStatus = "NotStarted",
+        numberOfAttempts = 0L
+      )
+    ),
+    list(
+      status_code = 202L,
+      retry_after = 0,
+      body = list(
+        status = "Unknown",
+        extendedStatus = "InProgress",
+        numberOfAttempts = 2L,
+        refreshAttempts = list(
+          list(
+            attemptId = 1L,
+            type = "Data",
+            endTime = "2026-08-13T08:00:01Z",
+            serviceExceptionJson = '{"errorCode":"Transient"}'
+          ),
+          list(
+            attemptId = 2L,
+            type = "Data",
+            startTime = "2026-08-13T08:00:02Z"
+          )
+        )
+      )
+    ),
+    list(
+      status_code = 200L,
+      retry_after = NULL,
+      body = list(
+        status = "Completed",
+        extendedStatus = "Completed",
+        numberOfAttempts = 2L,
+        endTime = "2026-08-13T08:00:03Z"
+      )
+    )
+  )
+  index <- 0L
+  now <- as.POSIXct("2026-08-13 08:00:00", tz = "UTC")
+  local_mocked_bindings(
+    .pbi_refresh_request = function(...) {
+      index <<- index + 1L
+      c(
+        responses[[index]],
+        list(location = NULL, request_id = NULL)
+      )
+    }
+  )
+
+  result <- fabric_pbi_refresh_wait(
+    pbi_refresh_test_handle(),
+    poll_interval = 0,
+    timeout = 10,
+    .sleep = function(seconds) {
+      now <<- now + seconds
+    },
+    .now = function() now
+  )
+
+  expect_identical(result$state, "Completed")
+  expect_identical(result$number_of_attempts, 2L)
+  expect_identical(index, 3L)
+})
+
+test_that("wait rejects a completion response received after its deadline", {
+  elapsed <- 0
+  seen_deadline <- NULL
+  started <- as.POSIXct("2026-08-13 08:00:00", tz = "UTC")
+  local_mocked_bindings(
+    .pbi_refresh_request = function(..., deadline = NULL) {
+      seen_deadline <<- deadline
+      elapsed <<- elapsed + 10
+      list(
+        status_code = 200L,
+        location = NULL,
+        request_id = NULL,
+        retry_after = NULL,
+        body = list(status = "Completed", extendedStatus = "Completed")
+      )
+    }
+  )
+
+  error <- expect_error(
+    fabric_pbi_refresh_wait(
+      pbi_refresh_test_handle(),
+      poll_interval = 0,
+      timeout = 1,
+      .sleep = function(seconds) {
+        elapsed <<- elapsed + seconds
+      },
+      .now = function() started + elapsed
+    ),
+    class = "fabric_pbi_refresh_wait_timeout"
+  )
+
+  expect_identical(seen_deadline, started + 1)
+  expect_equal(elapsed, 10 + .fabric_pbi_refresh_poll_floor)
+  expect_identical(error$last_status$state, "Completed")
+})
+
+test_that("wait rejects service retry delays beyond its deadline", {
+  calls <- 0L
+  now <- as.POSIXct("2026-08-13 08:00:00", tz = "UTC")
+  refresh <- pbi_refresh_test_handle()
+  refresh$api_base <- "https://api.powerbi.com/v1.0/myorg"
+  httr2::local_mocked_responses(function(req) {
+    calls <<- calls + 1L
+    json_response(429L, headers = list("retry-after" = "30"))
+  })
+
+  error <- expect_error(
+    fabric_pbi_refresh_wait(
+      refresh,
+      poll_interval = 0,
+      timeout = 1,
+      .sleep = function(seconds) {
+        now <<- now + seconds
+      },
+      .now = function() now
+    ),
+    class = "fabric_pbi_refresh_wait_timeout"
+  )
+
+  expect_identical(calls, 1L)
+  expect_s3_class(error$parent, "fabric_http_deadline_error")
+  expect_equal(error$parent$retry_after, 30)
+  expect_equal(
+    error$parent$remaining,
+    1 - .fabric_pbi_refresh_poll_floor,
+    tolerance = 1e-6
+  )
+})
+
+test_that("status to wait preserves the latest unelapsed Retry-After", {
+  now <- as.POSIXct("2026-09-07 10:00:00", tz = "UTC")
+  calls <- 0L
+  slept <- numeric()
+  local_mocked_bindings(.pbi_refresh_request = function(...) {
+    calls <<- calls + 1L
+    list(
+      status_code = 200L,
+      retry_after = if (calls == 1L) 60 else NULL,
+      body = list(status = if (calls == 1L) "InProgress" else "Completed")
+    )
+  })
+  handle <- pbi_refresh_test_handle()
+  handle$next_poll_at <- NULL
+  status <- fabric_pbi_refresh_status(
+    handle,
+    .now = function() now
+  )
+  now <- now + 50
+  result <- fabric_pbi_refresh_wait(
+    status,
+    timeout = 20,
+    .now = function() now,
+    .sleep = function(seconds) {
+      slept <<- c(slept, seconds)
+      now <<- now + seconds
+    }
+  )
+  expect_equal(slept, 10)
+  expect_identical(calls, 2L)
+  expect_identical(result$state, "Completed")
+  expect_null(result$refresh$next_poll_at)
+})
+
+test_that("wait sleeps only the unelapsed submission Retry-After", {
+  requested <- 0L
+  slept <- numeric()
+  submitted <- as.POSIXct("2026-08-13 08:00:00", tz = "UTC")
+  now <- submitted + 50
+  handle <- pbi_refresh_test_handle(retry_after = 60)
+  handle$submitted_at <- submitted
+  handle$next_poll_at <- submitted + 60
+  local_mocked_bindings(
+    .pbi_refresh_request = function(...) {
+      requested <<- requested + 1L
+      list(
+        status_code = 200L,
+        location = NULL,
+        request_id = NULL,
+        retry_after = NULL,
+        body = list(status = "Completed", extendedStatus = "Completed")
+      )
+    }
+  )
+
+  result <- fabric_pbi_refresh_wait(
+    handle,
+    timeout = 20,
+    .sleep = function(seconds) {
+      slept <<- c(slept, seconds)
+      now <<- now + seconds
+    },
+    .now = function() now
+  )
+
+  expect_identical(result$state, "Completed")
+  expect_equal(slept, 10)
+  expect_identical(requested, 1L)
+})
+
+test_that("wait raises distinct service terminal conditions", {
+  states <- list(
+    Failed = c("Failed", "Failed", "fabric_pbi_refresh_failed"),
+    TimedOut = c("Failed", "TimedOut", "fabric_pbi_refresh_service_timeout"),
+    Cancelled = c("Unknown", "Cancelled", "fabric_pbi_refresh_cancelled"),
+    Disabled = c("Disabled", "Disabled", "fabric_pbi_refresh_disabled")
+  )
+
+  for (values in states) {
+    now <- as.POSIXct("2026-08-13 08:00:00", tz = "UTC")
+    local_mocked_bindings(
+      .pbi_refresh_request = function(...) {
+        list(
+          status_code = 200L,
+          location = NULL,
+          request_id = NULL,
+          retry_after = NULL,
+          body = list(status = values[[1L]], extendedStatus = values[[2L]])
+        )
+      }
+    )
+    expect_error(
+      fabric_pbi_refresh_wait(
+        pbi_refresh_test_handle(),
+        poll_interval = 0,
+        timeout = 1,
+        .sleep = function(seconds) {
+          now <<- now + seconds
+        },
+        .now = function() now
+      ),
+      class = values[[3L]]
+    )
+  }
+})
+
+test_that("client wait timeout is distinct and can cancel", {
+  cancel_calls <- 0L
+  cancel_deadline <- NULL
+  now <- as.POSIXct("2026-08-13 08:00:00", tz = "UTC")
+  started <- now
+  withr::local_options(fabricqueryr.wait.cleanup_timeout = 5)
+  local_mocked_bindings(
+    .pbi_refresh_cancel_context = function(context, deadline = NULL, ...) {
+      cancel_calls <<- cancel_calls + 1L
+      cancel_deadline <<- deadline
+      invisible(TRUE)
+    }
+  )
+
+  error <- expect_error(
+    fabric_pbi_refresh_wait(
+      pbi_refresh_test_handle(),
+      timeout = 1,
+      cancel_on_timeout = TRUE,
+      .sleep = function(seconds) {
+        now <<- now + seconds
+      },
+      .now = function() now
+    ),
+    class = "fabric_pbi_refresh_wait_timeout"
+  )
+  expect_identical(error$cancel_accepted, TRUE)
+  expect_identical(cancel_calls, 1L)
+  expect_identical(cancel_deadline, started + 6)
+})
+
+test_that("wait rejects unknown future states without polling forever", {
+  now <- as.POSIXct("2026-08-13 08:00:00", tz = "UTC")
+  local_mocked_bindings(
+    .pbi_refresh_request = function(...) {
+      list(
+        status_code = 200L,
+        location = NULL,
+        request_id = NULL,
+        retry_after = NULL,
+        body = list(status = "FutureState")
+      )
+    }
+  )
+
+  condition <- expect_error(
+    fabric_pbi_refresh_wait(
+      pbi_refresh_test_handle(),
+      poll_interval = 0,
+      timeout = 1,
+      .sleep = function(seconds) {
+        now <<- now + seconds
+      },
+      .now = function() now
+    ),
+    class = "fabric_pbi_refresh_unknown_status"
+  )
+  expect_identical(condition$refresh_status$state, "FutureState")
+})
+
+test_that("cancel uses the request-specific DELETE route", {
+  call <- NULL
+  local_mocked_bindings(
+    .pbi_refresh_request = function(method, url, credential, ...) {
+      call <<- list(method = method, url = url, args = list(...))
+      list(
+        status_code = 200L,
+        location = NULL,
+        request_id = NULL,
+        retry_after = NULL,
+        body = list()
+      )
+    }
+  )
+
+  result <- withVisible(fabric_pbi_refresh_cancel(pbi_refresh_test_handle()))
+
+  expect_false(result$visible)
+  expect_identical(result$value, TRUE)
+  expect_identical(call$method, "DELETE")
+  expect_false(call$args$idempotent)
+  expect_identical(call$args$accepted_status, c(202L, 404L))
+  expect_match(call$url, paste0("/refreshes/", pbi_refresh_id), fixed = TRUE)
+})
+
+test_that("standard refresh cancellation fails before an HTTP request", {
+  requested <- FALSE
+  local_mocked_bindings(
+    .pbi_refresh_request = function(...) {
+      requested <<- TRUE
+    }
+  )
+
+  condition <- rlang::catch_cnd(fabric_pbi_refresh_cancel(
+    pbi_refresh_test_handle(mode = "standard")
+  ))
+
+  expect_s3_class(condition, "fabric_pbi_refresh_unsupported_operation")
+  expect_match(conditionMessage(condition), "cannot be cancelled", fixed = TRUE)
+  expect_identical(requested, FALSE)
+})
+
+test_that("raw standard refresh cancellation is rejected from history", {
+  calls <- list()
+  local_mocked_bindings(
+    .pbi_refresh_request = function(method, url, credential, ...) {
+      calls[[length(calls) + 1L]] <<- list(method = method, url = url)
+      list(
+        status_code = 200L,
+        location = NULL,
+        request_id = NULL,
+        retry_after = NULL,
+        body = list(
+          value = list(list(
+            requestId = pbi_refresh_id,
+            refreshType = "ViaApi",
+            status = "Completed"
+          ))
+        )
+      )
+    }
+  )
+
+  condition <- rlang::catch_cnd(fabric_pbi_refresh_cancel(
+    refresh_id = pbi_refresh_id,
+    workspace_id = pbi_refresh_workspace_id,
+    dataset_id = pbi_refresh_dataset_id,
+    token = "test-token",
+    api_base = "https://powerbi.test/v1.0/myorg"
+  ))
+
+  expect_s3_class(condition, "fabric_pbi_refresh_unsupported_operation")
+  expect_length(calls, 1L)
+  expect_identical(calls[[1L]]$method, "GET")
+  expect_match(calls[[1L]]$url, "/refreshes$", perl = TRUE)
+})
+
+test_that("raw enhanced refresh cancellation is classified before DELETE", {
+  calls <- list()
+  local_mocked_bindings(
+    .pbi_refresh_request = function(method, url, credential, ...) {
+      calls[[length(calls) + 1L]] <<- list(method = method, url = url)
+      body <- if (identical(method, "GET")) {
+        list(
+          value = list(list(
+            requestId = pbi_refresh_id,
+            refreshType = "ViaEnhancedApi",
+            status = "Unknown"
+          ))
+        )
+      } else {
+        list()
+      }
+      list(
+        status_code = 200L,
+        location = NULL,
+        request_id = NULL,
+        retry_after = NULL,
+        body = body
+      )
+    }
+  )
+
+  result <- withVisible(fabric_pbi_refresh_cancel(
+    refresh_id = pbi_refresh_id,
+    workspace_id = pbi_refresh_workspace_id,
+    dataset_id = pbi_refresh_dataset_id,
+    token = "test-token",
+    api_base = "https://powerbi.test/v1.0/myorg"
+  ))
+
+  expect_false(result$visible)
+  expect_identical(result$value, TRUE)
+  expect_identical(
+    vapply(calls, `[[`, character(1), "method"),
+    c("GET", "DELETE")
+  )
+  expect_match(
+    calls[[2L]]$url,
+    paste0("/refreshes/", pbi_refresh_id),
+    fixed = TRUE
+  )
+})
+
+test_that("connection strings resolve through the existing DAX target lookup", {
+  call <- NULL
+  local_mocked_bindings(
+    pbi_resolve_ids_from_connstr = function(connstr, credential, api_base) {
+      expect_match(connstr, "powerbi://", fixed = TRUE)
+      list(
+        group_id = pbi_refresh_workspace_id,
+        dataset_id = pbi_refresh_dataset_id
+      )
+    },
+    .pbi_refresh_request = function(method, url, credential, payload, ...) {
+      call <<- url
+      list(
+        status_code = 202L,
+        location = NULL,
+        request_id = pbi_refresh_id,
+        retry_after = NULL,
+        body = list()
+      )
+    }
+  )
+
+  fabric_pbi_refresh(
+    paste0(
+      "Data Source=powerbi://api.powerbi.com/v1.0/myorg/Workspace;",
+      "Initial Catalog=Model;"
+    ),
+    token = "test-token",
+    principal_type = "service_principal"
+  )
+
+  expect_match(
+    call,
+    paste0("/groups/", pbi_refresh_workspace_id),
+    fixed = TRUE
+  )
+})
+
+test_that("print methods expose identity and state without credentials", {
+  handle <- pbi_refresh_test_handle()
+  detail <- .pbi_refresh_detail(
+    list(status = "Completed", numberOfAttempts = 1L),
+    handle,
+    200L
+  )
+
+  expect_output(print(handle), pbi_refresh_id, fixed = TRUE)
+  expect_output(print(handle), "enhanced", fixed = TRUE)
+  expect_output(print(detail), "Completed", fixed = TRUE)
+  expect_output(print(detail), "attempts: 1", fixed = TRUE)
+  expect_false(any(grepl(
+    "test-token",
+    capture.output(print(handle)),
+    fixed = TRUE
+  )))
+})
+
+test_that("refresh handles do not serialize bearer credentials", {
+  secret <- "refresh-handle-secret-that-must-not-be-serialized"
+  handle <- pbi_refresh_test_handle()
+  reference <- .pbi_refresh_credential_reference(
+    fabric_credential(token = secret)
+  )
+  handle$credential <- reference$reference
+  handle$.credential_key <- reference$key
+
+  expect_identical(
+    fabric_get_token(.pbi_refresh_credential(handle), "audience"),
+    secret
+  )
+  serialized <- serialize(handle, NULL, ascii = TRUE)
+  expect_false(grepl(secret, rawToChar(serialized), fixed = TRUE))
+
+  restored <- unserialize(serialized)
+  expect_error(
+    .pbi_refresh_credential(restored),
+    "no longer has an in-process credential",
+    class = "fabric_pbi_refresh_credential_error"
+  )
+})

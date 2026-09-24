@@ -1,0 +1,183 @@
+---
+title: "Get started with 'fabricQueryR'"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Get started with 'fabricQueryR'}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", eval = FALSE)
+```
+
+Microsoft Fabric is a collection of services for storing, transforming, and
+reporting on data. 'fabricQueryR' lets you work with many of those services
+from R: you can read Fabric data, send R data to Fabric, and start work that
+runs inside Fabric.
+
+This guide introduces the basic Fabric concepts and completes one small read.
+Start here if you are new to either Fabric or 'fabricQueryR', then continue to
+a task-specific vignette.
+
+## The Fabric objects you will see
+
+A *workspace* is a shared area that contains Fabric items. An *item* is a
+resource inside a workspace, such as a Lakehouse, Warehouse, semantic model, 
+or notebook.
+
+The most common data items have different purposes:
+
+| Item | Think of it as | A common R task |
+|---|---|---|
+| Lakehouse | Files plus managed data tables | Read or write a table or file |
+| Warehouse | A relational SQL database | Query or load business tables |
+| Eventhouse | A database for event and time-series data | Query with KQL or ingest events |
+| Semantic model | Report-ready tables, relationships, and calculations | Query with DAX or refresh the model |
+| API for GraphQL | A structured API in front of Fabric data | Request selected fields |
+
+*OneLake* is the storage layer shared by Fabric items. In a Lakehouse, the
+`Files/` area contains ordinary files and the `Tables/` area contains managed
+Delta tables. Delta is a storage format that supports efficient reads and writes,
+schema evolution, and transactional consistency.
+
+## Sign in
+
+This guide uses APIs available in 'fabricQueryR' 1.0.0 and later. Install the
+package, load it, and set your organization's Microsoft Entra tenant ID:
+
+```{r, eval = FALSE}
+install.packages("fabricQueryR")
+
+library(fabricQueryR)
+Sys.setenv(FABRICQUERYR_TENANT_ID = "<your-tenant-id>")
+```
+
+The first Fabric call may open a browser. Sign in with the same work or school
+account that you use in the Fabric portal. 
+
+If your organization requires an approved application, 
+your administrator may also give you a client ID to set as `FABRICQUERYR_CLIENT_ID`.
+
+```{r, eval = FALSE}
+# Run this only when your administrator supplies a client ID:
+Sys.setenv(FABRICQUERYR_CLIENT_ID = "<your-app-client-id>")
+```
+
+The [authentication vignette](authentication.html) explains this setup and
+the different ways to authenticate in more detail.
+
+## Find a workspace and an item
+
+Start by listing the workspaces that your account can access:
+
+```{r tutorial-test-list-workspaces, eval = FALSE}
+# List all workspaces you can access
+workspaces <- fabric_workspaces()
+```
+
+The result is a list of `FabricWorkspace` R6 objects. Each object keeps the
+workspace fields returned by Fabric and provides discovery methods. For
+example, `$items()` corresponds to `fabric_items()`, and `$lakehouses()`
+corresponds to `fabric_lakehouses()`. 
+If the list is empty, check that your account has been granted access to a workspace in the Fabric portal.
+If the list is not empty, select a specific workspace:
+
+```{r tutorial-test-select-first, eval = FALSE}
+# Select the first workspace in the list
+workspace <- workspaces[[1L]]
+workspace$displayName
+```
+
+For a script that will run repeatedly,
+selecting by exact name is more robust:
+
+```{r tutorial-test-select-by-name, eval = FALSE}
+# Select a workspace by name
+workspaces <- fabric_workspaces()
+matches <- Filter(
+  \(x) identical(x$displayName, "Analytics workspace"),
+  workspaces
+)
+stopifnot(length(matches) == 1L)
+workspace <- matches[[1L]]
+```
+
+Now list all items with `$items()` (`fabric_items()`), or ask directly for
+Lakehouses with `$lakehouses()` (`fabric_lakehouses()`):
+
+```{r tutorial-test-list-items, eval = FALSE}
+# List all items in the workspace
+items <- workspace$items()
+items
+
+# The generic interface also filters types without a typed convenience method
+reports <- workspace$items(type = "Report")
+
+# List only Lakehouses in the workspace
+lakehouses <- workspace$lakehouses()
+lakehouse <- lakehouses[[1L]]
+lakehouse$displayName
+```
+
+A discovered item is a read-only R6 object. Read its Fabric metadata through
+fields such as `$displayName`, `$type`, and `$id`; methods
+matched to its type perform the useful next actions. For example, a
+`FabricLakehouse` provides `$tables()` (`fabric_lakehouse_tables()`),
+`$read_table()` (`fabric_lakehouse_read_table()`), and `$write_table()`
+(`fabric_lakehouse_write_table()`), plus OneLake, SQL, and Livy methods. Use
+`$as_list()` or `as.list()` only when another interface specifically requires a
+plain record. The typed workspace methods are an intentional convenience
+subset of Fabric's larger item catalog. `$items(type = ...)` can discover other
+service types; those items retain all returned fields as generic `FabricItem`
+objects when the package has no workload-specific subclass.
+
+## Complete a first read
+
+If the workspace contains a Lakehouse, 
+reading one managed table is a simple first workflow. Use `$tables()`
+(`fabric_lakehouse_tables()`) to discover its tables and `$read_table()`
+(`fabric_lakehouse_read_table()`) to read one:
+
+```{r tutorial-test-read-lakehouse, eval = FALSE}
+# List the tables in the Lakehouse
+tables <- lakehouse$tables()
+tables[c("schema", "name", "type")]
+
+# Select the first table and read a small number of rows
+first_table <- tables[1L, ]
+rows <- lakehouse$read_table(
+  first_table,
+  limit = 100L
+)
+
+# Show the first few rows
+head(rows)
+```
+
+The result is a tibble, which can be used with base R, 'dplyr', plotting
+packages, or other familiar R tools. `limit = 100L` keeps this first request
+small while you confirm that access and table selection are correct.
+
+This direct Delta read uses Python through 'reticulate'. The first read may
+download the required runtime and packages. Use `fabric_delta_config()` to
+inspect requirements, or `fabric_delta_config(initialize = TRUE)` to prepare
+the runtime before reading. Direct reads also need OneLake data access; use
+SQL or Spark if the table uses an unsupported Delta feature. The
+[reading guide](reading-data.html) explains these choices.
+
+## Choose the next guide
+
+There are often several valid ways to move the same data. 
+The vignettes below compare the options and show how to use them.
+Continue with one of the following vignettes:
+
+- [Bring Fabric data into R](reading-data.html) compares SQL, Lakehouse,
+  Warehouse, Eventhouse, semantic-model, OneLake-file, GraphQL, and Spark
+  reads
+- [Bring R data into Microsoft Fabric](ingesting-data.html) compares ways to
+  send an R object or an existing file to Fabric
+- [Working with Fabric Lakehouses and OneLake](onelake-and-lakehouse.html)
+  explains Lakehouse files and tables in more detail
+- [Working with Livy (Spark)](spark-with-livy.html) introduces remote Spark work
+  after the simpler read and write paths

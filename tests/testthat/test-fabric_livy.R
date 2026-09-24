@@ -1,0 +1,2917 @@
+test_that("Livy reports SQL truncation with inspectable partial data", {
+  value <- list(
+    schema = list(
+      type = "struct",
+      fields = list(list(name = "id", type = "int"))
+    ),
+    data = list(list(1L)),
+    truncated = TRUE
+  )
+  error <- rlang::catch_cnd(fabric_livy_parse_sql_json(value))
+  expect_s3_class(error, "fabric_livy_partial_error")
+  expect_identical(error$partial_data$id, 1L)
+  value$truncated <- FALSE
+  expect_identical(fabric_livy_parse_sql_json(value)$id, 1L)
+})
+
+test_that("Livy decodes signed binary arrays including empty and NULL values", {
+  expect_identical(
+    fabric_livy_convert_column(
+      list(list(0L, -1L, -128L), list(0L, 255L, 128L), list(), NULL),
+      "binary"
+    ),
+    list(as.raw(c(0, 255, 128)), as.raw(c(0, 255, 128)), raw(), NULL)
+  )
+  for (value in list(
+    list(256L),
+    list(-129L),
+    list(0.5),
+    list(NULL),
+    list(TRUE),
+    list(list(1L))
+  )) {
+    error <- rlang::catch_cnd(fabric_livy_convert_column(list(value), "binary"))
+    expect_s3_class(error, "error")
+    expect_match(conditionMessage(error), "binary")
+  }
+})
+
+test_that("Livy timestamps fully parse offsets with either date separator", {
+  values <- list(
+    "2026-09-07 12:30:00+02:00",
+    "2026-09-07T12:30:00+0200",
+    "2026-09-07 05:00:00-05:30",
+    "2026-09-07T10:30:00Z",
+    "2026-09-07 10:30:00",
+    NULL
+  )
+  expected <- as.POSIXct(c(rep("2026-09-07 10:30:00", 5L), NA), tz = "UTC")
+  expect_equal(
+    unname(fabric_livy_convert_column(values, "timestamp")),
+    expected
+  )
+  for (value in c(
+    "2026-09-07 12:30:00junk",
+    "2026-09-07 12:30:00+25:00",
+    "2026-09-07T12:30:00Zjunk"
+  )) {
+    error <- rlang::catch_cnd(fabric_livy_convert_column(
+      list(value),
+      "timestamp"
+    ))
+    expect_s3_class(error, "error")
+    expect_match(conditionMessage(error), "timestamp")
+  }
+})
+
+test_that("Livy selects identity-aware OAuth audiences", {
+  required_delegated <- paste0(
+    "https://api.fabric.microsoft.com/",
+    c(
+      "Lakehouse.Execute.All",
+      "Lakehouse.Read.All",
+      "Code.AccessFabric.All",
+      "Code.AccessStorage.All"
+    )
+  )
+  expect_identical(
+    fabric_livy_audience(NULL, NULL, list(auth_type = "device_code")),
+    required_delegated
+  )
+  expect_identical(
+    fabric_livy_audience(
+      NULL,
+      NULL,
+      list(auth_type = "client_credentials", password = "secret")
+    ),
+    .fabric_audience$power_bi
+  )
+  expect_identical(
+    fabric_livy_audience("https://custom.test/.default", "token"),
+    "https://custom.test/.default"
+  )
+  with_sql <- c(
+    required_delegated,
+    "https://api.fabric.microsoft.com/Code.AccessSQL.All"
+  )
+  expect_identical(fabric_livy_audience(with_sql, "token"), with_sql)
+  expect_error(
+    fabric_livy_audience(
+      .fabric_audience$livy_delegated,
+      NULL,
+      list(auth_type = "client_credentials", password = "secret")
+    ),
+    "requires one .default audience",
+    fixed = TRUE
+  )
+  expect_error(
+    fabric_livy_audience(
+      "https://api.fabric.microsoft.com/Lakehouse.Execute.All",
+      NULL,
+      list(auth_type = "client_credentials", password = "secret")
+    ),
+    "requires one .default audience",
+    fixed = TRUE
+  )
+  expect_error(
+    fabric_livy_audience(c("scope", "scope"), "token"),
+    "without duplicates",
+    fixed = TRUE
+  )
+})
+
+test_that("Livy activity discovery requests and parses one service page", {
+  session_id <- "11111111-1111-4111-8111-111111111111"
+  batch_id <- "22222222-2222-4222-8222-222222222222"
+  calls <- list()
+  responses <- list(
+    list(
+      items = list(
+        list(
+          id = session_id,
+          name = "interactive",
+          state = "idle",
+          appId = "application-1",
+          submittedAt = "2026-08-30T10:00:00Z"
+        )
+      ),
+      totalCountOfMatchedItems = 4,
+      pageSize = 1
+    ),
+    list(
+      items = list(
+        list(
+          id = batch_id,
+          result = "success",
+          livyState = "success",
+          pluginState = "Running",
+          schedulerState = "Ended"
+        )
+      ),
+      totalCountOfMatchedItems = 1,
+      pageSize = 1
+    )
+  )
+  local_mocked_bindings(
+    fabric_livy_json = function(method, url, credential, query = NULL, ...) {
+      calls[[length(calls) + 1L]] <<- list(
+        method = method,
+        url = url,
+        query = query,
+        audience = credential$livy_audience
+      )
+      response <- responses[[1L]]
+      responses <<- responses[-1L]
+      response
+    }
+  )
+
+  sessions <- fabric_livy_sessions(
+    "https://example.test/livy/sessions",
+    top = 1,
+    skip = 2,
+    token = "token"
+  )
+  batches <- fabric_livy_batches(
+    "https://example.test/livy/sessions",
+    token = "token"
+  )
+
+  expect_s3_class(sessions, "tbl_df")
+  expect_identical(sessions$id, session_id)
+  expect_identical(sessions$state, "idle")
+  expect_identical(sessions$raw[[1L]]$appId, "application-1")
+  expect_identical(attr(sessions, "total_count"), 4L)
+  expect_identical(attr(sessions, "page_size"), 1L)
+  expect_identical(attr(sessions, "skip"), 2L)
+  expect_identical(batches$id, batch_id)
+  expect_identical(batches$state, "success")
+  expect_identical(batches$raw[[1L]]$schedulerState, "Ended")
+  expect_identical(calls[[1L]]$method, "GET")
+  expect_identical(calls[[1L]]$url, "https://example.test/livy/sessions")
+  expect_identical(
+    calls[[1L]]$query,
+    list(`$top` = 1L, `$skip` = 2L, `$count` = "true")
+  )
+  expect_identical(calls[[2L]]$url, "https://example.test/livy/batches")
+})
+
+test_that("Livy activity discovery rejects malformed pages", {
+  local_mocked_bindings(
+    fabric_livy_json = function(...) list(items = list(list(id = c("a", "b"))))
+  )
+  expect_error(
+    fabric_livy_sessions("https://example.test/livy", token = "token"),
+    class = "fabric_livy_protocol_error"
+  )
+
+  local_mocked_bindings(
+    fabric_livy_json = function(...) {
+      list(items = list(), totalCountOfMatchedItems = -1)
+    }
+  )
+  expect_error(
+    fabric_livy_batches("https://example.test/livy", token = "token"),
+    class = "fabric_livy_protocol_error"
+  )
+})
+
+test_that("Livy activity discovery rejects unsupported HC listing locally", {
+  local_mocked_bindings(
+    fabric_livy_recovery_context = function(...) {
+      rlang::abort("network setup must not run")
+    }
+  )
+
+  expect_error(
+    fabric_livy_sessions(
+      "https://example.test/livy",
+      high_concurrency = TRUE,
+      token = "token"
+    ),
+    "does not support listing high-concurrency Livy sessions",
+    fixed = TRUE,
+    class = "fabric_livy_unsupported_error"
+  )
+})
+
+test_that("Livy attach reconstructs authenticated handles without POST", {
+  session_id <- "AbCd1111-1111-4111-8111-111111111111"
+  batch_id <- "ABCD2222-2222-4222-8222-222222222222"
+  hc_id <- "aBcD3333-3333-4333-8333-333333333333"
+  underlying_id <- "44444444-4444-4444-8444-444444444444"
+  repl_id <- "55555555-5555-4555-8555-555555555555"
+  calls <- list()
+  local_mocked_bindings(
+    fabric_livy_json = function(method, url, credential, ...) {
+      calls[[length(calls) + 1L]] <<- list(method = method, url = url)
+      if (grepl("/repls/", url, fixed = TRUE)) {
+        return(list(total_statements = 0L, statements = list()))
+      }
+      id <- tolower(sub(".*/", "", url))
+      state <- if (grepl("batches", url, fixed = TRUE)) "running" else "idle"
+      if (grepl("highConcurrencySessions", url, fixed = TRUE)) {
+        return(list(
+          id = id,
+          state = state,
+          sessionId = underlying_id,
+          replId = repl_id
+        ))
+      }
+      list(id = id, state = state)
+    }
+  )
+
+  session <- fabric_livy_session_attach(
+    "https://example.test/livy/batches",
+    session_id,
+    token = "fresh-token",
+    verbose = FALSE
+  )
+  batch <- fabric_livy_batch_attach(
+    "https://example.test/livy/sessions",
+    batch_id,
+    token = "fresh-token",
+    verbose = FALSE
+  )
+  hc <- fabric_livy_session_attach(
+    "https://example.test/livy/sessions",
+    hc_id,
+    high_concurrency = TRUE,
+    token = "fresh-token",
+    verbose = FALSE
+  )
+
+  expect_s3_class(session, "FabricLivySession")
+  expect_identical(session$id, tolower(session_id))
+  expect_identical(session$status()$state, "idle")
+  expect_s3_class(batch, "FabricLivyBatch")
+  expect_identical(batch$id, tolower(batch_id))
+  expect_identical(batch$status()$state, "running")
+  expect_s3_class(hc, "FabricLivySession")
+  expect_identical(hc$id, tolower(hc_id))
+  expect_identical(hc$session_id, underlying_id)
+  expect_identical(hc$repl_id, repl_id)
+  expect_identical(hc$statements()$total_statements, 0L)
+  expect_true(all(vapply(calls, `[[`, character(1), "method") == "GET"))
+  expect_identical(
+    vapply(calls, `[[`, character(1), "url"),
+    c(
+      paste0("https://example.test/livy/sessions/", session_id),
+      paste0("https://example.test/livy/batches/", batch_id),
+      paste0("https://example.test/livy/highConcurrencySessions/", hc_id),
+      paste0("https://example.test/livy/sessions/", tolower(session_id)),
+      paste0("https://example.test/livy/batches/", tolower(batch_id)),
+      paste0(
+        "https://example.test/livy/highConcurrencySessions/",
+        underlying_id,
+        "/repls/",
+        repl_id,
+        "/statements"
+      )
+    )
+  )
+})
+
+test_that("Livy attach is the supported recovery path after serialization", {
+  batch_id <- "22222222-2222-4222-8222-222222222222"
+  credential <- fabric_credential(token = "old-token")
+  old <- FabricLivyBatch$new(
+    response = list(id = batch_id, state = "running"),
+    url = "https://example.test/livy/batches",
+    credential = credential,
+    verbose = FALSE
+  )
+  restored <- unserialize(serialize(old, NULL))
+  expect_error(restored$status(), class = "fabric_livy_credential_error")
+
+  local_mocked_bindings(
+    fabric_livy_json = function(...) list(id = batch_id, state = "success")
+  )
+  attached <- fabric_livy_batch_attach(
+    "https://example.test/livy",
+    batch_id,
+    token = "fresh-token",
+    verbose = FALSE
+  )
+  expect_identical(attached$status()$state, "success")
+  expect_error(
+    fabric_livy_batch_attach(
+      "https://example.test/livy",
+      "../sessions/other",
+      token = "fresh-token"
+    ),
+    "must be a GUID",
+    fixed = TRUE
+  )
+})
+
+test_that("custom Livy hosts require an explicit credential", {
+  session_error <- rlang::catch_cnd(fabric_livy_session(
+    "https://livy.example/livy",
+    verbose = FALSE
+  ))
+  batch_error <- rlang::catch_cnd(fabric_livy_batch_submit(
+    "https://livy.example/livy",
+    file = "abfss://container@example.dfs.core.windows.net/job.py",
+    verbose = FALSE
+  ))
+
+  expect_s3_class(session_error, "fabric_custom_endpoint_requires_token")
+  expect_identical(session_error$endpoint_host, "livy.example")
+  expect_identical(session_error$argument, "livy_url")
+  expect_s3_class(batch_error, "fabric_custom_endpoint_requires_token")
+  expect_identical(batch_error$endpoint_host, "livy.example")
+  expect_identical(batch_error$argument, "livy_url")
+})
+
+test_that("Livy requests use the audience stored on the credential", {
+  requested <- NULL
+  requested_url <- NULL
+  credential <- fabric_livy_credential(
+    tenant_id = NULL,
+    client_id = NULL,
+    token = "token"
+  )
+  local_mocked_bindings(
+    .httr2_perform = function(req, audience, ...) {
+      requested <<- audience
+      requested_url <<- req$url
+      httr2::response(
+        status_code = 200L,
+        url = req$url,
+        headers = list("content-type" = "application/json"),
+        body = charToRaw(paste0(
+          '{"value":9007199254740993,',
+          '"uint64":[18446744073709551615,18446744073709551614]}'
+        ))
+      )
+    }
+  )
+
+  response <- fabric_livy_json(
+    "GET",
+    "https://api.fabric.microsoft.com/livy/sessions/1",
+    credential,
+    query = list(`$top` = 10L, `$skip` = 2L, `$count` = "true")
+  )
+
+  expect_identical(requested, .fabric_audience$livy_delegated)
+  expect_identical(
+    httr2::url_parse(requested_url)$query,
+    list(`$top` = "10", `$skip` = "2", `$count` = "true")
+  )
+  expect_identical(response$value, "9007199254740993")
+  expect_identical(
+    unlist(response$uint64, use.names = FALSE),
+    c("18446744073709551615", "18446744073709551614")
+  )
+})
+
+test_that("regular session runs multiple statements and closes", {
+  # Uses a short wall-clock deadline; retain deterministic polling tests on CRAN.
+  skip_on_cran()
+  calls <- list()
+  session_gets <- 0L
+  statement_gets <- new.env(parent = emptyenv())
+
+  local_mocked_bindings(
+    fabric_livy_json = function(
+      method,
+      url,
+      credential,
+      payload = NULL,
+      idempotent = NULL,
+      deadline = NULL
+    ) {
+      calls[[length(calls) + 1L]] <<- list(
+        method = method,
+        url = url,
+        payload = payload,
+        idempotent = idempotent
+      )
+      if (method == "POST" && grepl("/sessions$", url)) {
+        return(list(id = "session-1", state = "starting"))
+      }
+      if (method == "GET" && grepl("/sessions/session-1$", url)) {
+        session_gets <<- session_gets + 1L
+        return(list(
+          id = "session-1",
+          state = if (session_gets == 1L) {
+            "starting"
+          } else if (session_gets == 3L) {
+            "busy"
+          } else {
+            "idle"
+          }
+        ))
+      }
+      if (method == "POST" && grepl("/statements$", url)) {
+        id <- if (grepl("first", payload$code)) 1L else 2L
+        return(list(id = id, state = "waiting", code = payload$code))
+      }
+      if (method == "GET" && grepl("/statements/[12]$", url)) {
+        id <- sub(".*/", "", url)
+        count <- statement_gets[[id]] %||% 0L
+        statement_gets[[id]] <- count + 1L
+        if (count == 0L) {
+          return(list(id = as.integer(id), state = "running"))
+        }
+        return(list(
+          id = as.integer(id),
+          state = "available",
+          output = list(
+            status = "ok",
+            execution_count = as.integer(id),
+            data = list("text/plain" = paste("result", id))
+          )
+        ))
+      }
+      rlang::abort(paste("Unexpected mocked call:", method, url))
+    },
+    fabric_livy_ok = function(
+      method,
+      url,
+      credential,
+      payload = NULL,
+      idempotent = NULL,
+      accepted_status = integer(),
+      deadline = NULL
+    ) {
+      calls[[length(calls) + 1L]] <<- list(
+        method = method,
+        url = url,
+        idempotent = idempotent
+      )
+      TRUE
+    }
+  )
+
+  session <- fabric_livy_session(
+    "https://api.fabric.microsoft.com/livy/batches",
+    token = "token",
+    conf = list("spark.sql.shuffle.partitions" = "2"),
+    environment_id = "11111111-1111-4111-8111-111111111111",
+    tags = list(owner = "unit-test"),
+    verbose = FALSE
+  )
+  expect_s3_class(session, "FabricLivySession")
+  expect_equal(
+    session$url,
+    paste0(
+      "https://api.fabric.microsoft.com/livy/sessions/",
+      "session-1"
+    )
+  )
+  expect_false(calls[[1L]]$idempotent)
+  expect_equal(
+    calls[[1L]]$payload$conf[["spark.sql.shuffle.partitions"]],
+    "2"
+  )
+  expect_match(
+    calls[[1L]]$payload$conf[["spark.fabric.environmentDetails"]],
+    "11111111-1111-4111-8111-111111111111",
+    fixed = TRUE
+  )
+  expect_equal(calls[[1L]]$payload$tags$owner, "unit-test")
+
+  session$wait(timeout = 1, poll_interval = 0)
+  statement <- session$submit(
+    "print('first')",
+    kind = "pyspark"
+  )
+  session$status()
+  expect_identical(session$state, "busy")
+  statement$wait(timeout = 1, poll_interval = 0)
+  first <- statement$result()
+  second <- session$run(
+    "print('second')",
+    kind = "pyspark",
+    timeout = 1,
+    poll_interval = 0
+  )
+
+  expect_s3_class(first, "fabric_livy_statement_result")
+  expect_equal(first$id, 1L)
+  expect_equal(first$output$parsed, "result 1")
+  expect_equal(second$id, 2L)
+  expect_equal(second$output$execution_count, 2L)
+  expect_true(is.finite(first$duration_sec))
+  expect_gte(first$duration_sec, 0)
+
+  expect_true(session$close())
+  expect_false(session$close())
+  expect_true(session$closed)
+  expect_error(session$status(), "closed")
+  delete_calls <- Filter(
+    function(call) identical(call$method, "DELETE"),
+    calls
+  )
+  expect_length(delete_calls, 1L)
+  expect_true(delete_calls[[1L]]$idempotent)
+})
+
+test_that("submit returns an inspectable and cancellable statement", {
+  calls <- list()
+  local_mocked_bindings(
+    fabric_livy_json = function(
+      method,
+      url,
+      credential,
+      payload = NULL,
+      idempotent = NULL,
+      deadline = NULL
+    ) {
+      calls[[length(calls) + 1L]] <<- list(
+        method = method,
+        url = url,
+        payload = payload
+      )
+      if (method == "POST" && grepl("/sessions$", url)) {
+        return(list(id = "s", state = "idle"))
+      }
+      if (method == "POST" && grepl("/statements$", url)) {
+        return(list(id = 9L, state = "waiting"))
+      }
+      if (method == "POST" && grepl("/cancel$", url)) {
+        return(list(msg = "canceled"))
+      }
+      if (method == "GET" && grepl("/statements", url, fixed = TRUE)) {
+        return(list(
+          total_statements = 1L,
+          statements = list(list(id = 9L, state = "waiting"))
+        ))
+      }
+      rlang::abort("Unexpected mocked call")
+    },
+    fabric_livy_ok = function(...) TRUE
+  )
+
+  session <- fabric_livy_session(
+    "https://example.test/livy/sessions",
+    token = "token",
+    verbose = FALSE
+  )
+  statement <- session$submit(
+    "1 + 1",
+    kind = "spark",
+    source_id = "request-42"
+  )
+  expect_s3_class(statement, "FabricLivyStatement")
+  expect_equal(
+    calls[[2L]]$payload,
+    list(code = "1 + 1", kind = "spark", sourceId = "request-42")
+  )
+  expect_equal(statement$cancel()$msg, "canceled")
+  expect_match(calls[[3L]]$url, "/statements/9/cancel$")
+  expect_length(session$statements()$statements, 1L)
+  session$close()
+})
+
+test_that("session statement listing follows the Livy collection contract", {
+  urls <- character()
+  local_mocked_bindings(
+    fabric_livy_json = function(method, url, ...) {
+      if (method == "POST") {
+        return(list(id = "session", state = "idle"))
+      }
+      urls <<- c(urls, url)
+      list(
+        total_statements = 3L,
+        statements = lapply(1:3, function(id) {
+          list(id = id, state = "available")
+        })
+      )
+    },
+    fabric_livy_ok = function(...) TRUE
+  )
+  session <- fabric_livy_session(
+    "https://example.test/livy/sessions",
+    token = "token",
+    verbose = FALSE
+  )
+
+  result <- session$statements()
+
+  expect_identical(result$total_statements, 3L)
+  expect_equal(vapply(result$statements, `[[`, integer(1), "id"), 1:3)
+  expect_length(urls, 1L)
+  expect_match(urls, "/statements$")
+  session$close()
+})
+
+test_that("statement cancellation supplies the JSON object required by HC", {
+  payloads <- list()
+  local_mocked_bindings(
+    fabric_livy_json = function(method, url, credential, payload = NULL, ...) {
+      if (endsWith(url, "/cancel")) {
+        payloads[[length(payloads) + 1L]] <<- payload
+      }
+      list(
+        id = if (endsWith(url, "/sessions")) "session" else 1L,
+        state = "idle"
+      )
+    },
+    fabric_livy_ok = function(...) TRUE
+  )
+  session <- fabric_livy_session(
+    "https://example.test/livy/sessions",
+    token = "test-token",
+    verbose = FALSE
+  )
+  withr::defer(session$close())
+  statement <- session$submit("print('test')", kind = "pyspark")
+  statement$cancel()
+  expect_length(payloads, 1L)
+  expect_identical(
+    as.character(jsonlite::toJSON(payloads[[1L]], auto_unbox = TRUE)),
+    "{}"
+  )
+})
+
+test_that("statement output byte ranges apply only to individual lookups", {
+  calls <- list()
+  local_mocked_bindings(
+    fabric_livy_json = function(method, url, query = NULL, ...) {
+      calls[[length(calls) + 1L]] <<- list(
+        method = method,
+        url = url,
+        query = query
+      )
+      if (method == "POST" && grepl("/sessions$", url)) {
+        return(list(id = "session", state = "idle"))
+      }
+      if (method == "POST" && grepl("/statements$", url)) {
+        return(list(id = 4L, state = "waiting"))
+      }
+      list(id = 4L, state = "available", output = list(status = "ok"))
+    },
+    fabric_livy_ok = function(...) TRUE
+  )
+  session <- fabric_livy_session(
+    "https://example.test/livy/sessions",
+    token = "token",
+    verbose = FALSE
+  )
+  statement <- session$submit("print('large output')", kind = "pyspark")
+
+  result <- statement$status(from = 16L, size = 32L)
+
+  expect_identical(result$state, "available")
+  expect_match(calls[[3L]]$url, "/statements/4$")
+  expect_identical(calls[[3L]]$query, list(from = 16L, size = 32L))
+  expect_error(statement$status(from = -1), "from must")
+  expect_error(statement$status(size = 0), "size must")
+  expect_error(
+    statement$status(refresh = FALSE, from = 0),
+    "require refresh = TRUE",
+    fixed = TRUE
+  )
+  session$close()
+})
+
+test_that("session statement listing rejects inconsistent collections", {
+  local_mocked_bindings(
+    fabric_livy_json = local({
+      responses <- list(
+        list(id = "session", state = "idle"),
+        list(
+          total_statements = 0L,
+          statements = list(list(id = 1L, state = "available"))
+        )
+      )
+      function(...) {
+        response <- responses[[1L]]
+        responses <<- responses[-1L]
+        response
+      }
+    }),
+    fabric_livy_ok = function(...) TRUE
+  )
+  session <- fabric_livy_session(
+    "https://example.test/livy/sessions",
+    token = "token",
+    verbose = FALSE
+  )
+
+  expect_error(
+    session$statements(),
+    class = "fabric_livy_protocol_error"
+  )
+  session$close()
+})
+
+test_that("statement errors preserve output and traceback", {
+  # Uses a short wall-clock deadline; retain deterministic polling tests on CRAN.
+  skip_on_cran()
+  responses <- list(
+    list(id = "s", state = "idle"),
+    list(id = 1L, state = "waiting"),
+    list(
+      id = 1L,
+      state = "available",
+      output = list(
+        status = "error",
+        ename = "AnalysisException",
+        evalue = "table was not found",
+        traceback = c("line one", "line two")
+      )
+    )
+  )
+  local_mocked_bindings(
+    fabric_livy_json = function(...) {
+      response <- responses[[1L]]
+      responses <<- responses[-1L]
+      response
+    },
+    fabric_livy_ok = function(...) TRUE
+  )
+
+  session <- fabric_livy_session(
+    "https://example.test/livy/sessions",
+    token = "token",
+    verbose = FALSE
+  )
+  statement <- session$submit("spark.table('missing')", "pyspark")
+  error <- expect_error(
+    statement$wait(timeout = 1, poll_interval = 0),
+    class = "fabric_livy_statement_error"
+  )
+  expect_match(conditionMessage(error), "table was not found", fixed = TRUE)
+  expect_equal(error$output$ename, "AnalysisException")
+  expect_equal(error$traceback, c("line one", "line two"))
+
+  result <- statement$result(refresh = FALSE, error_on_failure = FALSE)
+  expect_equal(result$output$status, "error")
+  expect_equal(result$output$evalue, "table was not found")
+  expect_equal(result$output$traceback, c("line one", "line two"))
+  session$close()
+})
+
+test_that("Livy errors use documented service message fields", {
+  statement_error <- tryCatch(
+    fabric_livy_abort_statement(list(
+      state = "available",
+      output = list(
+        status = "error",
+        ename = "AnalysisException",
+        traceback = c("trace line one", "trace line two")
+      )
+    )),
+    error = identity
+  )
+  expect_s3_class(statement_error, "fabric_livy_statement_error")
+  expect_match(
+    conditionMessage(statement_error),
+    "AnalysisException",
+    fixed = TRUE
+  )
+  expect_match(
+    conditionMessage(statement_error),
+    "trace line two",
+    fixed = TRUE
+  )
+
+  responses <- list(
+    list(
+      state = "error",
+      message = "session lifecycle failed",
+      errorInfo = list(list(code = "SessionCode", message = "session detail"))
+    ),
+    list(
+      state = "dead",
+      message = "batch lifecycle failed",
+      errorInfo = list(list(code = "BatchCode", message = "batch detail"))
+    )
+  )
+  aborters <- list(fabric_livy_abort_session, fabric_livy_abort_batch)
+  classes <- c("fabric_livy_session_error", "fabric_livy_batch_error")
+  for (index in seq_along(aborters)) {
+    error <- tryCatch(aborters[[index]](responses[[index]]), error = identity)
+    expect_s3_class(error, classes[[index]])
+    expect_match(conditionMessage(error), "lifecycle failed", fixed = TRUE)
+    expect_match(conditionMessage(error), "detail", fixed = TRUE)
+    expect_false(grepl("Code", conditionMessage(error), fixed = TRUE))
+  }
+})
+
+test_that("statement JSON output is parsed independently of lifecycle", {
+  result <- fabric_livy_output(
+    response = list(
+      id = 4L,
+      state = "available",
+      output = list(
+        status = "ok",
+        data = list(
+          "application/json" = list(
+            list(id = 1L, value = "alpha"),
+            list(id = 2L, value = "beta")
+          )
+        )
+      )
+    ),
+    started_local = as.POSIXct("2026-01-01", tz = "UTC"),
+    completed_local = as.POSIXct("2026-01-01 00:00:02", tz = "UTC"),
+    url = "https://example.test/statements/4"
+  )
+  expect_s3_class(result$output$parsed, "tbl_df")
+  expect_equal(result$output$parsed$id, c(1L, 2L))
+  expect_equal(result$output$parsed$value, c("alpha", "beta"))
+  expect_equal(result$duration_sec, 2)
+})
+
+test_that("generic statement JSON preserves null values", {
+  result <- fabric_livy_output(
+    response = list(
+      id = 4L,
+      state = "available",
+      output = list(
+        status = "ok",
+        data = list(
+          "application/json" = list(
+            present = "value",
+            missing = NULL,
+            nested = list(missing = NULL),
+            values = list(1L, NULL, 3L)
+          )
+        )
+      )
+    ),
+    started_local = as.POSIXct("2026-01-01", tz = "UTC"),
+    completed_local = as.POSIXct("2026-01-01 00:00:01", tz = "UTC"),
+    url = "https://example.test/statements/4"
+  )
+
+  expect_identical(result$output$parsed$present, "value")
+  expect_null(result$output$parsed$missing)
+  expect_null(result$output$parsed$nested$missing)
+  expect_identical(result$output$parsed$values, c(1L, NA_integer_, 3L))
+})
+
+test_that("Livy fallback columns simplify only uniform scalar types", {
+  simplifiable <- list(
+    character = list(
+      values = list("one", NULL, "two"),
+      expected = c("one", NA_character_, "two")
+    ),
+    integer = list(
+      values = list(1L, NULL, 2L),
+      expected = c(1L, NA_integer_, 2L)
+    ),
+    double = list(
+      values = list(1, NULL, 2.5),
+      expected = c(1, NA_real_, 2.5)
+    ),
+    logical = list(
+      values = list(TRUE, NULL, FALSE),
+      expected = c(TRUE, NA, FALSE)
+    ),
+    complex = list(
+      values = list(1 + 2i, NULL, 3 + 4i),
+      expected = c(1 + 2i, NA_complex_, 3 + 4i)
+    )
+  )
+  for (case in simplifiable) {
+    expect_identical(
+      fabric_livy_simplify_column(case$values),
+      case$expected
+    )
+  }
+
+  fallback <- list(
+    mixed = list(1L, "two"),
+    numeric_mixture = list(1L, 2),
+    raw = list(as.raw(1L), NULL),
+    nested = list(list(value = 1L), NULL),
+    non_scalar = list(c(1L, 2L), 3L),
+    all_null = list(NULL, NULL)
+  )
+  for (case in fallback) {
+    expect_identical(fabric_livy_simplify_column(case), case)
+  }
+})
+
+test_that("the Livy request adapter preserves its HTTP contract", {
+  captured <- NULL
+  credential <- list(livy_audience = "https://custom.fabric.example/.default")
+  deadline <- as.POSIXct("2026-08-24 12:00:00", tz = "UTC")
+  local_mocked_bindings(
+    .httr2_perform = function(
+      req,
+      credential,
+      audience,
+      idempotent,
+      accepted_status,
+      deadline
+    ) {
+      captured <<- list(
+        req = req,
+        credential = credential,
+        audience = audience,
+        idempotent = idempotent,
+        accepted_status = accepted_status,
+        deadline = deadline
+      )
+      invisible(list(status = "ok"))
+    }
+  )
+
+  value <- fabric_livy_ok(
+    method = "DELETE",
+    url = "https://api.fabric.microsoft.com/v1/workspaces/w/livy/sessions/7",
+    credential = credential,
+    payload = list(args = character(), code = "stop()"),
+    idempotent = TRUE,
+    accepted_status = c(200L, 404L),
+    deadline = deadline
+  )
+
+  expect_true(value)
+  expect_identical(captured$req$method, "DELETE")
+  expect_identical(captured$req$body$data$code, "stop()")
+  expect_s3_class(captured$req$body$data$args, "AsIs")
+  expect_identical(captured$credential, credential)
+  expect_identical(
+    captured$audience,
+    "https://custom.fabric.example/.default"
+  )
+  expect_true(captured$idempotent)
+  expect_identical(captured$accepted_status, c(200L, 404L))
+  expect_identical(captured$deadline, deadline)
+})
+
+test_that("bodyless Livy mutations carry an explicit zero-length body", {
+  requests <- list()
+  httr2::local_mocked_responses(function(req) {
+    requests[[length(requests) + 1L]] <<- req
+    body <- if (length(requests) == 1L) {
+      charToRaw('{"state":"idle"}')
+    } else {
+      raw()
+    }
+    httr2::response(
+      status_code = 200L,
+      url = req$url,
+      headers = list("content-type" = "application/json"),
+      body = body
+    )
+  })
+  credential <- fabric_credential(token = "token")
+
+  response <- fabric_livy_json(
+    "POST",
+    "https://example.test/livy/sessions/1/statements/2/cancel",
+    credential
+  )
+  ok <- fabric_livy_ok(
+    "POST",
+    "https://example.test/livy/batches/1/cancel",
+    credential
+  )
+
+  expect_identical(response$state, "idle")
+  expect_true(ok)
+  expect_length(requests, 2L)
+  for (request in requests) {
+    expect_identical(request$body$type, "raw")
+    expect_length(request$body$data, 0L)
+  }
+})
+
+test_that("Livy wraps malformed successful response bodies", {
+  url <- "https://example.test/livy/sessions/1"
+  responses <- list(
+    httr2::response(
+      status_code = 200L,
+      url = url,
+      headers = list("content-type" = "application/json"),
+      body = raw()
+    ),
+    httr2::response(
+      status_code = 200L,
+      url = url,
+      headers = list("content-type" = "text/plain"),
+      body = charToRaw("not json")
+    ),
+    httr2::response(
+      status_code = 200L,
+      url = url,
+      headers = list("content-type" = "application/json"),
+      body = charToRaw("{")
+    ),
+    httr2::response(
+      status_code = 400L,
+      url = url,
+      headers = list("content-type" = "application/json"),
+      body = charToRaw('{"error":{"code":"InvalidRequest"}}')
+    )
+  )
+  httr2::local_mocked_responses(responses)
+  credential <- fabric_credential(token = "token")
+
+  for (index in seq_len(3L)) {
+    error <- tryCatch(
+      fabric_livy_json("GET", url, credential),
+      error = identity
+    )
+    expect_s3_class(error, "fabric_livy_protocol_error")
+    expect_s3_class(error$parent, "fabric_livy_decode_error")
+    expect_identical(error$response_metadata$status, 200L)
+    expect_null(error$response_metadata$body)
+  }
+  http_error <- tryCatch(
+    fabric_livy_json("GET", url, credential),
+    error = identity
+  )
+  expect_s3_class(http_error, "fabric_http_error")
+  expect_false(inherits(http_error, "fabric_livy_protocol_error"))
+})
+
+test_that("Livy table MIME output is parsed into a tibble", {
+  result <- fabric_livy_output(
+    response = list(
+      id = 5L,
+      state = "available",
+      output = list(
+        status = "ok",
+        data = list(
+          "application/vnd.livy.table.v1+json" = list(
+            headers = list(
+              list(name = "id", type = "BIGINT_TYPE"),
+              list(name = "label", type = "STRING_TYPE")
+            ),
+            data = list(
+              list("9007199254740993", "alpha"),
+              list("-9007199254740993", "beta")
+            )
+          ),
+          "text/plain" = "fallback rendering"
+        )
+      )
+    ),
+    started_local = as.POSIXct("2026-01-01", tz = "UTC"),
+    completed_local = as.POSIXct("2026-01-01 00:00:01", tz = "UTC"),
+    url = "https://example.test/statements/5"
+  )
+
+  expect_s3_class(result$output$parsed, "tbl_df")
+  expect_equal(
+    result$output$parsed$id,
+    c("9007199254740993", "-9007199254740993")
+  )
+  expect_equal(result$output$parsed$label, c("alpha", "beta"))
+})
+
+test_that("Livy raw JSON boundaries preserve Spark BIGINT values", {
+  raw_table <- paste0(
+    '{"headers":[{"name":"id","type":"BIGINT_TYPE"}],',
+    '"data":[[9007199254740993],[-9007199254740993]]}'
+  )
+  parsed_table <- fabric_livy_parse_table(raw_table)
+  expect_identical(
+    parsed_table$id,
+    c("9007199254740993", "-9007199254740993")
+  )
+
+  raw_sql <- paste0(
+    '{"schema":{"type":"struct","fields":[',
+    '{"name":"id","type":"long","nullable":false}]},',
+    '"data":[[9007199254740993]]}'
+  )
+  parsed_sql <- fabric_livy_parse_sql_json(raw_sql)
+  expect_identical(parsed_sql$id, "9007199254740993")
+
+  raw_decimal <- paste0(
+    '{"schema":{"type":"struct","fields":[',
+    '{"name":"amount","type":"decimal(38,15)","nullable":true}]},',
+    '"data":[[12345678901234567890.123456789012345],[null]]}'
+  )
+  parsed_decimal <- fabric_livy_parse_sql_json(raw_decimal)
+  expect_identical(
+    parsed_decimal$amount,
+    c("12345678901234567890.123456789012345", NA_character_)
+  )
+
+  raw_integer <- paste0(
+    '{"schema":{"type":"struct","fields":[',
+    '{"name":"value","type":"integer","nullable":true}]},',
+    '"data":[[-2147483648],[2147483647],[null]]}'
+  )
+  parsed_integer <- fabric_livy_parse_sql_json(raw_integer)
+  expect_identical(
+    parsed_integer$value,
+    c(-2147483648, 2147483647, NA_real_)
+  )
+  for (value in c("-2147483649", "2147483648", "1.5")) {
+    expect_error(
+      fabric_livy_convert_column(list(value), "integer"),
+      class = "fabric_livy_protocol_error"
+    )
+  }
+})
+
+test_that("Livy JSON numbers preserve exact BIGINT and DOUBLE values", {
+  parsed <- fabric_livy_parse_table(paste0(
+    '{"headers":[{"name":"id","type":"long"},',
+    '{"name":"ratio","type":"double"}],',
+    '"data":[[1000000000000001,1.2345678901234567],',
+    '[-1000000000000001,-1.2345678901234567],[null,null]]}'
+  ))
+  expect_identical(
+    parsed$id,
+    c("1000000000000001", "-1000000000000001", NA_character_)
+  )
+  expect_identical(
+    parsed$ratio,
+    c(1.2345678901234567, -1.2345678901234567, NA_real_)
+  )
+})
+
+test_that("Livy HTTP decoding preserves numeric DECIMAL tokens", {
+  body <- paste0(
+    '{"id":1,"state":"available","output":{"status":"ok","data":{',
+    '"application/json":{"schema":{"type":"struct","fields":[',
+    '{"name":"amount","type":"decimal(38,15)","nullable":false},',
+    '{"name":"ratio","type":"double","nullable":false}]},',
+    '"data":[[12345678901234567890.123456789012345,1.25]]}}}}'
+  )
+  local_mocked_bindings(
+    .httr2_perform = function(req, ...) {
+      httr2::response(
+        status_code = 200L,
+        url = req$url,
+        headers = list("content-type" = "application/json"),
+        body = charToRaw(body)
+      )
+    }
+  )
+
+  response <- fabric_livy_json(
+    "GET",
+    "https://api.fabric.test/v1/workspaces/w/livyApi/versions/2023-12-01/sessions/1/statements/2",
+    fabric_credential(token = "test-token")
+  )
+  parsed <- fabric_livy_parse_output_data(response$output$data)
+
+  expect_identical(
+    parsed$amount,
+    "12345678901234567890.123456789012345"
+  )
+  expect_identical(parsed$ratio, 1.25)
+})
+
+test_that("Livy table conversion follows the declared Spark schema", {
+  parsed <- fabric_livy_parse_table(list(
+    headers = list(
+      list(name = "all_null_date", type = "DATE_TYPE"),
+      list(name = "long", type = "BIGINT_TYPE"),
+      list(name = "amount", type = "decimal(38,15)"),
+      list(name = "at", type = "timestamp"),
+      list(name = "local_at", type = "timestamp_ntz"),
+      list(name = "measurement", type = "double"),
+      list(name = "bytes", type = "binary"),
+      list(name = "nested", type = list(type = "array", elementType = "long"))
+    ),
+    data = list(
+      list(
+        NULL,
+        "9007199254740993",
+        "12345678901234567890.123456789012345",
+        "2026-08-10T12:30:01.125Z",
+        "2026-08-10T12:30:01.125",
+        "NaN",
+        jsonlite::base64_enc(charToRaw("abc")),
+        list("9007199254740993", NULL)
+      ),
+      list(NULL, "-1", "-0.0100", NULL, NULL, "Infinity", NULL, NULL)
+    )
+  ))
+
+  expect_s3_class(parsed$all_null_date, "Date")
+  expect_true(all(is.na(parsed$all_null_date)))
+  expect_identical(parsed$long, c("9007199254740993", "-1"))
+  expect_identical(
+    parsed$amount,
+    c("12345678901234567890.123456789012345", "-0.0100")
+  )
+  expect_s3_class(parsed$at, "POSIXct")
+  expect_equal(
+    format(parsed$at[[1L]], "%Y-%m-%d %H:%M:%OS3", tz = "UTC"),
+    "2026-08-10 12:30:01.125"
+  )
+  expect_identical(
+    parsed$local_at,
+    c("2026-08-10 12:30:01.125", NA_character_)
+  )
+  expect_true(is.nan(parsed$measurement[[1L]]))
+  expect_identical(parsed$measurement[[2L]], Inf)
+  expect_identical(rawToChar(parsed$bytes[[1L]]), "abc")
+  expect_null(parsed$bytes[[2L]])
+  expect_identical(parsed$nested[[1L]][[1L]], "9007199254740993")
+  expect_identical(attr(parsed, "spark_schema")[[2L]]$type, "BIGINT_TYPE")
+
+  empty <- fabric_livy_parse_table(list(
+    headers = list(
+      list(name = "id", type = "long"),
+      list(name = "day", type = "date")
+    ),
+    data = list()
+  ))
+  expect_identical(empty$id, character())
+  expect_s3_class(empty$day, "Date")
+  expect_length(empty$day, 0L)
+  expect_length(attr(empty, "spark_schema"), 2L)
+})
+
+test_that("Livy zoned timestamps accept RFC 3339 offsets cross-platform", {
+  parsed <- fabric_livy_convert_column(
+    list(
+      "2026-08-10T12:30:01.125+02:00",
+      "2026-08-10T12:30:01.125+0200",
+      "2026-08-10T12:30:01.125-05:30",
+      "2026-08-10T12:30:01.125Z"
+    ),
+    "timestamp"
+  )
+
+  expect_s3_class(parsed, "POSIXct")
+  expect_equal(
+    unname(format(parsed, "%Y-%m-%d %H:%M:%OS3", tz = "UTC")),
+    c(
+      "2026-08-10 10:30:01.125",
+      "2026-08-10 10:30:01.125",
+      "2026-08-10 18:00:01.125",
+      "2026-08-10 12:30:01.125"
+    )
+  )
+})
+
+test_that("Fabric SQL nulls remain distinguishable from textual NaN", {
+  parsed <- fabric_livy_parse_sql_json(list(
+    schema = list(
+      type = "struct",
+      fields = list(
+        list(name = "nan_value", type = "double", nullable = TRUE),
+        list(name = "local_at", type = "timestamp_ntz", nullable = TRUE)
+      )
+    ),
+    data = list(list(NULL, "2026-08-10T12:30:01.125"))
+  ))
+
+  expect_identical(parsed$nan_value, NA_real_)
+  expect_identical(parsed$local_at, "2026-08-10 12:30:01.125")
+})
+
+test_that("Spark SQL JSON output is parsed into a tibble", {
+  result <- fabric_livy_output(
+    response = list(
+      id = 6L,
+      state = "available",
+      output = list(
+        status = "ok",
+        data = list(
+          "application/json" = list(
+            schema = list(
+              type = "struct",
+              fields = list(
+                list(
+                  name = "fabricqueryr_sql_value",
+                  type = "integer",
+                  nullable = FALSE
+                )
+              )
+            ),
+            data = list(list(42L))
+          )
+        )
+      )
+    ),
+    started_local = as.POSIXct("2026-01-01", tz = "UTC"),
+    completed_local = as.POSIXct("2026-01-01 00:00:01", tz = "UTC"),
+    url = "https://example.test/statements/6"
+  )
+
+  expect_s3_class(result$output$parsed, "tbl_df")
+  expect_identical(result$output$parsed$fabricqueryr_sql_value, 42L)
+})
+
+test_that("Livy preserves duplicate SQL aliases and joined columns by position", {
+  for (names in list(
+    c("id", "id"),
+    c("id", "label", "id", "label"),
+    c("id", "id", "id...1")
+  )) {
+    headers <- lapply(names, function(name) list(name = name, type = "integer"))
+    values <- as.list(seq_along(names))
+    table <- fabric_livy_parse_table(list(
+      headers = headers,
+      data = list(values)
+    ))
+    expect_identical(names(table), make.unique(names, sep = "..."))
+    expect_identical(lapply(seq_along(table), function(i) table[[i]]), values)
+    expect_identical(attr(table, "spark_schema"), headers)
+    sql <- fabric_livy_parse_sql_json(list(
+      schema = list(type = "struct", fields = headers),
+      data = list(values)
+    ))
+    expect_identical(sql, table)
+  }
+})
+
+test_that("Livy preserves row counts for tables without columns", {
+  for (n in c(0L, 1L, 3L)) {
+    rows <- rep(list(list()), n)
+    table <- fabric_livy_parse_table(list(headers = list(), data = rows))
+    expect_s3_class(table, "tbl_df")
+    expect_identical(dim(table), c(n, 0L))
+    expect_identical(attr(table, "spark_schema"), list())
+    sql <- fabric_livy_parse_sql_json(list(
+      schema = list(type = "struct", fields = list()),
+      data = rows
+    ))
+    expect_identical(sql, table)
+    for (mime in c("application/json", "application/vnd.livy.table.v1+json")) {
+      payload <- if (identical(mime, "application/json")) {
+        list(schema = list(type = "struct", fields = list()), data = rows)
+      } else {
+        list(headers = list(), data = rows)
+      }
+      parsed <- fabric_livy_parse_output_data(stats::setNames(
+        list(payload),
+        mime
+      ))
+      expect_identical(parsed, table)
+    }
+  }
+})
+
+test_that("Livy table MIME output rejects malformed rows", {
+  expect_error(
+    fabric_livy_parse_table(list(
+      headers = list(list(name = "id"), list(name = "label")),
+      data = list(list(1L))
+    )),
+    "row width",
+    class = "fabric_livy_protocol_error"
+  )
+})
+
+test_that("Livy output parsing rejects malformed JSON shapes and base64", {
+  now <- as.POSIXct("2026-01-01", tz = "UTC")
+  expect_error(
+    fabric_livy_output("not-an-object", now, now, "https://example.test"),
+    class = "fabric_livy_protocol_error"
+  )
+  expect_error(
+    fabric_livy_output(
+      list(id = 1L, state = "available", output = "not-an-object"),
+      now,
+      now,
+      "https://example.test"
+    ),
+    class = "fabric_livy_protocol_error"
+  )
+  for (value in list("%%%", "abc", c("YQ==", "Yg=="), NA_character_)) {
+    expect_error(
+      fabric_livy_convert_column(list(value), "binary"),
+      class = "fabric_livy_protocol_error"
+    )
+  }
+  expect_identical(
+    rawToChar(fabric_livy_convert_column(list("YQ=="), "binary")[[1L]]),
+    "a"
+  )
+})
+
+test_that("session finalizer does not perform network cleanup", {
+  deleted <- character()
+  local_mocked_bindings(
+    fabric_livy_json = function(...) list(id = "finalize-me", state = "idle"),
+    fabric_livy_ok = function(method, url, ...) {
+      if (method == "DELETE") {
+        deleted <<- c(deleted, url)
+      }
+      TRUE
+    }
+  )
+  session <- fabric_livy_session(
+    "https://example.test/livy/sessions",
+    token = "token",
+    verbose = FALSE
+  )
+  rm(session)
+  gc()
+  expect_length(deleted, 0L)
+})
+
+test_that("high-concurrency sessions use HC and REPL endpoints", {
+  # Uses a short wall-clock deadline; retain deterministic polling tests on CRAN.
+  skip_on_cran()
+  calls <- list()
+  local_mocked_bindings(
+    fabric_livy_json = function(
+      method,
+      url,
+      credential,
+      payload = NULL,
+      idempotent = NULL,
+      deadline = NULL
+    ) {
+      calls[[length(calls) + 1L]] <<- list(
+        method = method,
+        url = url,
+        payload = payload,
+        idempotent = idempotent
+      )
+      if (method == "POST" && grepl("highConcurrencySessions$", url)) {
+        return(list(id = "hc-id", state = "NotStarted"))
+      }
+      if (method == "GET" && grepl("highConcurrencySessions/hc-id$", url)) {
+        return(list(
+          id = "hc-id",
+          state = "Idle",
+          sessionId = "shared-session",
+          replId = "isolated-repl"
+        ))
+      }
+      if (method == "POST" && grepl("/statements$", url)) {
+        return(list(id = 3L, state = "waiting"))
+      }
+      rlang::abort(paste("Unexpected mocked call:", method, url))
+    },
+    fabric_livy_ok = function(...) TRUE
+  )
+
+  session <- fabric_livy_session(
+    "https://example.test/livy/sessions",
+    high_concurrency = TRUE,
+    session_tag = "packed-work",
+    artifact_name = "TestLakehouse",
+    tags = list(run = "42"),
+    token = "token",
+    verbose = FALSE
+  )
+  expect_equal(calls[[1L]]$payload$sessionTag, "packed-work")
+  expect_equal(calls[[1L]]$payload$artifactName, "TestLakehouse")
+  expect_false(calls[[1L]]$idempotent)
+
+  session$wait(timeout = 1, poll_interval = 0)
+  statement <- session$submit("print(1)", "pyspark")
+  expect_s3_class(statement, "FabricLivyStatement")
+  expect_match(
+    calls[[3L]]$url,
+    paste0(
+      "/highConcurrencySessions/shared-session/",
+      "repls/isolated-repl/statements$"
+    )
+  )
+  expect_error(session$reset_timeout(), "not supported")
+  session$close()
+})
+
+test_that("session reset timeout sends an explicit JSON payload", {
+  reset_url <- NULL
+  reset_payload <- NULL
+  local_mocked_bindings(
+    fabric_livy_json = function(...) list(id = "s", state = "idle"),
+    fabric_livy_ok = function(method, url, payload = NULL, ...) {
+      if (method == "POST") {
+        reset_url <<- url
+        reset_payload <<- payload
+      }
+      TRUE
+    }
+  )
+  session <- fabric_livy_session(
+    "https://example.test/livy/sessions",
+    token = "token",
+    verbose = FALSE
+  )
+  expect_identical(session$reset_timeout(), session)
+  expect_equal(reset_url, paste0(session$url, "/reset-timeout"))
+  expect_identical(reset_payload, structure(list(), names = character()))
+  session$close()
+})
+
+test_that("closing an auto-terminated Livy session accepts 404", {
+  accepted <- NULL
+  received_deadline <- NULL
+  local_mocked_bindings(
+    fabric_livy_json = function(...) list(id = "expired", state = "idle"),
+    fabric_livy_ok = function(method, accepted_status, deadline = NULL, ...) {
+      expect_identical(method, "DELETE")
+      accepted <<- accepted_status
+      received_deadline <<- deadline
+      TRUE
+    }
+  )
+  session <- fabric_livy_session(
+    "https://example.test/livy/sessions",
+    token = "token",
+    verbose = FALSE
+  )
+
+  deadline <- Sys.time() + 5
+  expect_true(session$close(deadline = deadline))
+  expect_identical(accepted, 404L)
+  expect_identical(received_deadline, deadline)
+  expect_true(session$closed)
+})
+
+test_that("fabric_livy_query closes temporary session after failure", {
+  closed <- FALSE
+  fake_session <- new.env(parent = emptyenv())
+  fake_session$wait <- function(...) invisible(fake_session)
+  fake_session$run <- function(...) rlang::abort("spark failed")
+  fake_session$close <- function(deadline = NULL) {
+    closed <<- TRUE
+    TRUE
+  }
+  local_mocked_bindings(
+    fabric_livy_session = function(...) fake_session
+  )
+
+  expect_error(
+    fabric_livy_query(
+      "https://example.test/livy/sessions",
+      "raise Exception()",
+      token = "token",
+      verbose = FALSE
+    ),
+    "spark failed",
+    fixed = TRUE
+  )
+  expect_true(closed)
+})
+
+test_that("fabric_livy_query warns without losing a successful result", {
+  result <- structure(list(state = "available"), class = "livy-result")
+  fake_session <- new.env(parent = emptyenv())
+  fake_session$wait <- function(...) invisible(fake_session)
+  fake_session$run <- function(...) result
+  fake_session$close <- function(deadline = NULL) rlang::abort("delete failed")
+  local_mocked_bindings(
+    fabric_livy_session = function(...) fake_session
+  )
+
+  returned <- NULL
+  expect_warning(
+    returned <- fabric_livy_query(
+      "https://api.fabric.microsoft.com/livy/sessions",
+      "print(1)",
+      token = "token",
+      verbose = FALSE
+    ),
+    class = "fabric_livy_cleanup_warning"
+  )
+
+  expect_identical(returned, result)
+})
+
+test_that("fabric_livy_query retains execution and bounded cleanup failures", {
+  # Uses a short wall-clock deadline; retain deterministic polling tests on CRAN.
+  skip_on_cran()
+  cleanup_deadline <- NULL
+  fake_session <- new.env(parent = emptyenv())
+  fake_session$url <- "https://api.fabric.microsoft.com/livy/sessions/42"
+  fake_session$wait <- function(...) invisible(fake_session)
+  fake_session$run <- function(...) rlang::abort("spark failed")
+  fake_session$close <- function(deadline = NULL) {
+    cleanup_deadline <<- deadline
+    rlang::abort("delete failed")
+  }
+  local_mocked_bindings(
+    fabric_livy_session = function(...) fake_session
+  )
+  withr::local_options(fabricqueryr.livy.cleanup_timeout = 5)
+
+  error <- expect_error(
+    fabric_livy_query(
+      "https://api.fabric.microsoft.com/livy/sessions",
+      "raise Exception()",
+      token = "token",
+      verbose = FALSE
+    ),
+    class = "fabric_livy_execution_cleanup_error"
+  )
+
+  expect_match(conditionMessage(error$parent), "spark failed", fixed = TRUE)
+  expect_s3_class(error$cleanup_error, "fabric_livy_cleanup_error")
+  expect_match(
+    conditionMessage(error$cleanup_error),
+    "delete failed",
+    fixed = TRUE
+  )
+  expect_s3_class(cleanup_deadline, "POSIXct")
+  expect_gt(cleanup_deadline, Sys.time())
+  expect_lte(cleanup_deadline, Sys.time() + 5)
+  expect_identical(error$session_url, fake_session$url)
+})
+
+test_that("batch jobs expose success logs and structured results", {
+  # Uses a short wall-clock deadline; retain deterministic polling tests on CRAN.
+  skip_on_cran()
+  calls <- list()
+  gets <- 0L
+  local_mocked_bindings(
+    fabric_livy_json = function(
+      method,
+      url,
+      credential,
+      payload = NULL,
+      idempotent = NULL,
+      deadline = NULL
+    ) {
+      calls[[length(calls) + 1L]] <<- list(
+        method = method,
+        url = url,
+        payload = payload,
+        idempotent = idempotent
+      )
+      if (method == "POST") {
+        return(list(id = "batch-1", state = "starting"))
+      }
+      gets <<- gets + 1L
+      if (gets == 1L) {
+        return(list(id = "batch-1", state = "running", log = "starting"))
+      }
+      list(
+        id = "batch-1",
+        state = "success",
+        result = "Succeeded",
+        appId = "application-1",
+        log = c("starting", "FABRICQUERYR_BATCH_SUCCESS")
+      )
+    },
+    fabric_livy_ok = function(...) TRUE
+  )
+
+  batch <- fabric_livy_batch_submit(
+    "https://example.test/livy/sessions",
+    file = livy_test_application_uri,
+    name = "unit-batch",
+    args = c("success"),
+    conf = list("spark.test" = "yes"),
+    environment_id = "11111111-1111-4111-8111-111111111111",
+    target_lakehouse_id = "22222222-2222-4222-8222-222222222222",
+    token = "token",
+    verbose = FALSE
+  )
+  expect_s3_class(batch, "FabricLivyBatch")
+  expect_match(calls[[1L]]$url, "/batches$")
+  expect_false(calls[[1L]]$idempotent)
+  expect_equal(calls[[1L]]$payload$args, "success")
+  expect_equal(
+    calls[[1L]]$payload$conf[["spark.targetLakehouse"]],
+    "22222222-2222-4222-8222-222222222222"
+  )
+
+  batch$wait(timeout = 1, poll_interval = 0)
+  result <- batch$result(refresh = FALSE)
+  expect_s3_class(result, "fabric_livy_batch_result")
+  expect_equal(result$result, "Succeeded")
+  expect_equal(result$app_id, "application-1")
+  expect_match(
+    paste(batch$logs(refresh = FALSE), collapse = "\n"),
+    "FABRICQUERYR_BATCH_SUCCESS"
+  )
+})
+
+test_that("Livy vector fields remain JSON arrays when length one", {
+  request <- NULL
+  local_mocked_bindings(
+    .httr2_perform = function(req, ...) {
+      request <<- req
+      httr2::response(
+        status_code = 200L,
+        url = req$url,
+        headers = list("content-type" = "application/json"),
+        body = charToRaw('{"id":"batch-1","state":"starting"}')
+      )
+    }
+  )
+
+  fabric_livy_json(
+    "POST",
+    "https://example.test/batches",
+    livy_test_credential(),
+    payload = list(
+      file = "fixture.py",
+      args = "success",
+      jars = "dependency.jar"
+    )
+  )
+
+  expect_s3_class(request$body$data$args, "AsIs")
+  expect_s3_class(request$body$data$jars, "AsIs")
+  expect_false(inherits(request$body$data$file, "AsIs"))
+  expect_equal(
+    as.character(jsonlite::toJSON(
+      request$body$data,
+      auto_unbox = request$body$params$auto_unbox
+    )),
+    '{"file":"fixture.py","args":["success"],"jars":["dependency.jar"]}'
+  )
+})
+
+test_that("batch failures and cancellation preserve service details", {
+  # Uses a short wall-clock deadline; retain deterministic polling tests on CRAN.
+  skip_on_cran()
+  mode <- "failure"
+  accepted <- NULL
+  local_mocked_bindings(
+    fabric_livy_json = function(method, ...) {
+      if (method == "POST") {
+        return(list(id = "batch-2", state = "starting"))
+      }
+      list(
+        id = "batch-2",
+        state = "dead",
+        result = "Failed",
+        log = c("driver log", "intentional batch failure"),
+        errorInfo = list(list(message = "python exited with status 1"))
+      )
+    },
+    fabric_livy_ok = function(
+      method,
+      url,
+      ...,
+      accepted_status = integer()
+    ) {
+      mode <<- paste(method, url)
+      accepted <<- accepted_status
+      TRUE
+    }
+  )
+  batch <- fabric_livy_batch_submit(
+    "https://example.test/livy/batches",
+    file = livy_test_application_uri,
+    token = "token",
+    verbose = FALSE
+  )
+  error <- expect_error(
+    batch$wait(timeout = 1, poll_interval = 0),
+    class = "fabric_livy_batch_error"
+  )
+  expect_match(conditionMessage(error), "intentional batch failure")
+  expect_equal(error$logs[[1L]], "driver log")
+  expect_length(error$error_info, 1L)
+
+  expect_true(batch$cancel())
+  expect_true(batch$cancel_requested)
+  expect_match(mode, paste0("^DELETE ", batch$url, "$"))
+  expect_identical(accepted, 404L)
+})
+
+test_that("batch timeout can request cancellation", {
+  # Uses a short wall-clock deadline; retain deterministic polling tests on CRAN.
+  skip_on_cran()
+  cancelled <- FALSE
+  cancel_deadline <- NULL
+  local_mocked_bindings(
+    fabric_livy_json = function(method, ...) {
+      if (method == "POST") {
+        list(id = "slow-batch", state = "starting")
+      } else {
+        list(id = "slow-batch", state = "running")
+      }
+    },
+    fabric_livy_ok = function(..., deadline = NULL) {
+      cancelled <<- TRUE
+      cancel_deadline <<- deadline
+      TRUE
+    }
+  )
+  batch <- fabric_livy_batch_submit(
+    "https://example.test/livy/batches",
+    file = livy_test_application_uri,
+    token = "token",
+    verbose = FALSE
+  )
+  error <- expect_error(
+    batch$wait(
+      timeout = 0,
+      poll_interval = 0,
+      cancel_on_timeout = TRUE
+    ),
+    class = "fabric_livy_timeout_error"
+  )
+  expect_s3_class(error$batch, "fabric_livy_batch_metadata")
+  expect_identical(error$batch$id, batch$id)
+  expect_identical(error$batch$url, batch$url)
+  expect_identical(error$handle, batch)
+  expect_identical(error$kind, "batch")
+  expect_identical(error$last_state, "starting")
+  expect_identical(error$last_response, batch$response)
+  expect_true(cancelled)
+  expect_true(batch$cancel_requested)
+  expect_s3_class(cancel_deadline, "POSIXct")
+  expect_gt(cancel_deadline, Sys.time())
+  expect_true(error$cancel_accepted)
+  expect_null(error$cancel_error)
+})
+
+test_that("batch timeout retains a bounded cleanup cancellation failure", {
+  # Uses a short wall-clock deadline; retain deterministic polling tests on CRAN.
+  skip_on_cran()
+  local_mocked_bindings(
+    fabric_livy_json = function(...) {
+      list(id = "slow-batch", state = "running")
+    },
+    fabric_livy_ok = function(..., deadline = NULL) {
+      expect_s3_class(deadline, "POSIXct")
+      expect_gt(deadline, Sys.time())
+      rlang::abort(
+        paste0(
+          "cancellation deadline exhausted; ",
+          "Authorization: Bearer sentinel-cancel-secret"
+        )
+      )
+    }
+  )
+  batch <- fabric_livy_batch_submit(
+    "https://example.test/livy/batches",
+    file = livy_test_application_uri,
+    token = "token",
+    verbose = FALSE
+  )
+
+  error <- expect_error(
+    batch$wait(timeout = 0, cancel_on_timeout = TRUE),
+    class = "fabric_livy_timeout_error"
+  )
+  expect_false(error$cancel_accepted)
+  expect_match(
+    conditionMessage(error$cancel_error),
+    "cancellation deadline exhausted",
+    fixed = TRUE
+  )
+  expect_s3_class(error$cancel_error, "fabric_livy_cancellation_error")
+  expect_false(
+    grepl(
+      "sentinel-cancel-secret",
+      rawToChar(serialize(error, NULL, ascii = TRUE)),
+      fixed = TRUE
+    )
+  )
+  expect_identical(error$handle, batch)
+  expect_false(batch$cancel_requested)
+})
+
+test_that("statement wait polls through cancelling until cancelled", {
+  # Uses a short wall-clock deadline; retain deterministic polling tests on CRAN.
+  skip_on_cran()
+  responses <- list(
+    list(id = "session", state = "idle"),
+    list(id = 7L, state = "running"),
+    list(id = 7L, state = "cancelling"),
+    list(id = 7L, state = "cancelled")
+  )
+  calls <- 0L
+  local_mocked_bindings(
+    fabric_livy_json = function(...) {
+      calls <<- calls + 1L
+      response <- responses[[1L]]
+      responses <<- responses[-1L]
+      response
+    },
+    fabric_livy_ok = function(...) TRUE
+  )
+
+  session <- fabric_livy_session(
+    "https://example.test/livy/sessions",
+    token = "token",
+    verbose = FALSE
+  )
+  statement <- session$submit("print(1)", "pyspark")
+  statement$wait(
+    timeout = 1,
+    poll_interval = 0,
+    error_on_failure = FALSE
+  )
+
+  expect_identical(statement$state, "cancelled")
+  expect_identical(calls, 4L)
+  result <- statement$result(refresh = FALSE, error_on_failure = FALSE)
+  expect_identical(result$state, "cancelled")
+  session$close()
+})
+
+test_that("top-level batch waiting cancels on timeout and exposes its handle", {
+  calls <- character()
+  local_mocked_bindings(
+    fabric_livy_json = function(method, ...) {
+      calls <<- c(calls, method)
+      if (method == "POST") {
+        list(id = "slow-batch", state = "starting")
+      } else {
+        list(id = "slow-batch", state = "running")
+      }
+    },
+    fabric_livy_ok = function(method, ...) {
+      calls <<- c(calls, method)
+      TRUE
+    }
+  )
+
+  error <- expect_error(
+    fabric_livy_batch_submit(
+      "https://example.test/livy/batches",
+      file = livy_test_application_uri,
+      token = "token",
+      verbose = FALSE,
+      wait = TRUE,
+      timeout = 0,
+      poll_interval = 0
+    ),
+    class = "fabric_livy_timeout_error"
+  )
+
+  expect_s3_class(error$batch, "fabric_livy_batch_metadata")
+  expect_identical(error$batch$id, "slow-batch")
+  expect_true(error$batch$cancel_requested)
+  expect_s3_class(error$handle, "FabricLivyBatch")
+  expect_identical(error$handle$status(refresh = FALSE)$id, "slow-batch")
+  expect_identical(calls, c("POST", "DELETE"))
+  expect_identical(error$handle$status()$state, "running")
+  expect_identical(calls, c("POST", "DELETE", "GET"))
+})
+
+test_that("Livy handles and timeout errors do not serialize credentials", {
+  secrets <- c(
+    static = "sentinel-livy-static-token",
+    callback = "sentinel-livy-callback-token",
+    client = "sentinel-livy-client-secret"
+  )
+  credentials <- list(
+    fabric_credential(token = secrets[["static"]]),
+    fabric_credential(token = function(...) secrets[["callback"]]),
+    fabric_credential(
+      tenant_id = "tenant-id",
+      client_id = "client-id",
+      auth_args = list(
+        auth_type = "client_credentials",
+        password = secrets[["client"]]
+      )
+    )
+  )
+  handles <- lapply(credentials, function(credential) {
+    FabricLivyBatch$new(
+      response = list(id = "batch-id", state = "starting"),
+      url = "https://example.test/livy/batches",
+      credential = credential,
+      verbose = FALSE
+    )
+  })
+
+  serialized_handles <- vapply(
+    handles,
+    function(handle) rawToChar(serialize(handle, NULL, ascii = TRUE)),
+    character(1)
+  )
+  expect_false(any(vapply(
+    secrets,
+    function(secret) any(grepl(secret, serialized_handles, fixed = TRUE)),
+    logical(1)
+  )))
+
+  error <- tryCatch(
+    fabric_livy_abort_timeout(
+      "batch",
+      handles[[1L]],
+      handles[[1L]]$response
+    ),
+    error = identity
+  )
+  serialized_error <- rawToChar(serialize(error, NULL, ascii = TRUE))
+  expect_s3_class(error$batch, "fabric_livy_batch_metadata")
+  expect_identical(error$batch$id, "batch-id")
+  expect_identical(error$handle, handles[[1L]])
+  expect_false(grepl(secrets[["static"]], serialized_error, fixed = TRUE))
+
+  restored_error <- unserialize(serialize(error, NULL))
+  credential_error <- rlang::catch_cnd(
+    restored_error$handle$status(),
+    classes = "error"
+  )
+  expect_s3_class(credential_error, "fabric_livy_credential_error")
+  expect_match(
+    conditionMessage(credential_error),
+    "no longer has an in-process credential",
+    fixed = TRUE
+  )
+
+  restored <- unserialize(serialize(handles[[1L]], NULL))
+  expect_error(
+    restored$status(),
+    "no longer has an in-process credential",
+    class = "fabric_livy_credential_error"
+  )
+})
+
+test_that("Livy polling sleep is clamped to the remaining budget", {
+  slept <- numeric()
+  now <- as.POSIXct("2026-01-01 00:00:00", tz = "UTC")
+  remaining <- fabric_livy_poll_sleep(
+    now + 2,
+    poll_interval = 10,
+    .now = function() now,
+    .sleep = function(seconds) {
+      slept <<- c(slept, seconds)
+      invisible(NULL)
+    }
+  )
+  expect_equal(remaining, 2)
+  expect_equal(slept, 2)
+})
+
+test_that("Livy input and endpoint validation is explicit", {
+  expect_null(fabric_livy_normalize_named_list(list(), "tags"))
+  expect_null(fabric_livy_conf(list()))
+  expect_equal(
+    fabric_livy_endpoint(
+      "https://example.test/base/sessions/",
+      "batches"
+    ),
+    "https://example.test/base/batches"
+  )
+  expect_equal(
+    fabric_livy_endpoint(
+      "https://example.test/base/batches",
+      "highConcurrencySessions"
+    ),
+    "https://example.test/base/highConcurrencySessions"
+  )
+  expect_error(
+    fabric_livy_endpoint("http://api.fabric.microsoft.com/livy", "sessions"),
+    "valid HTTPS endpoint"
+  )
+  for (url in c(
+    "https://api.fabric.microsoft.com/livy?token=value",
+    "https://api.fabric.microsoft.com/livy#sessions",
+    "https://user@api.fabric.microsoft.com/livy"
+  )) {
+    expect_error(
+      fabric_livy_endpoint(url, "sessions"),
+      "must not contain",
+      fixed = TRUE
+    )
+  }
+  expect_error(
+    fabric_livy_endpoint(
+      "https://api.fabric.microsoft.com:8443/livy",
+      "sessions"
+    ),
+    "default port",
+    fixed = TRUE
+  )
+  expect_equal(
+    fabric_livy_endpoint(
+      "https://example.test:8443/livy",
+      "sessions"
+    ),
+    "https://example.test:8443/livy/sessions"
+  )
+  expect_error(
+    fabric_livy_session(
+      "https://example.test/base",
+      session_tag = "not-hc",
+      token = "token"
+    ),
+    "only available"
+  )
+  expect_error(
+    fabric_livy_session(
+      "https://example.test/base",
+      tags = list("missing name"),
+      token = "token"
+    ),
+    "uniquely named list"
+  )
+  expect_error(
+    fabric_livy_session(
+      "https://example.test/base",
+      conf = list("spark.setting" = 1),
+      token = "token"
+    ),
+    "single, non-missing strings"
+  )
+  expect_error(
+    fabric_livy_session(
+      "https://example.test/base",
+      archives = list("archive.zip"),
+      token = "token"
+    ),
+    "character vector"
+  )
+  expect_error(
+    fabric_livy_session(
+      "https://example.test/base",
+      driver_cores = 1.5,
+      token = "token"
+    ),
+    "whole number"
+  )
+  expect_error(
+    fabric_livy_batch_submit(
+      "https://example.test/base",
+      file = livy_test_application_uri,
+      tags = list(run = NA_character_),
+      token = "token"
+    ),
+    "non-missing strings"
+  )
+  expect_error(
+    fabric_livy_batch_submit(
+      "https://example.test/base",
+      file = "",
+      token = "token"
+    ),
+    "file must"
+  )
+  auth_calls <- 0L
+  token <- function(...) {
+    auth_calls <<- auth_calls + 1L
+    stop("must not authenticate")
+  }
+  expect_error(
+    fabric_livy_session(
+      "https://api.fabric.microsoft.com/livy",
+      environment_id = "not-an-environment-guid",
+      token = token
+    ),
+    "environment_id must be a GUID",
+    fixed = TRUE
+  )
+  expect_error(
+    fabric_livy_batch_submit(
+      "https://api.fabric.microsoft.com/livy",
+      file = livy_test_application_uri,
+      target_lakehouse_id = "../not-a-lakehouse-guid",
+      token = token
+    ),
+    "target_lakehouse_id must be a GUID",
+    fixed = TRUE
+  )
+  expect_equal(auth_calls, 0L)
+})
+
+test_that("Livy batch application paths are safe absolute ABFS URIs", {
+  expect_invisible(
+    fabric_livy_validate_abfs_uri(livy_test_application_uri, "file")
+  )
+  expect_invisible(
+    fabric_livy_validate_abfs_uri(
+      "ABFS://container@account.dfs.core.windows.net/jobs/main.py",
+      "file"
+    )
+  )
+  expect_invisible(
+    fabric_livy_validate_abfs_uri(
+      paste0(
+        "abfss://container@account.dfs.core.windows.net/",
+        "jobs/main%20file.py"
+      ),
+      "file"
+    )
+  )
+
+  invalid_uris <- c(
+    "job.py",
+    "https://account.example/jobs/main.py",
+    "abfss://account.example/jobs/main.py",
+    "abfss://@account.example/jobs/main.py",
+    "abfss://container@/jobs/main.py",
+    "abfss://container:secret@account.example/jobs/main.py",
+    "abfss://container:@account.example/jobs/main.py",
+    "abfss://container@account.example:443/jobs/main.py",
+    "abfss://container@account.example/",
+    "abfss://container@account.example/jobs/main.py?sig=secret",
+    "abfss://container@account.example/jobs/main.py#fragment",
+    "abfss://con tainer@account.example/jobs/main.py",
+    "abfss://con%20tainer@account.example/jobs/main.py",
+    "abfss://container@account name.example/jobs/main.py",
+    "abfss://container@account%20name.example/jobs/main.py",
+    "abfss://container@account.example/jobs/../main.py",
+    "abfss://container@account.example/jobs/%2e%2e/main.py",
+    "abfss://container@account.example/jobs/.%2e/main.py",
+    "abfss://container@account.example/jobs/%2e%2e%2fmain.py",
+    "abfss://container@account.example/jobs\\main.py",
+    "abfss://container@account.example/jobs/main file.py",
+    "abfss://container@account.example/jobs/main%09file.py",
+    "abfss://container@account.example/jobs/main%7Ffile.py",
+    "abfss://container@account.example/jobs/main%C2%85file.py",
+    "abfss://container@account.example/jobs/main%C2%A0file.py",
+    "abfss://container@account.example/jobs/main%5cfile.py",
+    "abfss://container@account.example/jobs/main%00.py",
+    "abfss://container@account.example/jobs/main%ZZ.py"
+  )
+  resolve_calls <- 0L
+  local_mocked_bindings(
+    fabric_livy_resolve_url = function(...) {
+      resolve_calls <<- resolve_calls + 1L
+      stop("must not resolve an endpoint")
+    }
+  )
+
+  for (uri in invalid_uris) {
+    error <- rlang::catch_cnd(
+      fabric_livy_batch_submit(
+        "https://api.fabric.microsoft.com/livy",
+        file = uri,
+        token = "token",
+        verbose = FALSE
+      ),
+      classes = "error"
+    )
+    expect_true(inherits(error, "fabric_livy_abfs_uri_error"), info = uri)
+    expect_false(grepl(uri, conditionMessage(error), fixed = TRUE), info = uri)
+  }
+  expect_identical(resolve_calls, 0L)
+})
+
+test_that("Livy wait arguments are validated before remote side effects", {
+  calls <- 0L
+  local_mocked_bindings(
+    fabric_livy_json = function(...) {
+      calls <<- calls + 1L
+      list(id = "created", state = "idle")
+    }
+  )
+
+  expect_error(
+    fabric_livy_query(
+      "https://example.test/livy/sessions",
+      code = "print(1)",
+      timeout = NA_real_,
+      token = "token"
+    ),
+    "timeout"
+  )
+  expect_identical(calls, 0L)
+
+  expect_error(
+    fabric_livy_batch_submit(
+      "https://example.test/livy/batches",
+      file = livy_test_application_uri,
+      wait = TRUE,
+      poll_interval = -1,
+      token = "token"
+    ),
+    "poll_interval"
+  )
+  expect_identical(calls, 0L)
+})
+
+test_that("session run validates polling before submitting a statement", {
+  posts <- 0L
+  local_mocked_bindings(
+    fabric_livy_json = function(method, ...) {
+      if (method == "POST") {
+        posts <<- posts + 1L
+      }
+      list(id = "session", state = "idle")
+    },
+    fabric_livy_ok = function(...) TRUE
+  )
+  session <- fabric_livy_session(
+    "https://example.test/livy/sessions",
+    token = "token",
+    verbose = FALSE
+  )
+  expect_identical(posts, 1L)
+
+  expect_error(
+    session$run("print(1)", timeout = Inf),
+    "timeout"
+  )
+  expect_identical(posts, 1L)
+  session$close()
+})
+
+test_that("batch result validates error_on_failure before refresh", {
+  gets <- 0L
+  local_mocked_bindings(
+    fabric_livy_json = function(method, ...) {
+      if (method == "POST") {
+        list(id = "batch", state = "success")
+      } else {
+        gets <<- gets + 1L
+        list(id = "batch", state = "success")
+      }
+    }
+  )
+  batch <- fabric_livy_batch_submit(
+    "https://example.test/livy/batches",
+    file = livy_test_application_uri,
+    token = "token",
+    verbose = FALSE
+  )
+
+  expect_error(batch$result(error_on_failure = NA), "must be TRUE or FALSE")
+  expect_identical(gets, 0L)
+})
+
+test_that("Livy result methods latch terminal completion times", {
+  credential <- livy_test_credential()
+  batch <- FabricLivyBatch$new(
+    response = list(id = "batch", state = "success", result = "Succeeded"),
+    url = "https://example.test/batches",
+    credential = credential,
+    verbose = FALSE
+  )
+  first_batch <- batch$result(refresh = FALSE)
+  second_batch <- batch$result(refresh = FALSE)
+  expect_s3_class(batch$completed_local, "POSIXct")
+  expect_identical(first_batch$completed_local, second_batch$completed_local)
+
+  statement <- FabricLivyStatement$new(
+    session = new.env(parent = emptyenv()),
+    response = list(
+      id = 1L,
+      state = "available",
+      output = list(status = "ok", data = list())
+    ),
+    url = "https://example.test/statements/1",
+    credential = credential,
+    verbose = FALSE
+  )
+  first_statement <- statement$result(refresh = FALSE)
+  second_statement <- statement$result(refresh = FALSE)
+  expect_s3_class(statement$completed_local, "POSIXct")
+  expect_identical(
+    first_statement$completed_local,
+    second_statement$completed_local
+  )
+  expect_identical(
+    first_statement$duration_sec,
+    second_statement$duration_sec
+  )
+})
+
+test_that("Livy handles print concise summaries without credentials", {
+  local_mocked_bindings(
+    fabric_livy_json = function(...) list(id = "session", state = "idle")
+  )
+  credential <- fabric_credential(token = "never-print-this-token")
+  session <- fabric_livy_session(
+    "https://example.test/livy/sessions",
+    token = "never-print-this-token",
+    verbose = FALSE
+  )
+  statement <- FabricLivyStatement$new(
+    session = session,
+    response = list(id = 7L, state = "waiting"),
+    url = "https://example.test/livy/sessions/session/statements/7",
+    credential = credential,
+    verbose = FALSE
+  )
+  batch <- FabricLivyBatch$new(
+    response = list(id = "batch", state = "running"),
+    url = "https://example.test/livy/batches",
+    credential = credential,
+    verbose = FALSE
+  )
+
+  capture_invisible_print <- function(value) {
+    capture.output(expect_invisible(print(value)))
+  }
+  session_text <- capture_invisible_print(session)
+  statement_text <- capture_invisible_print(statement)
+  batch_text <- capture_invisible_print(batch)
+  expect_match(paste(session_text, collapse = "\n"), "state: idle")
+  expect_match(paste(statement_text, collapse = "\n"), "id: 7")
+  expect_match(paste(batch_text, collapse = "\n"), "cancel requested: FALSE")
+  expect_false(any(grepl(
+    "never-print-this-token",
+    c(session_text, statement_text, batch_text),
+    fixed = TRUE
+  )))
+})
+
+test_that("Livy count-only responses still yield the requested activity page", {
+  for (fun in list(fabric_livy_sessions, fabric_livy_batches)) {
+    queries <- list()
+    local_mocked_bindings(fabric_livy_json = function(
+      method,
+      url,
+      credential,
+      query,
+      ...
+    ) {
+      queries[[length(queries) + 1L]] <<- query
+      if (identical(query[["$count"]], "true")) {
+        return(list(
+          items = list(),
+          totalCountOfMatchedItems = 12,
+          pageSize = 100
+        ))
+      }
+      list(
+        items = list(list(id = "activity-id", state = "Running")),
+        pageSize = 100
+      )
+    })
+    page <- fun(
+      "https://example.test/livy",
+      top = 1L,
+      skip = 3L,
+      token = "token"
+    )
+    expect_identical(page$id, "activity-id")
+    expect_equal(attr(page, "total_count"), 12)
+    expect_identical(attr(page, "skip"), 3L)
+    expect_identical(
+      queries,
+      list(
+        list(`$top` = 1L, `$skip` = 3L, `$count` = "true"),
+        list(`$top` = 1L, `$skip` = 3L, `$count` = "false")
+      )
+    )
+  }
+})
+
+test_that("Livy does not retry genuinely empty or exhausted pages", {
+  for (case in list(
+    list(total = 0, skip = 0L, count = TRUE),
+    list(total = 2, skip = 2L, count = TRUE),
+    list(total = 2, skip = 0L, count = FALSE),
+    list(total = NULL, skip = 0L, count = TRUE)
+  )) {
+    calls <- 0L
+    local_mocked_bindings(fabric_livy_json = function(...) {
+      calls <<- calls + 1L
+      list(items = list(), totalCountOfMatchedItems = case$total)
+    })
+    page <- fabric_livy_sessions(
+      "https://example.test/livy",
+      token = "token",
+      skip = case$skip,
+      count = case$count
+    )
+    expect_equal(nrow(page), 0L)
+    expect_identical(calls, 1L)
+  }
+})
+
+test_that("session waits stop on all documented terminal states", {
+  # Uses a short wall-clock deadline; retain deterministic polling tests on CRAN.
+  skip_on_cran()
+  check_terminal <- function(
+    initial_state,
+    result = NULL,
+    high_concurrency = FALSE
+  ) {
+    responses <- list(
+      list(id = "terminal-session", state = "starting"),
+      list(
+        id = "terminal-session",
+        state = initial_state,
+        result = result
+      )
+    )
+    local_mocked_bindings(
+      fabric_livy_json = function(...) {
+        response <- responses[[1L]]
+        responses <<- responses[-1L]
+        response
+      },
+      fabric_livy_ok = function(...) TRUE
+    )
+    session <- fabric_livy_session(
+      "https://example.test/livy",
+      high_concurrency = high_concurrency,
+      token = "token",
+      verbose = FALSE
+    )
+    expect_error(
+      session$wait(timeout = 1, poll_interval = 0),
+      class = "fabric_livy_session_error"
+    )
+    session$close()
+  }
+
+  check_terminal("success")
+  check_terminal("Deleting", high_concurrency = TRUE)
+  check_terminal("starting", result = "Failed")
+  check_terminal("unrecognized", result = "Cancelled")
+  check_terminal("idle", result = "Failed")
+  check_terminal("idle", result = "Cancelled")
+})
+
+test_that("idle Livy sessions with explicit Fabric errors are not ready", {
+  # Uses a short wall-clock deadline; retain deterministic polling tests on CRAN.
+  skip_on_cran()
+  for (hc in c(FALSE, TRUE)) {
+    response <- list(
+      id = "session",
+      state = "idle",
+      sessionId = "backing",
+      replId = "repl",
+      fabricSessionStateInfo = list(error = list(message = "failed"))
+    )
+    local_mocked_bindings(fabric_livy_json = function(...) response)
+    session <- FabricLivySession$new(
+      response = response,
+      livy_url = "https://example.test/livy/sessions",
+      high_concurrency = hc,
+      credential = fabric_credential(token = "token"),
+      verbose = FALSE
+    )
+    expect_error(
+      session$wait(timeout = 1, poll_interval = 0),
+      class = "fabric_livy_session_error"
+    )
+  }
+})
+
+test_that("Livy dates and narrow integers reject lossy conversion", {
+  for (value in c("2026-01-02garbage", "2026-1-02", "2026-02-30", "invalid")) {
+    expect_error(
+      fabric_livy_convert_column(list(value), "date"),
+      class = "fabric_livy_protocol_error"
+    )
+  }
+  expect_identical(
+    fabric_livy_convert_column(list("2024-02-29", NULL), "date"),
+    as.Date(c("2024-02-29", NA))
+  )
+  for (kind in c("byte", "short")) {
+    bound <- if (kind == "byte") 128 else 32768
+    for (value in list(1.5, -1.5, bound, -bound - 1, Inf, "NaN", "text")) {
+      expect_error(
+        fabric_livy_convert_column(list(value), kind),
+        class = "fabric_livy_protocol_error"
+      )
+    }
+    expect_identical(
+      fabric_livy_convert_column(list(-bound, bound - 1, NULL), kind),
+      as.integer(c(-bound, bound - 1, NA))
+    )
+  }
+})
+
+test_that("session wait continues through an Uncertain intermediate result", {
+  # Uses a short wall-clock deadline; retain deterministic polling tests on CRAN.
+  skip_on_cran()
+  responses <- list(
+    list(id = "uncertain-session", state = "starting"),
+    list(id = "uncertain-session", state = "running", result = "Uncertain"),
+    list(id = "uncertain-session", state = "idle", result = "Uncertain")
+  )
+  local_mocked_bindings(
+    fabric_livy_json = function(...) {
+      response <- responses[[1L]]
+      responses <<- responses[-1L]
+      response
+    },
+    fabric_livy_ok = function(...) TRUE
+  )
+  session <- fabric_livy_session(
+    "https://example.test/livy",
+    token = "token",
+    verbose = FALSE
+  )
+
+  expect_invisible(session$wait(timeout = 1, poll_interval = 0))
+  expect_identical(session$state, "idle")
+  expect_length(responses, 0L)
+  session$close()
+})
+test_that("generic Livy JSON preserves doubles throughout their finite range", {
+  values <- c(
+    0,
+    1,
+    pi,
+    1 / 3,
+    1 - .Machine$double.eps / 2,
+    1 + .Machine$double.eps,
+    2^53 - 1,
+    2^53,
+    2^53 + 2,
+    1.2345678901234567e-100,
+    1.2345678901234567e100,
+    .Machine$double.xmin,
+    .Machine$double.xmin * (1 - .Machine$double.eps),
+    .Machine$double.xmin * .Machine$double.eps,
+    .Machine$double.xmax
+  )
+  values <- c(values, -values)
+
+  expect_identical(fabric_livy_parse_json(values), values)
+  expect_identical(fabric_livy_parse_json(as.list(values)), values)
+  for (value in values) {
+    expect_identical(fabric_livy_parse_json(value), value)
+  }
+})
+
+test_that("generic Livy JSON preserves doubles across exponents", {
+  exponents <- seq(-1000, 1000, by = 20)
+  values <- c(
+    pi / 4 * 2^exponents,
+    (1 + .Machine$double.eps) * 2^exponents,
+    -(1 - .Machine$double.eps / 2) * 2^exponents
+  )
+
+  expect_identical(fabric_livy_parse_json(values), values)
+})
+
+test_that("generic Livy JSON preserves nested numeric and exact text values", {
+  value <- list(
+    fraction = pi,
+    nested = list(
+      adjacent = c(1 - .Machine$double.eps / 2, 1 + .Machine$double.eps),
+      large = 2^53 + 2,
+      smallest = .Machine$double.xmin * .Machine$double.eps,
+      largest = .Machine$double.xmax,
+      missing = NULL
+    ),
+    integer = 1L,
+    integer_limits = c(-2147483647L, 2147483647L),
+    decimal = "12345678901234567890.123456789012345",
+    bigint = "9223372036854775807",
+    special = c(pi, NA_real_, Inf, -Inf, NaN)
+  )
+
+  expect_identical(fabric_livy_parse_json(value), value)
+})
+
+test_that("generic Livy JSON retains integer64 values as exact text", {
+  skip_if_not_installed("bit64")
+  value <- list(
+    id = bit64::as.integer64("9223372036854775807"),
+    negative_id = bit64::as.integer64("-9223372036854775807"),
+    number = pi
+  )
+
+  expect_identical(
+    fabric_livy_parse_json(value),
+    list(
+      id = "9223372036854775807",
+      negative_id = "-9223372036854775807",
+      number = pi
+    )
+  )
+})
+
+test_that("generic Livy MIME output preserves tabular double precision", {
+  values <- c(
+    pi,
+    1 / 3,
+    1 + .Machine$double.eps,
+    2^53 + 2,
+    .Machine$double.xmin * .Machine$double.eps,
+    .Machine$double.xmax
+  )
+  rows <- lapply(seq_along(values), function(index) {
+    list(id = index, value = values[[index]], opposite = -values[[index]])
+  })
+  expected <- tibble::tibble(
+    id = seq_along(values),
+    value = values,
+    opposite = -values
+  )
+
+  for (mime in c("application/json", "application/vnd.test+json")) {
+    result <- fabric_livy_output(
+      response = list(
+        id = 4L,
+        state = "available",
+        output = list(
+          status = "ok",
+          data = stats::setNames(list(rows), mime)
+        )
+      ),
+      started_local = as.POSIXct("2026-01-01", tz = "UTC"),
+      completed_local = as.POSIXct("2026-01-01 00:00:01", tz = "UTC"),
+      url = "https://example.test/statements/4"
+    )
+
+    expect_identical(result$output$parsed, expected)
+  }
+})
+
+test_that("generic Livy MIME retains mixed numeric arrays without character coercion", {
+  tokens <- c(
+    "3.141592653589793",
+    "1.0000000000000002",
+    "1.7976931348623157e308",
+    "4.9406564584124654e-324",
+    "-0.0"
+  )
+  for (mime in c("application/json", "application/vnd.test+json")) {
+    for (token in tokens) {
+      wire <- paste0(
+        '{"id":4,"state":"available","output":{"status":"ok","data":{"',
+        mime,
+        '":[',
+        token,
+        ',"text",null,true]}}}'
+      )
+      response <- fabric_livy_decode_json(wire)
+      result <- fabric_livy_output(
+        response,
+        Sys.time(),
+        Sys.time(),
+        "https://example.test/statements/4"
+      )
+      expected <- list(numeric_test_decode(token), "text", NULL, TRUE)
+      expect_identical(result$output$parsed, expected)
+      expect_identical(
+        writeBin(result$output$parsed[[1L]], raw()),
+        writeBin(expected[[1L]], raw())
+      )
+      expect_identical(result$output$data[[mime]], response$output$data[[mime]])
+    }
+  }
+})
+
+test_that("generic Livy arrays retain protected integer and decimal text beside doubles", {
+  value <- fabric_livy_decode_json(paste0(
+    '{"values":[9007199254740993,3.141592653589793,null],',
+    '"nested":[["12345678901234567890.123456789012345678",1.0000000000000002],',
+    '[9223372036854775807,1.7976931348623157e308]]}'
+  ))
+  result <- fabric_livy_parse_json(value)
+  expect_identical(result$values, list("9007199254740993", pi, NULL))
+  expect_identical(
+    result$nested,
+    list(
+      list("12345678901234567890.123456789012345678", 1 + .Machine$double.eps),
+      list("9223372036854775807", .Machine$double.xmax)
+    )
+  )
+  expect_identical(
+    fabric_livy_parse_json(list(
+      bit64::as.integer64("9223372036854775807"),
+      pi
+    )),
+    list("9223372036854775807", pi)
+  )
+})
+
+test_that("generic Livy record arrays keep mixed list columns and missing cells", {
+  value <- fabric_livy_decode_json(paste0(
+    '[{"id":1,"value":3.141592653589793,"nested":{"value":1.0000000000000002},"array":[1]},',
+    '{"id":2,"value":"text","nested":{"value":"label"},"array":[2]},',
+    '{"id":3,"value":null},{"id":4}]'
+  ))
+  result <- fabric_livy_parse_json(value)
+  expect_s3_class(result, "tbl_df")
+  expect_identical(result$id, 1:4)
+  expect_identical(result$value, list(pi, "text", NULL, NULL))
+  expect_identical(
+    result$nested$value,
+    list(1 + .Machine$double.eps, "label", NULL, NULL)
+  )
+  expect_identical(result$array, list(1L, 2L, NULL, NULL))
+})
+
+test_that("generic Livy simplification keeps compatible vectors and matrices usable", {
+  value <- fabric_livy_decode_json(paste0(
+    '{"numbers":[1,1.0000000000000002,null,1.7976931348623157e308],',
+    '"integers":[1,null,3],"logical":[true,null,false],',
+    '"matrix":[[1,2.0],[3.0,4]],"mixed_matrix":[[1,2],["a","b"]],',
+    '"cube":[[[1,2],[3,4]],[[5,6],[7,8]]],',
+    '"bigints":[9007199254740993,null,9007199254740995],',
+    '"strings":[1.0000000000000002,"Inf","NaN","NA"],',
+    '"nulls":[null,null],"empty":[],"missing":null}'
+  ))
+  result <- fabric_livy_parse_json(value)
+  expect_identical(
+    result$numbers,
+    c(1, 1 + .Machine$double.eps, NA_real_, .Machine$double.xmax)
+  )
+  expect_identical(result$integers, c(1L, NA_integer_, 3L))
+  expect_identical(result$logical, c(TRUE, NA, FALSE))
+  expect_identical(result$matrix, matrix(c(1, 3, 2, 4), nrow = 2L))
+  expect_identical(result$mixed_matrix, list(1:2, c("a", "b")))
+  expect_identical(
+    result$cube,
+    array(c(1L, 5L, 3L, 7L, 2L, 6L, 4L, 8L), dim = c(2L, 2L, 2L))
+  )
+  expect_identical(
+    result$bigints,
+    c("9007199254740993", NA_character_, "9007199254740995")
+  )
+  expect_identical(
+    result$strings,
+    list(1 + .Machine$double.eps, "Inf", "NaN", "NA")
+  )
+  expect_identical(result$nulls, list(NULL, NULL))
+  expect_identical(result$empty, list())
+  expect_null(result$missing)
+})
+test_that("Livy retains application flow through stored credentials", {
+  credential <- fabric_credential(
+    "tenant",
+    "client",
+    auth_args = list(password = "synthetic")
+  )
+  expect_identical(
+    fabric_livy_audience(NULL, credential),
+    .fabric_audience$power_bi
+  )
+  fixed <- fabric_credential(token = "synthetic")
+  fabric_get_token(fixed, .fabric_audience$fabric)
+  expect_identical(
+    fabric_get_token(fixed, fabric_livy_audience(NULL, fixed)),
+    "synthetic"
+  )
+  error <- tryCatch(
+    fabric_get_token(fixed, .fabric_audience$storage),
+    error = identity
+  )
+  expect_s3_class(error, "fabric_multi_audience_auth_error")
+})
+test_that("Livy restores decimal leaves in arrays maps and structs", {
+  decimal <- "12345678901234567890.123456789012345"
+  raw <- paste0(
+    '{"schema":{"type":"struct","fields":[',
+    '{"name":"a","type":{"type":"array","elementType":"decimal(38,15)"}},',
+    '{"name":"m","type":{"type":"map","keyType":"string","valueType":"decimal(38,15)"}},',
+    '{"name":"s","type":{"type":"struct","fields":[',
+    '{"name":"nested","type":{"type":"array","elementType":"decimal(38,15)"}}]}}',
+    ']},"data":[[[',
+    decimal,
+    ',null],{"x":',
+    decimal,
+    ',"missing":null},{"nested":[',
+    decimal,
+    ',null]}],[null,null,null]]}'
+  )
+  parsed <- fabric_livy_parse_sql_json(raw)
+  expect_identical(parsed$a, list(list(decimal, NULL), NULL))
+  expect_identical(parsed$m, list(list(x = decimal, missing = NULL), NULL))
+  expect_identical(parsed$s, list(list(nested = list(decimal, NULL)), NULL))
+})
+test_that("invalid Livy code cannot allocate a session", {
+  requests <- 0L
+  local_mocked_bindings(.httr2_perform = function(...) {
+    requests <<- requests + 1L
+    stop("unexpected HTTP")
+  })
+  for (code in list(NULL, "", NA_character_, 1, c("a", "b"))) {
+    error <- rlang::catch_cnd(fabric_livy_query(
+      "https://api.fabric.test/v1/workspaces/w/items/i/livyApi/versions/2023-12-01",
+      code = code,
+      token = "test-token"
+    ))
+    expect_match(conditionMessage(error), "code", fixed = TRUE)
+  }
+  expect_identical(requests, 0L)
+})
+test_that("Livy restores decimal tokens in Fabric struct envelopes", {
+  raw <- paste0(
+    '{"schema":{"type":"struct","fields":[{"name":"s","type":',
+    '{"type":"struct","fields":[{"name":"value","type":"decimal(38,15)"}]}}]},',
+    '"data":[[{"schema":[{"name":"value","dataType":{"precision":38,"scale":15}}],',
+    '"values":[12345678901234567890.123456789012345]}]]}'
+  )
+  result <- fabric_livy_parse_sql_json(raw)
+  expect_identical(
+    result$s[[1]]$values[[1]],
+    "12345678901234567890.123456789012345"
+  )
+  expect_identical(result$s[[1]]$schema[[1]]$dataType$precision, 38L)
+})

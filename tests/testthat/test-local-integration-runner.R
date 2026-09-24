@@ -1,0 +1,482 @@
+test_that("local client secrets require an explicit application identity", {
+  environment <- fabric_test_local_runner()
+
+  expect_error(
+    environment$fabric_local_validate_secret_identity(
+      tenant_id = "",
+      client_id = "",
+      client_secret = "secret",
+      auth_args = list()
+    ),
+    "cached AzureAuth identities are never combined"
+  )
+  expect_error(
+    environment$fabric_local_validate_secret_identity(
+      tenant_id = "tenant",
+      client_id = "",
+      client_secret = "secret",
+      auth_args = list()
+    ),
+    "FABRICQUERYR_CLIENT_ID"
+  )
+  expect_no_error(
+    environment$fabric_local_validate_secret_identity(
+      tenant_id = "tenant",
+      client_id = "client",
+      client_secret = "secret",
+      auth_args = list()
+    )
+  )
+  expect_no_error(
+    environment$fabric_local_validate_secret_identity(
+      tenant_id = "",
+      client_id = "",
+      client_secret = "secret",
+      auth_args = list(auth_type = "device_code")
+    )
+  )
+})
+
+test_that("local auth context selects cached identities deterministically", {
+  environment <- fabric_test_local_runner()
+  environment$fabric_local_cached_contexts <- function() {
+    list(list(tenant_id = "tenant-a", client_id = "client-a"))
+  }
+
+  expect_message(
+    context <- environment$fabric_local_auth_context("", ""),
+    "cached Fabric AzureAuth token"
+  )
+  expect_equal(
+    context,
+    list(tenant_id = "tenant-a", client_id = "client-a")
+  )
+
+  environment$fabric_local_cached_contexts <- function() {
+    list(
+      list(tenant_id = "tenant-a", client_id = "client-a"),
+      list(tenant_id = "tenant-b", client_id = "client-b")
+    )
+  }
+  expect_error(
+    environment$fabric_local_auth_context("", ""),
+    "Multiple cached Fabric identities"
+  )
+  expect_equal(
+    environment$fabric_local_auth_context("tenant-b", ""),
+    list(tenant_id = "tenant-b", client_id = "client-b")
+  )
+})
+
+test_that("local auth arguments resolve explicit and environment flows", {
+  environment <- fabric_test_local_runner()
+
+  expect_message(
+    resolved <- environment$fabric_local_resolve_auth_args(
+      list(use_cache = FALSE),
+      client_id = "client-id",
+      client_secret = "client-secret"
+    ),
+    "local Fabric authentication"
+  )
+  expect_identical(resolved$password, "client-secret")
+  expect_identical(resolved$auth_type, "client_credentials")
+  expect_false(resolved$use_cache)
+
+  explicit <- list(auth_type = "device_code", use_cache = FALSE)
+  expect_identical(
+    environment$fabric_local_resolve_auth_args(
+      explicit,
+      client_id = "client-id",
+      client_secret = "ignored-secret"
+    ),
+    explicit
+  )
+  expect_error(
+    environment$fabric_local_resolve_auth_args(
+      list("device_code"),
+      client_id = "client-id",
+      client_secret = ""
+    ),
+    "fully named"
+  )
+  expect_error(
+    environment$fabric_local_resolve_auth_args(
+      list(),
+      client_id = "",
+      client_secret = "client-secret"
+    ),
+    "FABRICQUERYR_CLIENT_ID"
+  )
+
+  expect_true(environment$fabric_local_uses_client_credentials(resolved))
+  expect_true(environment$fabric_local_uses_client_credentials(list(
+    certificate = "certificate.pem"
+  )))
+  expect_false(environment$fabric_local_uses_client_credentials(explicit))
+  expect_false(environment$fabric_local_sandbox_uses_env_tokens(resolved))
+  expect_true(environment$fabric_local_sandbox_uses_env_tokens(explicit))
+  expect_true(environment$fabric_local_sandbox_uses_env_tokens(list(
+    auth_type = "client_credentials",
+    certificate = "certificate.pem"
+  )))
+})
+
+test_that("local cached token lookup filters and deduplicates identities", {
+  environment <- fabric_test_local_runner()
+  fabric_audience <- "https://api.fabric.microsoft.com/.default"
+  first <- list(
+    scope = fabric_audience,
+    tenant = "tenant-a",
+    client = list(client_id = "client-a"),
+    marker = "first"
+  )
+  duplicate <- utils::modifyList(first, list(marker = "duplicate"))
+  other <- list(
+    resource = "https://storage.azure.com/.default",
+    tenant = "tenant-b",
+    client = list(client_id = "client-b")
+  )
+  local_mocked_bindings(
+    list_azure_tokens = function() list(first, duplicate, other),
+    .package = "AzureAuth"
+  )
+
+  expect_equal(
+    environment$fabric_local_cached_contexts(),
+    list(list(tenant_id = "tenant-a", client_id = "client-a"))
+  )
+  expect_identical(
+    environment$fabric_local_cached_token(
+      fabric_audience,
+      "tenant-a",
+      "client-a"
+    )$marker,
+    "first"
+  )
+  expect_null(environment$fabric_local_cached_token(
+    fabric_audience,
+    "tenant-b",
+    "client-b"
+  ))
+})
+
+test_that("local token acquisition cannot swap delegated and application identities", {
+  environment <- fabric_test_local_runner()
+  audience <- "https://api.fabric.microsoft.com/.default"
+  application <- list(
+    scope = audience,
+    tenant = "tenant",
+    client = list(client_id = "client"),
+    auth_type = "client_credentials",
+    marker = "application"
+  )
+  delegated <- utils::modifyList(
+    application,
+    list(
+      auth_type = "authorization_code",
+      marker = "delegated"
+    )
+  )
+  cached <- list(application, delegated)
+  local_mocked_bindings(
+    list_azure_tokens = function() cached,
+    get_azure_token = function(...) {
+      stop("unexpected interactive authentication")
+    },
+    .package = "AzureAuth"
+  )
+  for (order in list(c(1L, 2L), c(2L, 1L))) {
+    cached <- list(application, delegated)[order]
+    for (principal in c("application", "delegated")) {
+      auth <- if (principal == "application") {
+        list(auth_type = "client_credentials")
+      } else {
+        list()
+      }
+      tokens <- suppressMessages(environment$fabric_local_acquire_tokens(
+        "tenant",
+        "client",
+        auth_args = auth,
+        audiences = c(Fabric = audience)
+      ))
+      expect_identical(tokens[[audience]]$marker, principal)
+    }
+  }
+  cached <- list(application)
+  expect_null(environment$fabric_local_cached_token(
+    audience,
+    "tenant",
+    "client",
+    client_credentials = FALSE
+  ))
+  cached <- list(delegated)
+  expect_null(environment$fabric_local_cached_token(
+    audience,
+    "tenant",
+    "client",
+    client_credentials = TRUE
+  ))
+})
+
+test_that("local refresh-token exchange sends the requested audience", {
+  environment <- fabric_test_local_runner()
+  request <- NULL
+  httr2::local_mocked_responses(function(req) {
+    request <<- req
+    operation_test_response(
+      body = list(
+        access_token = "new-access-token",
+        refresh_token = "new-refresh-token",
+        expires_in = 3600
+      ),
+      url = req$url
+    )
+  })
+
+  audience <- "https://database.windows.net//.default"
+  exchanged <- environment$fabric_local_exchange_token(
+    list(
+      tenant_id = "tenant-id",
+      client_id = "client-id",
+      refresh_token = "old-refresh-token"
+    ),
+    audience
+  )
+
+  expect_s3_class(exchanged, "fabric_local_token")
+  expect_identical(exchanged$audience, audience)
+  expect_identical(exchanged$access_token, "new-access-token")
+  expect_match(request$url, "/tenant-id/oauth2/v2.0/token", fixed = TRUE)
+  expect_identical(request$body$type, "form")
+  expect_identical(
+    unclass(request$body$data$grant_type),
+    "refresh_token"
+  )
+  expect_identical(
+    utils::URLdecode(unclass(request$body$data$scope)),
+    paste(audience, "offline_access")
+  )
+  expect_error(
+    environment$fabric_local_exchange_token(
+      list(tenant_id = "tenant-id", client_id = "client-id"),
+      audience
+    ),
+    "cannot be refreshed"
+  )
+})
+
+test_that("local acquisition reuses and exchanges matching cached tokens", {
+  environment <- fabric_test_local_runner()
+  fabric_audience <- "https://api.fabric.microsoft.com/.default"
+  sql_audience <- "https://database.windows.net//.default"
+  source <- structure(
+    list(
+      tenant_id = "tenant-id",
+      client_id = "client-id",
+      audience = fabric_audience,
+      access_token = "fabric-token",
+      refresh_token = "refresh-token",
+      expires_on = as.numeric(Sys.time()) + 3600
+    ),
+    class = "fabric_local_token"
+  )
+  environment$fabric_local_cached_token <- function(audience, ...) {
+    if (identical(audience, fabric_audience)) source else NULL
+  }
+  exchanged_audiences <- character()
+  environment$fabric_local_exchange_token <- function(token, audience) {
+    exchanged_audiences <<- c(exchanged_audiences, audience)
+    utils::modifyList(
+      token,
+      list(audience = audience, access_token = "sql-token")
+    )
+  }
+
+  tokens <- suppressMessages(
+    environment$fabric_local_acquire_tokens(
+      tenant_id = "tenant-id",
+      client_id = "client-id",
+      audiences = c(Fabric = fabric_audience, SQL = sql_audience)
+    )
+  )
+
+  expect_identical(tokens[[fabric_audience]], source)
+  expect_identical(tokens[[sql_audience]]$access_token, "sql-token")
+  expect_identical(exchanged_audiences, sql_audience)
+})
+
+test_that("local JWT and identity validation execute both principal paths", {
+  environment <- fabric_test_local_runner()
+  claims <- environment$fabric_local_jwt_claims(fabric_test_local_jwt(list(
+    oid = "user-id",
+    appid = "application-id"
+  )))
+
+  expect_identical(claims$oid, "user-id")
+  expect_identical(claims$appid, "application-id")
+  expect_error(
+    environment$fabric_local_jwt_claims("not-a-jwt"),
+    "not a JWT"
+  )
+  expect_error(
+    environment$fabric_local_jwt_claims("header.invalid.signature"),
+    "Could not decode"
+  )
+
+  expect_message(
+    environment$fabric_local_validate_identity(
+      claims,
+      tenant_id = "tenant-id",
+      client_id = "APPLICATION-ID",
+      expected_user_id = "",
+      auth_args = list(auth_type = "client_credentials")
+    ),
+    "Authenticated to Fabric as application"
+  )
+  expect_error(
+    environment$fabric_local_validate_identity(
+      claims,
+      tenant_id = "tenant-id",
+      client_id = "wrong-application",
+      expected_user_id = "",
+      auth_args = list(auth_type = "client_credentials")
+    ),
+    "instead of"
+  )
+  expect_invisible(environment$fabric_local_validate_identity(
+    claims,
+    tenant_id = "tenant-id",
+    client_id = "client-id",
+    expected_user_id = "USER-ID",
+    auth_args = list(auth_type = "device_code")
+  ))
+  expect_error(
+    environment$fabric_local_validate_identity(
+      claims,
+      tenant_id = "tenant-id",
+      client_id = "client-id",
+      expected_user_id = "wrong-user",
+      auth_args = list(auth_type = "device_code")
+    ),
+    "use_cache = FALSE"
+  )
+})
+
+test_that("local token providers refresh both supported token representations", {
+  environment <- fabric_test_local_runner()
+  azure_audience <- "https://api.fabric.microsoft.com/.default"
+  azure_token <- fake_azure_token(valid = FALSE)
+  azure_provider <- environment$fabric_local_token_provider(setNames(
+    list(azure_token),
+    azure_audience
+  ))
+
+  expect_identical(azure_provider(azure_audience), "azure-token-refreshed")
+  expect_identical(azure_token$refreshes, 1L)
+  expect_identical(
+    azure_provider(azure_audience, force_refresh = TRUE),
+    "azure-token-refreshed"
+  )
+  expect_identical(azure_token$refreshes, 2L)
+
+  local_audience <- "https://database.windows.net//.default"
+  local_token <- structure(
+    list(
+      tenant_id = "tenant-id",
+      client_id = "client-id",
+      audience = local_audience,
+      access_token = "expired-token",
+      refresh_token = "refresh-token",
+      expires_on = 0
+    ),
+    class = "fabric_local_token"
+  )
+  exchanges <- 0L
+  environment$fabric_local_exchange_token <- function(token, audience) {
+    exchanges <<- exchanges + 1L
+    token$access_token <- "fresh-token"
+    token$expires_on <- as.numeric(Sys.time()) + 3600
+    token
+  }
+  local_provider <- environment$fabric_local_token_provider(setNames(
+    list(local_token),
+    local_audience
+  ))
+
+  expect_identical(local_provider(local_audience), "fresh-token")
+  expect_identical(local_provider(local_audience), "fresh-token")
+  expect_identical(exchanges, 1L)
+  expect_error(local_provider("missing-audience"), "No local AzureAuth token")
+})
+
+test_that("local runner selects only the audiences needed by its filter", {
+  environment <- fabric_test_local_runner()
+
+  all <- environment$fabric_local_test_audiences("integration-fabric")
+  onelake <- environment$fabric_local_test_audiences(
+    "integration-fabric-onelake"
+  )
+  jobs <- environment$fabric_local_test_audiences(
+    "integration-fabric-jobs"
+  )
+
+  expect_named(all, c("Fabric", "Power BI", "SQL", "OneLake", "Kusto"))
+  expect_named(onelake, c("Fabric", "Power BI", "SQL", "OneLake"))
+  expect_identical(
+    unname(onelake[["Power BI"]]),
+    "https://analysis.windows.net/powerbi/api/.default"
+  )
+  expect_named(jobs, c("Fabric", "Power BI", "OneLake"))
+  expect_identical(
+    unname(jobs[["Power BI"]]),
+    "https://analysis.windows.net/powerbi/api/.default"
+  )
+  expect_identical(
+    unname(onelake[["SQL"]]),
+    "https://database.windows.net//.default"
+  )
+  expect_identical(
+    environment$fabric_local_test_scope("integration-fabric"),
+    "all"
+  )
+  expect_identical(
+    environment$fabric_local_test_scope("integration-fabric-onelake"),
+    "onelake"
+  )
+  expect_identical(
+    environment$fabric_local_test_scope("integration-fabric-jobs"),
+    "jobs"
+  )
+  expect_identical(
+    environment$fabric_local_test_scope("integration-fabric-jobs-overrides"),
+    "jobs"
+  )
+  for (filter in c(
+    "integration-fabric-(jobs|sql)",
+    "integration-fabric-(onelake|kql-graphql)",
+    "integration-fabric-(jobs|onelake)",
+    "does-not-exist"
+  )) {
+    expect_identical(environment$fabric_local_test_scope(filter), "all")
+    expect_identical(environment$fabric_local_test_audiences(filter), all)
+  }
+})
+
+test_that("local runner builds exact selective deployment arguments", {
+  environment <- fabric_test_local_runner()
+
+  arguments <- environment$fabric_local_deploy_arguments(c(
+    "JobFixtures.Notebook",
+    "TestPipeline.DataPipeline",
+    "JobFixtures.Notebook"
+  ))
+
+  expect_identical(arguments[c(1L, 3L)], c("--item", "--item"))
+  expect_match(arguments[[2L]], "JobFixtures.Notebook", fixed = TRUE)
+  expect_match(arguments[[4L]], "TestPipeline.DataPipeline", fixed = TRUE)
+  expect_identical(
+    environment$fabric_local_deploy_arguments(character()),
+    character()
+  )
+})

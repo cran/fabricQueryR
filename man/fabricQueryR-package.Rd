@@ -4,9 +4,67 @@
 \name{fabricQueryR-package}
 \alias{fabricQueryR}
 \alias{fabricQueryR-package}
-\title{fabricQueryR: Query Data in 'Microsoft Fabric'}
+\title{Work with Microsoft Fabric from R}
 \description{
-Query data hosted in 'Microsoft Fabric'. Provides helpers to open 'DBI' connections to 'SQL' endpoints of 'Lakehouse' and 'Data Warehouse' items; submit 'Data Analysis Expressions' ('DAX') queries to semantic model datasets in 'Microsoft Fabric' and 'Power BI'; read 'Delta Lake' tables stored in 'OneLake' ('Azure Data Lake Storage Gen2'); and execute 'Spark' code via the 'Livy API'.
+'fabricQueryR' helps you find and work with Microsoft Fabric data from R.
+Start by discovering the workspaces and items available to you. Discovery
+returns read-only R6 objects that include the service fields and expose methods
+matched to each actionable resource. In most workflows, you can continue with
+\code{$} methods without copying IDs, endpoints, or credentials by hand. The
+same operations can also be called through the corresponding \verb{fabric_*()}
+functions
+}
+\section{Where to start}{
+
+\itemize{
+\item Use \code{\link[=fabric_workspaces]{fabric_workspaces()}} and the typed discovery helpers, such as
+\code{\link[=fabric_lakehouses]{fabric_lakehouses()}} or \code{\link[=fabric_semantic_models]{fabric_semantic_models()}}, to find data. A
+workspace can also continue discovery with \verb{$lakehouses()}
+(\code{\link[=fabric_lakehouses]{fabric_lakehouses()}}) and \verb{$semantic_models()}
+(\code{\link[=fabric_semantic_models]{fabric_semantic_models()}}); see \link{FabricItem}
+\item Use \code{\link[=fabric_sql_tables]{fabric_sql_tables()}} to discover tables and views across Warehouse,
+SQL Database, Warehouse snapshot, or Lakehouse SQL endpoints, then
+use \verb{$sql_read_table()} (\code{\link[=fabric_sql_read_table]{fabric_sql_read_table()}}) or \verb{$sql_query()}
+(\code{\link[=fabric_sql_query]{fabric_sql_query()}}) to read them
+\item Use \verb{$dax_query()} (\code{\link[=fabric_pbi_dax_query]{fabric_pbi_dax_query()}}) on a semantic model
+\item Use \verb{$livy_query()} (\code{\link[=fabric_livy_query]{fabric_livy_query()}}), \verb{$livy_session()}
+(\code{\link[=fabric_livy_session]{fabric_livy_session()}}), or \verb{$livy_batch_submit()}
+(\code{\link[=fabric_livy_batch_submit]{fabric_livy_batch_submit()}}) on a Lakehouse for Spark processing
+\item Use \code{\link[=fabric_lakehouse_schemas]{fabric_lakehouse_schemas()}} and \code{\link[=fabric_lakehouse_tables]{fabric_lakehouse_tables()}} to discover
+managed Delta tables; Lakehouse methods include \verb{$tables()}
+(\code{\link[=fabric_lakehouse_tables]{fabric_lakehouse_tables()}}), \verb{$read_table()}
+(\code{\link[=fabric_lakehouse_read_table]{fabric_lakehouse_read_table()}}), \verb{$write_table()}
+(\code{\link[=fabric_lakehouse_write_table]{fabric_lakehouse_write_table()}}), and \verb{$load_table()}
+(\code{\link[=fabric_lakehouse_load_table]{fabric_lakehouse_load_table()}})
+\item Use \link{fabric_onelake_files} for ordinary files
+\item Use \code{\link[=fabric_warehouse_schemas]{fabric_warehouse_schemas()}} and \code{\link[=fabric_warehouse_tables]{fabric_warehouse_tables()}} to discover
+Warehouse tables, then \verb{$read_table()} (\code{\link[=fabric_warehouse_read_table]{fabric_warehouse_read_table()}}) or
+\verb{$write_table()} (\code{\link[=fabric_warehouse_write_table]{fabric_warehouse_write_table()}}) on the Warehouse object
+\item Use \code{\link[=fabric_mirrored_databases]{fabric_mirrored_databases()}} and \code{\link[=fabric_mirrored_database_tables]{fabric_mirrored_database_tables()}}
+to discover and read continuously replicated Delta tables
+\item On an Eventhouse or KQL database, use \verb{$tables()} (\code{\link[=fabric_kql_tables]{fabric_kql_tables()}}),
+\verb{$query()} (\code{\link[=fabric_kql_query]{fabric_kql_query()}}), \verb{$read_table()}
+(\code{\link[=fabric_kql_read_table]{fabric_kql_read_table()}}), \verb{$ingest()} (\code{\link[=fabric_kql_ingest]{fabric_kql_ingest()}}),
+\verb{$write_table()} (\code{\link[=fabric_kql_write_table]{fabric_kql_write_table()}}), and \verb{$export()}
+(\code{\link[=fabric_kql_export]{fabric_kql_export()}})
+\item On an API for GraphQL item, use \verb{$query()} (\code{\link[=fabric_graphql_query]{fabric_graphql_query()}}),
+\verb{$schema()} (\code{\link[=fabric_graphql_schema]{fabric_graphql_schema()}}), and \verb{$paginate()}
+(\code{\link[=fabric_graphql_paginate]{fabric_graphql_paginate()}})
+\item Use experimental \code{\link[=fabric_function_invoke]{fabric_function_invoke()}} to call published business
+logic through a User Data Function's explicit public URL
+\item On a runnable item, use \verb{$run()} (\code{\link[=fabric_job_run]{fabric_job_run()}}), \verb{$status()}
+(\code{\link[=fabric_job_status]{fabric_job_status()}}), \verb{$wait()} (\code{\link[=fabric_job_wait]{fabric_job_wait()}}), and \verb{$cancel()}
+(\code{\link[=fabric_job_cancel]{fabric_job_cancel()}})
+\item See \code{vignette("authentication", package = "fabricQueryR")} for interactive
+and unattended authentication setup, required token audiences, and Fabric
+permissions
+}
+}
+
+\references{
+\href{https://learn.microsoft.com/en-us/fabric/fundamentals/microsoft-fabric-overview}{What is Microsoft Fabric?}
+
+\href{https://learn.microsoft.com/en-us/rest/api/fabric/}{Microsoft Fabric REST API documentation}
 }
 \seealso{
 Useful links:
@@ -19,6 +77,11 @@ Useful links:
 }
 \author{
 \strong{Maintainer}: Luka Koning \email{koningluka@gmail.com} [copyright holder]
+
+Authors:
+\itemize{
+  \item Luka Koning \email{koningluka@gmail.com} [copyright holder]
+}
 
 Other contributors:
 \itemize{

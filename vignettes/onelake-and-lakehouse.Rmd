@@ -1,0 +1,275 @@
+---
+title: "Working with Fabric Lakehouses and OneLake"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Working with Fabric Lakehouses and OneLake}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", eval = FALSE)
+```
+
+A Fabric Lakehouse keeps ordinary files and managed tables together in
+OneLake:
+
+- `Files/` contains ordinary files such as CSV, Parquet, JSON, images, and
+  scripts.
+- `Tables/` contains managed Delta tables that Fabric engines can query.
+
+Use the SQL analytics endpoint for familiar SQL queries against managed tables.
+Use the Lakehouse and OneLake helpers when you want to work directly with a
+table or file. This guide starts with a small SQL query, then moves from
+ordinary files to managed tables and, finally, large or historical reads.
+
+## Find and connect to a Lakehouse
+
+Find the workspace by name, then select one of its Lakehouses:
+
+```{r, eval = FALSE}
+library(fabricQueryR)
+
+workspaces <- fabric_workspaces()
+matches <- Filter(
+  \(x) identical(x$displayName, "Analytics workspace"),
+  workspaces
+)
+stopifnot(length(matches) == 1L)
+workspace <- matches[[1L]]
+lakehouse <- workspace$lakehouses()[[1L]]
+
+lakehouse$displayName
+```
+
+`$lakehouses()` is the workspace method for `fabric_lakehouses()`.
+
+Fabric provides a SQL analytics endpoint for querying the managed tables under
+`Tables/`. It does not query ordinary files under `Files/`. The endpoint
+address is already included in `lakehouse`, so you do not need to copy it from
+the Fabric portal.
+
+The discovered `FabricLakehouse` is a read-only R6 object. For a single SQL
+query, call `$sql_query()` (`fabric_sql_query()`):
+
+```{r, eval = FALSE}
+orders <- lakehouse$sql_query(
+  "SELECT TOP 10 * FROM dbo.orders"
+)
+```
+
+The default `numeric_policy = "auto"` uses ODBC's numeric conversion and warns
+once per session that precision may be lost. Use `numeric_policy = "driver"`
+to explicitly accept that conversion without a warning, or `"exact"` to reject
+unsafe ODBC results. Use `backend = "adbc"` for exact conversion; see the setup in
+[Bring Fabric data into R](reading-data.html).
+
+The method opens and closes the SQL connection for you. If you want to run
+several commands with 'DBI', use `$sql_connect()` (`fabric_sql_connect()`):
+
+```{r, eval = FALSE}
+con <- lakehouse$sql_connect()
+DBI::dbListTables(con)
+DBI::dbGetQuery(con, "SELECT TOP 10 * FROM dbo.orders")
+DBI::dbDisconnect(con)
+```
+
+For most work with managed tables, start with SQL. Use `$sql_query()`
+(`fabric_sql_query()`) for filters, joins, and summaries, or
+`$sql_read_table()` (`fabric_sql_read_table()`) to read one table without
+writing SQL. Use `$sql_connect()` (`fabric_sql_connect()`) only when you want
+to keep a connection open for several 'DBI' calls.
+
+You can also read a Delta table directly through OneLake with `$read_table()`
+(`fabric_lakehouse_read_table()`). This is useful for an Arrow stream or an
+earlier table version. Direct Delta reads use Python through 'reticulate'; see
+`?fabric_delta_config` for runtime requirements and setup diagnostics. They
+require OneLake data access and a supported Delta protocol. Use SQL or Spark
+for tables with unsupported features such as Type Widening or V2 Checkpoints.
+
+The `$onelake_*()` methods correspond to the
+`fabric_onelake_*()` functions and work with ordinary files under `Files/`,
+while `$write_table()` (`fabric_lakehouse_write_table()`) adds or replaces
+managed table data. These operations do not need a SQL connection. Never change
+the files underneath `Tables/` directly because they are part of a managed
+Delta table.
+
+## List and read ordinary files
+
+Start by listing a small folder with `$onelake_list()`
+(`fabric_onelake_list()`):
+
+```{r, eval = FALSE}
+files <- lakehouse$onelake_list(
+  path = "Files/incoming"
+)
+
+files[c("path", "is_directory", "content_length")]
+```
+
+Read a supported tabular file directly into R with `$onelake_read_file()`
+(`fabric_onelake_read_file()`):
+
+```{r, eval = FALSE}
+orders <- lakehouse$onelake_read_file(
+  path = "Files/incoming/orders.csv"
+)
+
+head(orders)
+```
+
+Use `$onelake_metadata()` (`fabric_onelake_metadata()`) for size and other
+properties without reading the contents. Use `$onelake_download()`
+(`fabric_onelake_download()`) for a file type that should stay as bytes or be
+saved to local disk.
+
+## Write or upload a file
+
+`$onelake_write_file()` (`fabric_onelake_write_file()`) turns an R or Arrow
+object into CSV, Parquet, or Arrow IPC content based on the path or explicit
+format:
+
+```{r, eval = FALSE}
+lakehouse$onelake_write_file(
+  path = "Files/exports/orders.parquet",
+  data = data.frame(
+    order_id = 1:3,
+    amount = c(10.5, 20, 30.25)
+  )
+)
+```
+
+If the file already exists on your computer, upload it with `$onelake_upload()`
+(`fabric_onelake_upload()`) without first parsing it in R:
+
+```{r, eval = FALSE}
+lakehouse$onelake_upload(
+  path = "Files/incoming/logo.png",
+  source = "logo.png"
+)
+```
+
+Both operations can replace a destination. Use a new path while learning and
+check `?fabric_onelake_write_file` or `?fabric_onelake_upload` before replacing
+shared data.
+
+## Discover and read managed tables
+
+List tables with `$tables()` (`fabric_lakehouse_tables()`):
+
+```{r, eval = FALSE}
+tables <- lakehouse$tables()
+tables[c("schema", "name", "type", "format")]
+```
+
+Select a discovered row or supply the table name to `$read_table()`
+(`fabric_lakehouse_read_table()`):
+
+```{r, eval = FALSE}
+table <- tables[1L, ]
+
+rows <- lakehouse$read_table(
+  table,
+  columns = c("order_id", "amount"),
+  limit = 100L
+)
+```
+
+Column selection and row limits happen before the result is fully collected in
+R. For SQL joins, grouping, or complex filters, use `$sql_query()`
+(`fabric_sql_query()`) against the Lakehouse SQL analytics endpoint instead.
+
+## Write an R object as a managed table
+
+Use `$write_table()` (`fabric_lakehouse_write_table()`):
+
+```{r, eval = FALSE}
+result <- lakehouse$write_table(
+  table = "orders_from_r",
+  data = data.frame(
+    order_id = 1:3,
+    amount = c(10.5, 20, 30.25)
+  ),
+  mode = "Overwrite"
+)
+
+result$rows
+result$staging_retained
+```
+
+The function stages Parquet files under a unique `Files/` path, asks Fabric to
+perform a managed Delta load, waits for completion, and cleans up after
+confirmed success. Fabric can infer a missing table's schema. Use Spark or a
+separately schema-controlled process when inference is not suitable.
+
+Column names are preserved exactly. The managed load endpoint accepted
+precomposed `caf\u00e9` but rejected decomposed `e\u0301` and connector punctuation
+in `x\u203fy` in the Fabric sandbox on 7 September 2026. This conflicts with the
+[documented Unicode categories](https://learn.microsoft.com/en-us/fabric/data-engineering/troubleshoot-lakehouse#delta-table-schema-errors).
+The package rejects those names before staging; explicitly normalize or rename
+them in your data if necessary.
+
+## Turn existing files into a table
+
+When CSV or Parquet files already exist in the Lakehouse, ask Fabric to load
+them directly with `$load_table()` (`fabric_lakehouse_load_table()`):
+
+```{r, eval = FALSE}
+operation <- lakehouse$load_table(
+  table = "orders_from_csv",
+  path = "Files/incoming/orders.csv",
+  format = "Csv",
+  header = TRUE,
+  delimiter = ",",
+  mode = "Overwrite"
+)
+
+operation <- fabric_operation_wait(operation, timeout = 900)
+```
+
+The source can be one file or a folder. Folder loads can filter by extension
+and include nested folders. The source must already be inside the selected
+Lakehouse's `Files/` area.
+
+## Read a large or historical Delta table
+
+Use `$read_table()` (`fabric_lakehouse_read_table()`) with an Arrow stream when
+the selected data may not fit comfortably in memory:
+
+```{r, eval = FALSE}
+local({
+  stream <- lakehouse$read_table(
+    table = "large_orders",
+    result = "arrow_stream"
+  )
+  on.exit(nanoarrow::nanoarrow_pointer_release(stream), add = TRUE)
+  reader <- arrow::as_record_batch_reader(stream)
+  on.exit(reader$Close(), add = TRUE, after = FALSE)
+  row_count <- 0
+  repeat {
+    batch <- reader$read_next_batch()
+    if (is.null(batch)) break
+    # Process or write this batch before reading the next one.
+    row_count <- row_count + batch$num_rows
+  }
+  row_count
+})
+```
+
+The stream is disk-backed and single-use. Close the Arrow reader when finished
+so its staged temporary file is deleted; if you consume the 'nanoarrow' stream
+directly, call `stream[["release"]]()`. Do not rely on garbage collection for
+this cleanup. `version` can select an earlier Delta table version when that
+history is available:
+
+```{r, eval = FALSE}
+older_rows <- lakehouse$read_table(
+  table = "orders",
+  version = 42L,
+  limit = 100L
+)
+```
+
+`fabric_onelake_read_delta_table()` is the lower-level reader for compatible
+Delta paths in Lakehouses and Warehouses. Prefer the Lakehouse wrapper for a
+normal discovered-table workflow.

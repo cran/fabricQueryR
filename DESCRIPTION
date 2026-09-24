@@ -1,6 +1,6 @@
 Package: fabricQueryR
-Title: Query Data in 'Microsoft Fabric'
-Version: 0.2.1
+Title: Access and Manage 'Microsoft Fabric'
+Version: 1.0.0
 Authors@R: 
     c(person(given = "Luka",
              family = "Koning",
@@ -9,27 +9,35 @@ Authors@R:
       person(given = "Kennispunt Twente",
              role = "fnd",
              email = "info@kennispunttwente.nl"))
-Description: 
-    Query data hosted in 'Microsoft Fabric'. Provides helpers to open 'DBI'
-    connections to 'SQL' endpoints of 'Lakehouse' and 'Data Warehouse' items; submit
-    'Data Analysis Expressions' ('DAX') queries to semantic model datasets in 'Microsoft
-    Fabric' and 'Power BI'; read 'Delta Lake' tables stored in 'OneLake'
-    ('Azure Data Lake Storage Gen2'); and execute 'Spark' code via the 'Livy API'. 
+Description: Access 'Microsoft Fabric' workspaces, items, and workload
+    endpoints through its web application programming interfaces (APIs).
+    Connect to data in 'OneLake', 'Lakehouse', 'Warehouse', semantic model,
+    and 'Eventhouse' items, with support for 'DBI', 'Arrow', 'GraphQL', and
+    'Spark'. Manage files, tables, refreshes, jobs, schedules, ingestion,
+    and long-running operations.
 License: MIT + file LICENSE
-Suggests: AzureStor, DBI, odbc, readr, fs, arrow, testthat (>= 3.0.0)
+Suggests: adbcdrivermanager, adbi, arrow (>= 17.0.0), DBI (>= 1.2.0),
+        dplyr, knitr, lifecycle, odbc, processx, purrr, rmarkdown,
+        testthat (>= 3.2.0), waldo, webfakes, withr
+VignetteBuilder: knitr
+Additional_repositories: https://r-dbi.r-universe.dev
 Config/testthat/edition: 3
+Config/Needs/ci:
+        adbcdrivermanager=url::https://cloud.r-project.org/src/contrib/Archive/adbcdrivermanager/adbcdrivermanager_0.23.0-2.tar.gz,
+        adbi=url::https://cloud.r-project.org/src/contrib/Archive/adbi/adbi_0.1.2.tar.gz
 Encoding: UTF-8
-RoxygenNote: 7.3.3
-Imports: AzureAuth, httr2, dplyr, tibble, purrr, stringr, jsonlite,
-        cli, rlang, utils
+Imports: AzureAuth, bit64, httr2 (>= 1.2.0), R6, vctrs, tibble,
+        jsonlite, methods, cli (>= 3.4.0), nanoarrow (>= 0.8.0),
+        reticulate (>= 1.41), rlang (>= 0.4.10), utils
 URL: https://github.com/kennispunttwente/fabricQueryR,
         https://kennispunttwente.github.io/fabricQueryR/
 BugReports: https://github.com/kennispunttwente/fabricQueryR/issues
 Depends: R (>= 4.1.0)
+Config/roxygen2/version: 8.1.0
 NeedsCompilation: no
-Packaged: 2026-04-03 17:11:16 UTC; dhrko
+Packaged: 2026-09-23 21:25:45 UTC; dhrko
 Author: Luka Koning [aut, cre, cph],
   Kennispunt Twente [fnd]
 Maintainer: Luka Koning <koningluka@gmail.com>
 Repository: CRAN
-Date/Publication: 2026-04-03 21:50:20 UTC
+Date/Publication: 2026-09-24 09:00:02 UTC

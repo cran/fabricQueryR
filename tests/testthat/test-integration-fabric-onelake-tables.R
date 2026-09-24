@@ -1,0 +1,697 @@
+# Fabric integration coverage: schema-aware table metadata and managed loads
+
+test_that("table writer staging collisions preserve existing directory contents", {
+  fabric_test_require_package("arrow")
+  manifest <- fabric_test_manifest()
+  lakehouse <- fabric_test_manifest_item(manifest, "TestLakehouse")
+  warehouse <- fabric_test_manifest_item(manifest, "TestWarehouse")
+  token <- fabric_test_token_provider()
+  root <- paste0("Files/fabricqueryr-collision-", basename(tempfile()))
+  path <- paste0(root, "/existing/marker.txt")
+  marker <- charToRaw("belongs to a different operation")
+  root_target <- onelake_resolve_target(
+    manifest$workspace_id,
+    lakehouse$id,
+    paste0(root, "/marker.txt")
+  )
+  onelake_reserve_staging(root_target, fabric_credential(token = token))
+  on.exit(
+    fabric_onelake_delete(
+      manifest$workspace_id,
+      lakehouse$id,
+      root,
+      recursive = TRUE,
+      confirm = TRUE,
+      token = token
+    ),
+    add = TRUE
+  )
+  fabric_onelake_upload(
+    manifest$workspace_id,
+    lakehouse$id,
+    path,
+    source = marker,
+    token = token
+  )
+  local_mocked_bindings(
+    .fabric_lakehouse_staging_id = function() "existing",
+    .fabric_warehouse_staging_id = function() "existing"
+  )
+  for (kind in c("lakehouse", "warehouse")) {
+    writer <- if (kind == "lakehouse") {
+      function() {
+        fabric_lakehouse_write_table(
+          lakehouse,
+          "collision_test",
+          data.frame(id = 1L),
+          workspace = manifest$workspace_id,
+          staging_root = root,
+          keep_staging_on_failure = FALSE,
+          token = token
+        )
+      }
+    } else {
+      function() {
+        fabric_warehouse_write_table(
+          warehouse,
+          "collision_test",
+          data.frame(id = 1L),
+          workspace = manifest$workspace_id,
+          staging_lakehouse = lakehouse,
+          staging_root = root,
+          keep_staging_on_failure = FALSE,
+          token = token
+        )
+      }
+    }
+    error <- tryCatch(writer(), error = identity)
+    expect_s3_class(error, "fabric_http_error")
+    expect_in(error$status, c(409L, 412L))
+    expect_identical(
+      fabric_onelake_download(
+        manifest$workspace_id,
+        lakehouse$id,
+        path,
+        token = token
+      ),
+      marker
+    )
+  }
+})
+
+test_that("OneLake table metadata APIs report existence", {
+  manifest <- fabric_test_manifest()
+  lakehouse <- fabric_test_manifest_item(manifest, "TestLakehouse")
+  target <- fabric_test_lakehouse_table_target(manifest, lakehouse)
+  token <- fabric_test_token_provider()
+  missing <- paste0("fabricqueryr_missing_", Sys.getpid())
+  for (protocol in c("delta", "iceberg")) {
+    expect_identical(
+      fabric_onelake_table_exists(
+        target,
+        missing,
+        schema = missing,
+        protocol = protocol,
+        token = token
+      ),
+      FALSE
+    )
+  }
+
+  expect_true(fabric_onelake_schema_exists(
+    target,
+    lakehouse$schema,
+    token = token
+  ))
+  expect_false(fabric_onelake_schema_exists(
+    target,
+    missing,
+    token = token
+  ))
+  expect_true(fabric_onelake_table_exists(
+    target,
+    lakehouse$tables$basic,
+    schema = lakehouse$schema,
+    token = token
+  ))
+  expect_false(fabric_onelake_table_exists(
+    target,
+    missing,
+    schema = lakehouse$schema,
+    token = token
+  ))
+  expect_true(fabric_onelake_schema_exists(
+    target,
+    lakehouse$schema,
+    protocol = "iceberg",
+    token = token
+  ))
+  expect_false(fabric_onelake_schema_exists(
+    target,
+    missing,
+    protocol = "iceberg",
+    token = token
+  ))
+  expect_true(fabric_onelake_table_exists(
+    target,
+    lakehouse$tables$basic,
+    schema = lakehouse$schema,
+    protocol = "iceberg",
+    token = token
+  ))
+  expect_false(fabric_onelake_table_exists(
+    target,
+    missing,
+    schema = lakehouse$schema,
+    protocol = "iceberg",
+    token = token
+  ))
+})
+
+test_that("Lakehouse tables list and load CSV and Parquet end to end", {
+  fabric_test_require_package("arrow")
+  fabric_test_require_package("DBI")
+  fabric_test_require_package("odbc")
+  manifest <- fabric_test_manifest()
+  fabric_test_use_table_delta_runtime()
+  lakehouse <- fabric_test_manifest_item(manifest, "TestLakehouse")
+  target <- fabric_test_lakehouse_table_target(manifest, lakehouse)
+  token <- fabric_test_token_provider()
+  schema <- lakehouse$schema
+  csv_table <- "fabricqueryr_csv_load"
+  parquet_table <- "fabricqueryr_r_load"
+
+  schemas <- fabric_lakehouse_schemas(target, page_size = 1L, token = token)
+  expect_true(schema %in% schemas$name)
+
+  # Force multiple metadata pages and retain the schema record associated with
+  # every table row
+  initial <- fabric_lakehouse_tables(
+    target,
+    detail = FALSE,
+    page_size = 1L,
+    token = token
+  )
+  expect_s3_class(initial, "tbl_df")
+  expect_true(all(nzchar(initial$name)))
+  expect_true(all(nzchar(initial$schema)))
+  if (nrow(initial)) {
+    expect_true(all(vapply(
+      seq_len(nrow(initial)),
+      function(index) {
+        identical(
+          initial$schema_metadata[[index]]$name,
+          initial$schema[[index]]
+        )
+      },
+      logical(1)
+    )))
+  }
+
+  # The staged CSV fixture covers both overwrite and append through the direct
+  # file-loading API
+  csv_overwrite <- fabric_lakehouse_load_table(
+    target,
+    table = csv_table,
+    path = "Files/fixtures/basic.csv",
+    format = "Csv",
+    mode = "Overwrite",
+    header = TRUE,
+    delimiter = ",",
+    token = token
+  )
+  csv_overwrite_state <- fabric_operation_wait(csv_overwrite, timeout = 900)
+  expect_equal(csv_overwrite_state$status, "Succeeded")
+  csv_overwrite_result <- fabric_operation_result(
+    csv_overwrite_state,
+    wait = FALSE
+  )
+  expect_s3_class(csv_overwrite_result, "fabric_operation_result")
+  expect_true(is.list(csv_overwrite_result$value))
+  expect_null(csv_overwrite_result$operation$result_url)
+
+  csv_append <- fabric_lakehouse_load_table(
+    target,
+    table = csv_table,
+    path = "Files/fixtures/basic.csv",
+    format = "Csv",
+    mode = "Append",
+    token = token
+  )
+  csv_append_state <- fabric_operation_wait(csv_append, timeout = 900)
+  expect_equal(csv_append_state$status, "Succeeded")
+
+  csv_rows <- fabric_test_eventually(function() {
+    value <- fabric_onelake_read_delta_table(
+      table_path = csv_table,
+      workspace_name = manifest$workspace_id,
+      lakehouse_name = lakehouse$id,
+      schema = schema,
+      token = token,
+      verbose = FALSE
+    )
+    if (nrow(value) != 6L) {
+      return(NULL)
+    }
+    value
+  })
+  expect_equal(as.integer(sort(csv_rows$id)), sort(rep(1:3, 2L)))
+  expect_equal(sum(is.na(csv_rows$amount)), 2L)
+
+  # The R workflow covers Unicode names, nulls, exact 64-bit integers, dates,
+  # timestamps, overwrite, append, and confirmed staging cleanup
+  unicode_name <- "caf\u00e9_\u6570\u636e"
+  first <- data.frame(
+    id = 1:2,
+    whole = bit64::as.integer64(c("9007199254740993", NA)),
+    amount = c(10.5, NA),
+    active = c(TRUE, FALSE),
+    event_date = as.Date(c("2026-01-01", "2026-01-02")),
+    event_time = as.POSIXct(
+      c("2026-01-01 10:00:00", "2026-01-02 11:30:00"),
+      tz = "UTC"
+    ),
+    stringsAsFactors = FALSE
+  )
+  first[[unicode_name]] <- c("\u00e9\u00e9n", NA)
+  overwrite <- fabric_lakehouse_write_table(
+    target,
+    table = parquet_table,
+    data = first,
+    mode = "Overwrite",
+    timeout = 900,
+    token = token
+  )
+  expect_equal(overwrite$operation_status$status, "Succeeded")
+  expect_false(overwrite$staging_retained)
+
+  second <- data.frame(
+    id = 3L,
+    whole = bit64::as.integer64("9007199254740995"),
+    amount = 30,
+    active = TRUE,
+    event_date = as.Date("2026-01-03"),
+    event_time = as.POSIXct("2026-01-03 12:45:00", tz = "UTC"),
+    stringsAsFactors = FALSE
+  )
+  second[[unicode_name]] <- "drie"
+  append <- fabric_lakehouse_write_table(
+    target,
+    table = parquet_table,
+    data = second,
+    mode = "Append",
+    timeout = 900,
+    token = token
+  )
+  expect_equal(append$operation_status$status, "Succeeded")
+  expect_false(append$staging_retained)
+
+  delta_rows <- fabric_test_eventually(function() {
+    value <- fabric_onelake_read_delta_table(
+      table_path = parquet_table,
+      workspace_name = manifest$workspace_id,
+      lakehouse_name = lakehouse$id,
+      schema = schema,
+      token = token,
+      verbose = FALSE
+    )
+    if (nrow(value) != 3L) {
+      return(NULL)
+    }
+    value[order(value$id), ]
+  })
+  expect_named(delta_rows, names(first), ignore.order = TRUE)
+  expect_equal(delta_rows$id, 1:3)
+  expect_equal(
+    as.character(delta_rows$whole),
+    c("9007199254740993", NA, "9007199254740995")
+  )
+  expect_equal(
+    delta_rows[[unicode_name]],
+    c("\u00e9\u00e9n", NA, "drie")
+  )
+  expect_equal(delta_rows$amount, c(10.5, NA, 30))
+  expect_identical(delta_rows$active, c(TRUE, FALSE, TRUE))
+  expect_equal(
+    as.Date(delta_rows$event_date),
+    as.Date(c(
+      "2026-01-01",
+      "2026-01-02",
+      "2026-01-03"
+    ))
+  )
+  expect_equal(
+    as.numeric(delta_rows$event_time),
+    as.numeric(c(first$event_time, second$event_time))
+  )
+
+  # The SQL analytics endpoint is eventually consistent with Lakehouse Delta
+  # metadata, so retry only the read-only verification query
+  sql_rows <- fabric_test_eventually(function() {
+    value <- fabric_sql_query(
+      numeric_policy = "driver",
+      server = lakehouse$sql_endpoint,
+      database = lakehouse$display_name,
+      sql = paste0(
+        "SELECT COUNT_BIG(*) AS row_count, ",
+        "SUM(CASE WHEN [",
+        unicode_name,
+        "] IS NULL THEN 1 ELSE 0 END) AS null_count, ",
+        "CAST(MAX(whole) AS varchar(30)) AS max_whole ",
+        "FROM [",
+        schema,
+        "].[",
+        parquet_table,
+        "]"
+      ),
+      token = token,
+      verbose = FALSE
+    )
+    if (as.numeric(value$row_count[[1L]]) != 3) {
+      return(NULL)
+    }
+    value
+  })
+  expect_equal(as.numeric(sql_rows$row_count), 3)
+  expect_equal(as.numeric(sql_rows$null_count), 1)
+  expect_equal(sql_rows$max_whole, "9007199254740995")
+
+  discovered <- fabric_lakehouse_tables(
+    target,
+    schema = schema,
+    detail = FALSE,
+    page_size = 1L,
+    token = token
+  )
+  expect_true(all(c(csv_table, parquet_table) %in% discovered$name))
+  expect_true(all(
+    toupper(discovered$format[
+      discovered$name %in%
+        c(
+          csv_table,
+          parquet_table
+        )
+    ]) ==
+      "DELTA"
+  ))
+  single <- fabric_lakehouse_table(
+    target,
+    parquet_table,
+    schema = schema,
+    token = token
+  )
+  expect_equal(single$name, parquet_table)
+  expect_equal(single$schema, schema)
+  expect_true(length(single$columns[[1L]]) > 0L)
+})
+
+test_that("mirrored database discovery and table helpers work end to end", {
+  fabric_test_require_package("DBI")
+  fabric_test_require_package("odbc")
+  manifest <- fabric_test_manifest()
+  fabric_test_use_table_delta_runtime()
+  provisioned <- fabric_test_manifest_item(
+    manifest,
+    "TestMirroredDatabase"
+  )
+  token <- fabric_test_token_provider()
+
+  workspaces <- fabric_workspaces(
+    token = token,
+    prefer_workspace_endpoints = TRUE
+  )
+  workspace <- Filter(
+    function(x) identical(x$id, manifest$workspace_id),
+    workspaces
+  )[[1L]]
+  databases <- fabric_mirrored_databases(
+    workspace,
+    detail = TRUE,
+    token = token
+  )
+  matches <- Filter(
+    function(database) identical(database$id, provisioned$id),
+    databases
+  )
+  expect_length(matches, 1L)
+  target <- matches[[1L]]
+  expect_identical(
+    target$workspaceOneLakeDfsEndpoint,
+    workspace$oneLakeEndpoints$dfsEndpoint
+  )
+  expect_equal(target$type, "MirroredDatabase")
+  expect_equal(target$default_schema, provisioned$schema)
+  expect_match(target$one_lake_tables_path, provisioned$id, fixed = TRUE)
+  expect_true(nzchar(target$sql_server))
+
+  schemas <- fabric_test_eventually(function() {
+    value <- fabric_mirrored_database_schemas(
+      target,
+      page_size = 1L,
+      token = token
+    )
+    if (!provisioned$schema %in% value$name) {
+      return(NULL)
+    }
+    value
+  })
+  expect_true(provisioned$schema %in% schemas$name)
+
+  table <- fabric_test_eventually(function() {
+    tables <- fabric_mirrored_database_tables(
+      target,
+      schema = provisioned$schema,
+      detail = TRUE,
+      page_size = 1L,
+      token = token
+    )
+    row <- tables[
+      tables$name == provisioned$tables$types,
+      ,
+      drop = FALSE
+    ]
+    if (nrow(row) != 1L || !length(row$columns[[1L]])) {
+      return(NULL)
+    }
+    row
+  })
+  expect_equal(table$schema, provisioned$schema)
+  expect_equal(toupper(table$format), "DELTA")
+  expect_equal(
+    vapply(table$columns[[1L]], `[[`, character(1), "name"),
+    c("id", "name", "amount")
+  )
+
+  single <- fabric_mirrored_database_table(
+    target,
+    provisioned$tables$types,
+    schema = provisioned$schema,
+    token = token
+  )
+  expect_equal(single$name, table$name)
+  expect_equal(single$schema, table$schema)
+  expect_equal(
+    vapply(single$columns[[1L]], `[[`, character(1), "name"),
+    vapply(table$columns[[1L]], `[[`, character(1), "name")
+  )
+
+  rows <- fabric_mirrored_database_read_table(
+    target,
+    single,
+    columns = c("id", "name", "amount"),
+    token = token,
+    verbose = FALSE
+  )
+  rows <- rows[order(rows$id), ]
+  expect_s3_class(rows, "tbl_df")
+  expect_equal(rows$id, 1:3)
+  expect_equal(rows$name, c("alpha", "beta", "gamma"))
+  expect_equal(rows$amount, c(10.5, 20, NA))
+
+  sql_table <- fabric_test_eventually(function() {
+    tables <- fabric_sql_tables(
+      target,
+      schema = provisioned$schema,
+      detail = TRUE,
+      backend = "odbc",
+      token = token,
+      verbose = FALSE
+    )
+    row <- tables[
+      tables$name == provisioned$tables$types,
+      ,
+      drop = FALSE
+    ]
+    if (nrow(row) != 1L || !length(row$columns[[1L]])) {
+      return(NULL)
+    }
+    row
+  })
+  sql_rows <- fabric_sql_read_table(
+    numeric_policy = "driver",
+    target,
+    sql_table,
+    columns = c("id", "name", "amount"),
+    limit = 3L,
+    backend = "odbc",
+    token = token,
+    verbose = FALSE
+  )
+  sql_rows <- sql_rows[order(sql_rows$id), ]
+  expect_equal(sql_rows$id, 1:3)
+  expect_equal(sql_rows$name, c("alpha", "beta", "gamma"))
+  expect_equal(as.numeric(sql_rows$amount), c(10.5, 20, NA))
+})
+
+test_that("Lakehouse writer retains a recoverable staging path on failure", {
+  fabric_test_require_package("arrow")
+  manifest <- fabric_test_manifest()
+  lakehouse <- fabric_test_manifest_item(manifest, "TestLakehouse")
+  target <- fabric_test_lakehouse_table_target(manifest, lakehouse)
+  token <- fabric_test_token_provider()
+  failed_table <- "fabricqueryr_expected_failure"
+
+  seeded <- fabric_lakehouse_write_table(
+    target,
+    table = failed_table,
+    data = data.frame(id = 1L),
+    mode = "Overwrite",
+    timeout = 900,
+    token = token
+  )
+  expect_equal(seeded$operation_status$status, "Succeeded")
+
+  failure <- tryCatch(
+    fabric_lakehouse_write_table(
+      target,
+      table = failed_table,
+      data = data.frame(id = "not-an-integer"),
+      mode = "Append",
+      timeout = 300,
+      token = token
+    ),
+    error = identity
+  )
+  staging_path <- failure[["staging_path"]]
+  safe_staging_path <- is.character(staging_path) &&
+    length(staging_path) == 1L &&
+    !is.na(staging_path) &&
+    grepl(
+      "^Files/fabricqueryr-staging/load-[A-Za-z0-9_-]+$",
+      staging_path
+    )
+  staging_removed <- FALSE
+  remove_staging <- function() {
+    if (!isTRUE(safe_staging_path)) {
+      return(FALSE)
+    }
+    fabric_onelake_delete(
+      manifest$workspace_id,
+      lakehouse$id,
+      staging_path,
+      recursive = TRUE,
+      confirm = TRUE,
+      token = token
+    )
+  }
+  on.exit(
+    if (!staging_removed) {
+      try(remove_staging(), silent = TRUE)
+    },
+    add = TRUE
+  )
+  expect_s3_class(failure, "fabric_lakehouse_write_error")
+  expect_true(failure$staging_retained)
+  expect_true(safe_staging_path)
+  retained <- fabric_onelake_list(
+    manifest$workspace_id,
+    lakehouse$id,
+    staging_path,
+    recursive = TRUE,
+    token = token
+  )
+  expect_equal(sum(!retained$is_directory), 1L)
+  expect_gt(sum(retained$content_length, na.rm = TRUE), 0)
+
+  # A rejected append must leave the committed destination unchanged
+  destination_rows <- fabric_test_eventually(function() {
+    value <- fabric_onelake_read_delta_table(
+      table_path = failed_table,
+      workspace_name = manifest$workspace_id,
+      lakehouse_name = lakehouse$id,
+      schema = lakehouse$schema,
+      token = token,
+      verbose = FALSE
+    )
+    if (nrow(value) != 1L) {
+      return(NULL)
+    }
+    value
+  })
+  expect_equal(destination_rows$id, 1L)
+
+  # The retained source is complete and can be submitted again after fixing
+  # the destination problem
+  recovered <- fabric_lakehouse_load_table(
+    target,
+    table = "fabricqueryr_recovered_load",
+    path = staging_path,
+    path_type = "Folder",
+    format = "Parquet",
+    mode = "Overwrite",
+    file_extension = "parquet",
+    token = token
+  )
+  recovered_state <- fabric_operation_wait(recovered, timeout = 900)
+  expect_equal(recovered_state$status, "Succeeded")
+  recovered_rows <- fabric_test_eventually(function() {
+    value <- fabric_onelake_read_delta_table(
+      table_path = "fabricqueryr_recovered_load",
+      workspace_name = manifest$workspace_id,
+      lakehouse_name = lakehouse$id,
+      schema = lakehouse$schema,
+      token = token,
+      verbose = FALSE
+    )
+    if (nrow(value) != 1L) {
+      return(NULL)
+    }
+    value
+  })
+  expect_equal(recovered_rows$id, "not-an-integer")
+
+  staging_removed <- isTRUE(remove_staging())
+  expect_true(staging_removed)
+})
+
+test_that("Lakehouse writer streams a lazy Arrow Dataset end to end", {
+  fabric_test_require_package("arrow")
+  manifest <- fabric_test_manifest()
+  fabric_test_use_table_delta_runtime()
+  lakehouse <- fabric_test_manifest_item(manifest, "TestLakehouse")
+  target <- fabric_test_lakehouse_table_target(manifest, lakehouse)
+  token <- fabric_test_token_provider()
+  table <- "fabricqueryr_lazy_arrow_load"
+  dataset_path <- tempfile("fabricqueryr-lazy-lakehouse-")
+  dir.create(dataset_path)
+  on.exit(unlink(dataset_path, recursive = TRUE, force = TRUE), add = TRUE)
+  arrow::write_parquet(
+    data.frame(id = 1:2, label = c("a", "b")),
+    file.path(dataset_path, "part-1.parquet")
+  )
+  arrow::write_parquet(
+    data.frame(id = 3:5, label = c("c", "d", "e")),
+    file.path(dataset_path, "part-2.parquet")
+  )
+
+  result <- fabric_lakehouse_write_table(
+    target,
+    table = table,
+    data = arrow::open_dataset(dataset_path),
+    mode = "Overwrite",
+    max_rows_per_file = 2,
+    timeout = 900,
+    token = token
+  )
+  expect_equal(result$operation_status$status, "Succeeded")
+  expect_equal(result$rows, 5)
+  expect_equal(result$file_count, 3L)
+  expect_false(result$staging_retained)
+
+  rows <- fabric_test_eventually(function() {
+    value <- fabric_onelake_read_delta_table(
+      table_path = table,
+      workspace_name = manifest$workspace_id,
+      lakehouse_name = lakehouse$id,
+      schema = lakehouse$schema,
+      token = token,
+      verbose = FALSE
+    )
+    if (nrow(value) != 5L) {
+      return(NULL)
+    }
+    value[order(value$id), ]
+  })
+  expect_equal(rows$id, 1:5)
+  expect_equal(rows$label, letters[1:5])
+})

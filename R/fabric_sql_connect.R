@@ -1,243 +1,2235 @@
-#' @title
-#' Connect to a Microsoft Fabric SQL endpoint
+#' Get connection details for a Fabric SQL item
 #'
-#' @description
-#' Opens a DBI/ODBC connection to a Microsoft Fabric **Data Warehouse** or
-#' **Lakehouse SQL endpoint**, authenticating with Azure AD (MSAL v2)
-#' and passing an access token to the ODBC driver.
+#' Shows the server, database, port, and item type that 'fabricQueryR' will use
+#' for a Fabric SQL connection. Most users can pass a discovered item directly to
+#' [fabric_sql_connect()] and do not need to call this helper
+#'
+#' @param server A Fabric SQL server name, a complete connection string copied
+#'   from the Fabric portal, or one Lakehouse, Warehouse, Warehouse snapshot,
+#'   or SQL Database object returned by a discovery function. A discovered
+#'   object is usually simplest because it also supplies the database name
+#' @param database Optional catalog/database. An explicit value overrides a
+#'   database found in `server`. For a bare endpoint, supply the item database
+#'   shown with its connection string in Fabric. If omitted, Warehouse and SQL
+#'   analytics endpoints open Fabric's `master` context, which is useful for
+#'   discovery but does not select the item's tables
+#' @param target_type Kind of Fabric SQL item. Keep `"auto"` unless a custom
+#'   hostname prevents 'fabricQueryR' from identifying it
+#' @param port Optional TCP port. An explicit value overrides a port in
+#'   `server`; otherwise the standard SQL port, 1433, is used
+#'
+#' @return A `fabric_sql_connection_info` list with `server`, `database`,
+#'   `port`, `target_type`, and `source` (whether the input was text or a
+#'   discovery object). No connection is opened
+#' @examples
+#' \dontrun{
+#' # Discover a Warehouse object that already contains its SQL endpoint
+#' workspace <- fabric_workspaces()[[1L]]
+#' # `$warehouses()` calls fabric_warehouses()
+#' warehouse <- workspace$warehouses()[[1L]]
+#'
+#' # Inspect connection details without opening a database connection
+#' info <- fabric_sql_connection_info(warehouse)
+#' info[c("server", "database", "port", "target_type")]
+#' }
+#' @export
+fabric_sql_connection_info <- function(
+  server,
+  database = NULL,
+  target_type = c(
+    "auto",
+    "lakehouse",
+    "warehouse",
+    "sql_database",
+    "sql_analytics_endpoint"
+  ),
+  port = NULL
+) {
+  # 1 Validate caller options ----------------------------------------------------------------------
+
+  # Check caller options now so later code can rely on safe input
+
+  target_type <- match.arg(target_type)
+  if (!is.null(database)) {
+    fabric_sql_scalar(database, "database")
+  }
+
+  if (!is.null(port)) {
+    fabric_sql_port(port)
+  }
+
+  # 2 Resolve discovery or text input --------------------------------------------------------------
+
+  # Discovery records can supply a server, database, and known Fabric item type
+
+  record <- fabric_as_record(server)
+  discovered_type <- NULL
+  connection_string <- NULL
+
+  if (!is.null(record)) {
+    # Only SQL-capable discovery records may become connection targets
+    discovered_type <- tolower(fabric_record_value(record, "type") %||% "")
+    if (
+      !discovered_type %in%
+        c(
+          "lakehouse",
+          "warehouse",
+          "warehousesnapshot",
+          "mirroreddatabase",
+          "sqldatabase"
+        )
+    ) {
+      .fabric_abort(
+        paste0(
+          "SQL connections require a discovered Lakehouse, Warehouse, ",
+          "WarehouseSnapshot, MirroredDatabase, or SQLDatabase item"
+        ),
+        class = "fabric_sql_target_error"
+      )
+    }
+
+    # Prefer a complete connection string, then fall back to separate fields
+    connection_string <- fabric_record_value(
+      record,
+      "sql_connection_string",
+      "connectionString"
+    )
+    server_value <- connection_string %||%
+      fabric_record_value(
+        record,
+        "sql_server",
+        "serverFqdn"
+      )
+    database <- database %||%
+      fabric_record_value(
+        record,
+        "sql_database",
+        "databaseName"
+      )
+  } else {
+    server_value <- server
+  }
+
+  # Normalize copied connection strings and direct server names identically
+  fabric_sql_scalar(server_value, "server")
+  parsed <- fabric_parse_sql_connection_string(server_value)
+  database <- database %||% parsed$database
+  # Use the display name only when no authoritative catalog is available.
+  if (
+    !is.null(record) &&
+      is.null(database) &&
+      discovered_type %in%
+        c(
+          "lakehouse",
+          "warehouse",
+          "warehousesnapshot",
+          "mirroreddatabase"
+        )
+  ) {
+    database <- fabric_record_value(record, "displayName")
+  }
+  if (!is.null(database) && !nzchar(trimws(database))) {
+    .fabric_abort(
+      "database must be one non-empty character value when supplied",
+      class = c("fabric_sql_database_error", "fabric_sql_target_error")
+    )
+  }
+
+  # 3 Infer connection details ---------------------------------------------------------------------
+
+  # Infer connection details from the available context before applying defaults
+
+  resolved_type <- target_type
+  if (identical(target_type, "auto")) {
+    resolved_type <- switch(
+      discovered_type %||% "",
+      lakehouse = "lakehouse",
+      warehouse = "warehouse",
+      warehousesnapshot = "warehouse",
+      mirroreddatabase = "sql_analytics_endpoint",
+      sqldatabase = "sql_database",
+      fabric_infer_sql_target(parsed$server)
+    )
+  }
+  resolved_port <- port %||% parsed$port %||% 1433L
+  fabric_sql_port(resolved_port)
+
+  # 4 Return normalized connection information -----------------------------------------------------
+
+  # Return normalized connection information in the stable form expected by the caller
+
+  structure(
+    list(
+      server = parsed$server,
+      database = if (is.null(database)) NULL else trimws(database),
+      port = as.integer(resolved_port),
+      target_type = resolved_type,
+      source = if (is.null(record)) "character" else "discovery"
+    ),
+    class = c("fabric_sql_connection_info", "list")
+  )
+}
+
+#' Connect to a Microsoft Fabric SQL target
+#'
+#' Opens a 'DBI' connection to a Fabric Warehouse, Warehouse snapshot,
+#' Lakehouse, mirrored database, or SQL Database. Use the connection with
+#' familiar 'DBI'
+#' functions such as [DBI::dbListTables()] and [DBI::dbGetQuery()]
 #'
 #' @details
-#' - `server` is the Microsoft Fabric SQL connection string, e.g.
-#'   `"xxxx.datawarehouse.fabric.microsoft.com"`.
-#'   You can find this by going to your **Lakehouse** or **Data Warehouse** item,
-#'   then **Settings** -> **SQL analytics endpoint** -> **SQL connection string**.
-#'   You may also pass a DSN-less `Server=...` string; it will be normalized.
-#' - By default we request a token for
-#'   `https://database.windows.net/.default`.
-#' - \pkg{AzureAuth} is used to acquire the token. Be wary of
-#'  caching behavior; you may want to call [AzureAuth::clean_token_directory()]
-#'  to clear cached tokens if you run into issues
+#' The easiest input is an item returned by [fabric_warehouses()],
+#' [fabric_lakehouses()], [fabric_mirrored_databases()], or
+#' [fabric_sql_databases()]. You can also paste a SQL connection string from
+#' Fabric. Lakehouse and mirrored database SQL endpoints are read-only; use the
+#' source system, Spark, or another appropriate writer to change their data
 #'
-#' @param server Character. Microsoft Fabric SQL connection string or `Server=...` string
-#' (see details).
-#' @param database Character. Database name. Defaults to `"Lakehouse"`.
-#' @param tenant_id Character. Entra ID (AAD) tenant GUID. Defaults to
-#'   `Sys.getenv("FABRICQUERYR_TENANT_ID")`.
-#' @param client_id Character. App registration (client) ID. Defaults to
-#'   `Sys.getenv("FABRICQUERYR_CLIENT_ID")`, falling back to the Azure CLI app id
-#'   `"04b07795-8ddb-461a-bbee-02f9e1bf7b46"` if unset.
-#' @param access_token Optional character. If supplied, use this bearer token
-#'   instead of acquiring a new one via `{AzureAuth}`.
-#' @param odbc_driver Character. ODBC driver name. Defaults to
-#'   `getOption("fabricqueryr.sql.driver", "ODBC Driver 18 for SQL Server")`.
-#' @param port Integer. TCP port (default 1433).
-#' @param encrypt,trust_server_certificate Character flags passed to ODBC.
-#'   Defaults `"yes"` and `"no"`, respectively.
-#' @param timeout Integer. Login/connect timeout in seconds. Default 30.
-#' @param verbose Logical. Emit progress via `{cli}`. Default `TRUE`.
-#' @param ... Additional arguments forwarded to [DBI::dbConnect()].
+#' @section Choosing a backend:
+#' `backend = "odbc"` is the default and works well for ordinary 'DBI' use. It
+#' requires Microsoft ODBC Driver 18 or newer. Use `backend = "adbc"` when you
+#' want a native Arrow result path, typically for larger analytical results.
 #'
-#' @return A live `DBIConnection` object.
+#' Install the R packages 'DBI' and 'odbc' for ODBC, or 'DBI', 'adbi', and
+#' 'adbcdrivermanager' for ADBC. 'adbi' is archived on CRAN and is available
+#' from `https://r-dbi.r-universe.dev`; see
+#' `vignette("reading-data", package = "fabricQueryR")` for installation.
+#'
+#' ADBC requires version 1.5.0 or newer of the external `mssql` driver, where
+#' Fabric Data Warehouse support was introduced. Install or update it separately
+#' with `dbc install mssql`. The connected driver must report its version through
+#' the standard ADBC information API
+#'
+#' @section Connection and permissions:
+#' Discovery records and complete portal connection strings normally include
+#' the database. A bare server can omit `database` to open Fabric's `master`
+#' context. Transient connection failures are retried automatically. The user
+#' or application must have access through a workspace role or the item's
+#' **Manage permissions** settings; SQL permissions may further restrict data
+#'
+#' @inheritParams fabric_sql_connection_info
+#' @param backend Connection driver. Use `"odbc"` for ordinary 'DBI' work or
+#'   `"adbc"` for a native Arrow path after installing its `mssql` driver
+#' @param tenant_id Microsoft Entra tenant ID. Defaults to
+#'   `FABRICQUERYR_TENANT_ID`
+#' @param client_id Microsoft Entra application/client ID. Defaults to
+#'   `FABRICQUERYR_CLIENT_ID`, then the Azure CLI application ID
+#' @param token Optional access token or token-provider function. Leave `NULL`
+#'   to let 'fabricQueryR' use its normal sign-in flow
+#' @param auth_args Additional sign-in options passed to
+#'   [AzureAuth::get_azure_token()]
+#' @param odbc_driver ODBC driver name. ODBC Driver 18 for SQL Server is the
+#'   default
+#' @param adbc_driver ADBC driver name or shared-library path. The separately
+#'   installed ADBC Driver Foundry `mssql` driver version 1.5.0 or newer is the
+#'   default requirement
+#' @param encrypt Whether the driver encrypts the connection. Keep the secure
+#'   default, `"yes"`, for Fabric
+#' @param trust_server_certificate Whether to accept a server certificate
+#'   without validating its trust chain. Keep the secure default, `"no"`,
+#'   unless diagnosing a controlled test environment
+#' @param timeout Non-negative whole-number login/connect timeout in seconds;
+#'   `0` lets the driver use an unlimited or driver-specific timeout
+#' @param read_only Whether to ask the driver for a read-only connection. This
+#'   is a connection hint, not a replacement for Fabric or SQL permissions
+#' @param max_tries Maximum attempts after temporary Fabric SQL failures
+#' @param retry_delay Initial delay in seconds before retrying. Later retries
+#'   wait progressively longer, up to 60 seconds
+#' @param verbose Logical. Show authentication, retry, and connection progress
+#' @param ... Additional arguments forwarded to [DBI::dbConnect()]. The former
+#'   named `access_token` argument is consumed here as a deprecated alias for
+#'   `token` and is not forwarded. For ODBC, a caller-supplied `attributes`
+#'   named list is merged with the package-managed `azure_token`; that protected
+#'   attribute cannot be overridden. ODBC authentication, target, driver, and
+#'   TLS options cannot be supplied through `...` because the package validates
+#'   and constructs those settings before attaching the access token. This also
+#'   excludes raw `.connection_string`, `DSN`, and `FileDSN` arguments
+#'   ADBC defaults to `bigint = "integer64"`, so ordinary BIGINT values do not
+#'   have to fit an R 32-bit integer. Supply another `bigint` policy explicitly
+#'   through `...` if needed. Direct DBI reads with `integer64` cannot represent
+#'   the minimum signed BIGINT because 'bit64' reserves that value for `NA`.
+#'   Direct ODBC binding can misinterpret `integer64` parameters as doubles.
+#'   Use [fabric_sql_query()] for its exact parameter handling, use ADBC, or
+#'   supply character parameters with explicit SQL `bigint` casts.
+#'
+#' @return A live `DBIConnection`. Close it with [DBI::dbDisconnect()] when
+#'   finished. For an ADBC connection with child results still registered,
+#'   use `DBI::dbDisconnect(con, force = TRUE)` to release them immediately
+#' @references
+#' [Connect to a Fabric Warehouse or SQL analytics endpoint](https://learn.microsoft.com/en-us/fabric/data-warehouse/how-to-connect)
+#'
+#' [Microsoft Entra authentication in Fabric Data Warehouse](https://learn.microsoft.com/en-us/fabric/data-warehouse/entra-id-authentication)
+#'
+#' [Lakehouse SQL analytics endpoint](https://learn.microsoft.com/en-us/fabric/data-engineering/lakehouse-sql-analytics-endpoint)
+#'
+#' [Download Microsoft ODBC Driver 18 for SQL Server](https://learn.microsoft.com/en-us/sql/connect/odbc/download-odbc-driver-for-sql-server)
+#'
+#' [ADBC `mssql` driver changelog](https://adbc-drivers.org/drivers/mssql/changelog.html)
 #' @export
 #'
 #' @examples
-#' # Example is not executed since it requires configured credentials for Fabric
 #' \dontrun{
-#' con <- fabric_sql_connect(
-#'   server    = "2gxz...qiy.datawarehouse.fabric.microsoft.com",
-#'   database  = "Lakehouse",
-#'   tenant_id = Sys.getenv("FABRICQUERYR_TENANT_ID"),
-#'   client_id = Sys.getenv("FABRICQUERYR_CLIENT_ID")
-#' )
+#' # Discover a Warehouse so no server name or database ID is copied by hand
+#' workspace <- fabric_workspaces()[[1L]]
+#' warehouse <- fabric_warehouses(workspace)[[1L]]
 #'
-#' # List databases
-#' DBI::dbGetQuery(con, "SELECT name FROM sys.databases")
-#'
-#' # List tables
-#' DBI::dbGetQuery(con, "
-#'  SELECT TABLE_SCHEMA, TABLE_NAME
-#'  FROM INFORMATION_SCHEMA.TABLES
-#'  WHERE TABLE_TYPE = 'BASE TABLE'
-#' ")
-#'
-#' # Get a table
-#' df <- DBI::dbReadTable(con, "Customers")
-#' dplyr::glimpse(df)
-#'
+#' # Open a 'DBI' connection, use it, and always disconnect when finished
+#' con <- fabric_sql_connect(warehouse)
+#' table <- DBI::dbListTables(con)[[1L]]
+#' table <- DBI::dbQuoteIdentifier(con, table)
+#' DBI::dbGetQuery(con, paste("SELECT TOP 10 * FROM", table))
 #' DBI::dbDisconnect(con)
+#'
+#' # The ADBC backend can return Arrow-native results when installed
+#' adbc_con <- fabric_sql_connect(warehouse, backend = "adbc")
+#' DBI::dbDisconnect(adbc_con)
 #' }
 fabric_sql_connect <- function(
   server,
-  database = "Lakehouse",
+  database = NULL,
+  target_type = c(
+    "auto",
+    "lakehouse",
+    "warehouse",
+    "sql_database",
+    "sql_analytics_endpoint"
+  ),
+  backend = c("odbc", "adbc"),
   tenant_id = Sys.getenv("FABRICQUERYR_TENANT_ID"),
   client_id = Sys.getenv(
     "FABRICQUERYR_CLIENT_ID",
     unset = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
   ),
-  access_token = NULL,
+  token = NULL,
+  auth_args = list(),
   odbc_driver = getOption(
     "fabricqueryr.sql.driver",
     "ODBC Driver 18 for SQL Server"
   ),
-  port = 1433L,
+  adbc_driver = getOption("fabricqueryr.sql.adbc_driver", "mssql"),
+  port = NULL,
   encrypt = "yes",
   trust_server_certificate = "no",
   timeout = 30L,
+  read_only = FALSE,
   verbose = TRUE,
+  max_tries = 3L,
+  retry_delay = 5,
   ...
 ) {
-  # ---- validation ----
-  stopifnot(
-    is.character(server),
-    length(server) == 1L,
-    nzchar(server),
-    is.character(database),
-    length(database) == 1L,
-    nzchar(database)
-  )
+  # 1 Validate connection options ------------------------------------------------------------------
 
-  # ---- deps ----
-  rlang::check_installed(
-    c("DBI", "odbc"),
-    reason = "to open a Fabric SQL connection"
-  )
+  # Resolve compatibility arguments and backend requirements before signing in
 
-  # ---- access token ----
-  if (is.null(access_token)) {
-    if (!nzchar(tenant_id)) {
-      stop(
-        "tenant_id is required (or set FABRICQUERYR_TENANT_ID env var).",
-        call. = FALSE
+  resolved <- fabric_resolve_token_alias(
+    token = token,
+    dots = list(...),
+    caller = "fabric_sql_connect()"
+  )
+  token <- resolved$token
+  target_type <- match.arg(target_type)
+  backend <- match.arg(backend)
+  if (!is.logical(read_only) || length(read_only) != 1L || is.na(read_only)) {
+    .fabric_abort("read_only must be TRUE or FALSE")
+  }
+  fabric_sql_timeout(timeout)
+  fabric_sql_retry_settings(max_tries, retry_delay)
+  fabric_sql_require_backend(backend)
+  adbc_driver_object <- NULL
+  if (identical(backend, "adbc")) {
+    fabric_sql_scalar(adbc_driver, "adbc_driver")
+    if ("uri" %in% names(resolved$dots)) {
+      .fabric_abort(
+        "fabric_sql_connect() constructs the ADBC uri; uri cannot be supplied in ...",
+        class = "fabric_sql_target_error"
       )
     }
-    if (!nzchar(client_id)) {
-      stop(
-        "client_id is required (or set FABRICQUERYR_CLIENT_ID env var).",
-        call. = FALSE
-      )
-    }
-
-    inform(
-      verbose,
-      "Authenticating with {.pkg AzureAuth} (MSAL v2) for SQL ..."
-    )
-    access_token <- fabric_get_sqldb_token(
-      tenant_id = tenant_id,
-      client_id = client_id
-    )
+    adbc_driver_object <- fabric_sql_load_adbc_driver(adbc_driver)
   }
 
-  # ---- normalize server ----
-  host <- fabric_normalize_server(server)
+  # 2 Resolve target and authentication ------------------------------------------------------------
 
-  # ---- connect via ODBC ----
-  inform(verbose, "Opening ODBC connection to {host} / DB '{database}' ...")
-  con <- DBI::dbConnect(
-    odbc::odbc(),
-    driver = odbc_driver,
-    server = host,
+  # Resolve target and authentication once so later steps use one consistent value
+
+  info <- fabric_sql_connection_info(
+    server = server,
     database = database,
-    Port = as.integer(port),
-    Encrypt = encrypt,
-    TrustServerCertificate = trust_server_certificate,
-    timeout = as.integer(timeout),
-    # Pass Azure AD access token through to the driver
-    attributes = list(azure_token = access_token),
-    ...
+    target_type = target_type,
+    port = port
   )
-  inform(verbose, "Connected.", type = "success")
-  con
+  info$server <- fabric_sql_validate_endpoint(info$server)
+  fabric_require_explicit_custom_token(
+    paste0("https://", info$server),
+    token,
+    "server",
+    allowed_hosts = .fabric_audience_hosts$sql
+  )
+  if (is.null(token)) {
+    inform(
+      verbose,
+      "Authenticating with {.pkg AzureAuth} (MSAL v2) for SQL"
+    )
+  }
+  credential <- fabric_credential(
+    tenant_id = tenant_id,
+    client_id = client_id,
+    token = token,
+    auth_args = auth_args
+  )
+  backend_label <- toupper(backend)
+  message <- if (is.null(info$database)) {
+    "Opening {backend_label} connection to {info$server} / Fabric master context"
+  } else {
+    "Opening {backend_label} connection to {info$server} / DB '{info$database}'"
+  }
+  inform(verbose, message)
+
+  # 3 Build backend arguments ----------------------------------------------------------------------
+
+  # ODBC and ADBC receive the same resolved target through their native option
+  # shapes; access tokens are added fresh inside the retry loop
+
+  odbc_options <- if (identical(backend, "odbc")) {
+    fabric_sql_odbc_options(resolved$dots)
+  } else {
+    list(dots = resolved$dots, attributes = list())
+  }
+  odbc_args <- c(
+    list(
+      backend = backend,
+      driver = odbc_driver,
+      server = paste0("tcp:", info$server, ",", info$port),
+      Encrypt = encrypt,
+      TrustServerCertificate = trust_server_certificate,
+      MARS_Connection = "no",
+      timeout = as.integer(timeout)
+    ),
+    if (!is.null(info$database)) list(database = info$database) else list(),
+    if (isTRUE(read_only)) list(ApplicationIntent = "ReadOnly") else list(),
+    odbc_options$dots
+  )
+
+  # 4 Open the connection --------------------------------------------------------------------------
+
+  # Acquire a fresh token on retries and stop immediately for non-transient
+  # driver failures
+
+  for (attempt in seq_len(as.integer(max_tries))) {
+    # Authentication failures are reported separately from driver failures
+    token_value <- tryCatch(
+      fabric_get_token(
+        credential,
+        .fabric_audience$sql,
+        force_refresh = attempt > 1L
+      ),
+      error = function(error) {
+        .fabric_abort(
+          "Fabric SQL authentication failed while acquiring an access token",
+          class = "fabric_sql_authentication_error",
+          parent = error
+        )
+      }
+    )
+
+    # Build the argument shape expected by the selected database backend
+    connect_args <- if (identical(backend, "odbc")) {
+      c(
+        odbc_args,
+        list(
+          attributes = c(
+            odbc_options$attributes,
+            list(azure_token = token_value)
+          )
+        )
+      )
+    } else {
+      c(
+        list(
+          backend = backend,
+          adbc_driver = adbc_driver_object,
+          uri = fabric_sql_adbc_uri(
+            info = info,
+            token = token_value,
+            encrypt = encrypt,
+            trust_server_certificate = trust_server_certificate,
+            timeout = timeout,
+            read_only = read_only
+          )
+        ),
+        resolved$dots
+      )
+    }
+
+    connection <- tryCatch(
+      do.call(.fabric_sql_db_connect, connect_args),
+      error = function(error) error
+    )
+
+    if (!inherits(connection, "error")) {
+      if (identical(backend, "adbc")) {
+        tryCatch(
+          fabric_sql_validate_adbc_driver(connection, adbc_driver),
+          error = function(error) {
+            try(
+              .fabric_sql_db_disconnect(connection, force = TRUE),
+              silent = TRUE
+            )
+            rlang::cnd_signal(error)
+          }
+        )
+      }
+      inform(verbose, "Connected", type = "success")
+      return(connection)
+    }
+
+    # Stop immediately for permanent failures or after the final attempt
+    if (
+      attempt == as.integer(max_tries) ||
+        !fabric_sql_transient_error(connection)
+    ) {
+      fabric_sql_connection_error(
+        connection,
+        secrets = if (identical(backend, "adbc")) token_value else NULL
+      )
+    }
+
+    delay <- fabric_sql_retry_delay(attempt, retry_delay)
+    inform(
+      verbose,
+      "Transient SQL connection failure; retrying in {delay} seconds"
+    )
+    .fabric_sql_sleep(delay)
+  }
+  .fabric_abort("Fabric SQL connection retry loop ended unexpectedly")
 }
 
-#' Run a SQL query against a Microsoft Fabric SQL endpoint (opening & closing connection)
+#' Run a parameterized query against Microsoft Fabric SQL
 #'
-#' Convenience wrapper that opens a connection with
-#' [fabric_sql_connect()], executes `sql`, and returns a tibble. The
-#' connection is closed on exit.
+#' Runs one SQL query and returns its rows, opening and closing the connection
+#' automatically. Use [fabric_sql_connect()] instead when several operations
+#' should share a connection. Supply changing values through `params` rather
+#' than pasting them into the SQL text
 #'
 #' @inheritParams fabric_sql_connect
-#' @param sql Character scalar. The SQL to run.
+#' @param sql One result-producing T-SQL `SELECT` statement, optionally beginning
+#'   with a common-table-expression `WITH` clause. For DDL or DML, open a
+#'   connection with [fabric_sql_connect()] and call [DBI::dbExecute()]. A
+#'   Lakehouse SQL analytics endpoint is read-only and does not support
+#'   `INSERT`, `UPDATE`, or `DELETE`
+#' @param params Optional list of values for `?` placeholders in `sql`. Values
+#'   are sent separately from the SQL text, which is safer and easier to quote
+#'   correctly than building a query with `paste()`. Factors are bound as their
+#'   character labels on both backends. For ODBC, `bit64::integer64` parameters
+#'   are sent as exact decimal text and their placeholders are cast to `bigint`
+#'   in SQL, preserving numeric operations and missing values. ADBC binds them
+#'   natively. This normalization applies to this query helper; direct DBI
+#'   calls on [fabric_sql_connect()] use the driver's parameter conversion.
+#' @param result Return a `"tibble"` for ordinary R analysis, or a single-use
+#'   `"arrow_stream"`. ADBC streams retain native Arrow types. ODBC streams are
+#'   converted from R data frames and cannot recover values lost by the driver.
+#'   The 'adbi' driver may fetch the complete result before returning
+#'   the stream, so this option does not guarantee bounded-memory retrieval.
+#'   An Arrow stream owns its DBI result and connection until the stream is
+#'   released; consume it promptly or release it explicitly with
+#'   [nanoarrow::nanoarrow_pointer_release()]
+#' @param numeric_policy `"auto"` (default) uses `"driver"` for ODBC and
+#'   `"exact"` for ADBC. Automatic ODBC conversion warns once per R session
+#'   about possible numeric precision loss. Set `"driver"` explicitly to
+#'   accept the driver's conversions without this warning, or use `"exact"`
+#'   to reject unsafe ODBC results before fetching
 #'
-#' @return A tibble with the query results (0 rows if none).
+#'   `"exact"` preserves ADBC decimals as character and BIGINT as
+#'   `bit64::integer64`, using character for columns
+#'   containing the minimum BIGINT. INT columns containing `-2147483648` use
+#'   exact doubles. Nested lists retain character decimals and 64-bit integers,
+#'   and double 32-bit integers. Null struct parents require
+#'   `result = "arrow_stream"`; exact tibble collection raises
+#'   `fabric_arrow_null_struct_error` to preserve their distinction from valid
+#'   structs with all-null fields. ODBC rejects DECIMAL, NUMERIC, INT and BIGINT
+#'   columns before fetching: its conversion can round or truncate values
+#'   or turn valid integer boundaries into missing values. Cast these columns
+#'   to `varchar` in SQL or use ADBC. `"driver"` explicitly accepts the backend's
+#'   conversions, including possible rounding and missing values, for either
+#'   output format. This policy applies to this query helper; direct DBI calls
+#'   on [fabric_sql_connect()] use the selected driver's conversion settings
+#' @param idempotent Logical. Set to `TRUE` only if running the entire statement
+#'   a second time has no unwanted effect (usually a plain `SELECT`). This
+#'   permits a retry when it is unclear whether Fabric executed the first
+#'   attempt
+#'
+#' @return With `result = "tibble"`, a tibble containing the returned rows and
+#'   column types determined by `numeric_policy`. With `result = "arrow_stream"`,
+#'   a single-use `nanoarrow_array_stream` for Arrow-compatible tools
 #' @export
 #'
 #' @examples
-#' # Example is not executed since it requires configured credentials for Fabric
 #' \dontrun{
-#' df <- fabric_sql_query(
-#'   server    = "2gxz...qiy.datawarehouse.fabric.microsoft.com",
-#'   database  = "Lakehouse",
-#'   sql       = "SELECT TOP 100 * FROM sys.objects",
-#'   tenant_id = Sys.getenv("FABRICQUERYR_TENANT_ID"),
-#'   client_id = Sys.getenv("FABRICQUERYR_CLIENT_ID")
+#' # Discover the Warehouse that will receive the query
+#' workspace <- fabric_workspaces()[[1L]]
+#' warehouse <- fabric_warehouses(workspace)[[1L]]
+#'
+#' # Discover and quote a table name through a short 'DBI' connection
+#' con <- fabric_sql_connect(warehouse)
+#' table <- DBI::dbListTables(con)[[1L]]
+#' table <- DBI::dbQuoteIdentifier(con, table)
+#' DBI::dbDisconnect(con)
+#' sql <- paste("SELECT TOP 100 * FROM", table)
+#'
+#' # Run the resulting read-only query and collect a tibble
+#' result <- fabric_sql_query(warehouse, sql, backend = "adbc")
+#'
+#' # Return Arrow-native batches instead of converting to a data frame
+#' stream <- fabric_sql_query(
+#'   warehouse,
+#'   sql,
+#'   backend = "adbc",
+#'   result = "arrow_stream"
 #' )
-#' dplyr::glimpse(df)
+#' reader <- arrow::as_record_batch_reader(stream)
+#' table <- reader$read_table()
 #' }
 fabric_sql_query <- function(
   server,
   sql,
-  database = "Lakehouse",
+  params = NULL,
+  result = c("tibble", "arrow_stream"),
+  database = NULL,
+  target_type = c(
+    "auto",
+    "lakehouse",
+    "warehouse",
+    "sql_database",
+    "sql_analytics_endpoint"
+  ),
+  backend = c("odbc", "adbc"),
   tenant_id = Sys.getenv("FABRICQUERYR_TENANT_ID"),
   client_id = Sys.getenv(
     "FABRICQUERYR_CLIENT_ID",
     unset = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
   ),
-  access_token = NULL,
+  token = NULL,
+  auth_args = list(),
   odbc_driver = getOption(
     "fabricqueryr.sql.driver",
     "ODBC Driver 18 for SQL Server"
   ),
-  port = 1433L,
+  adbc_driver = getOption("fabricqueryr.sql.adbc_driver", "mssql"),
+  port = NULL,
   encrypt = "yes",
   trust_server_certificate = "no",
   timeout = 30L,
+  read_only = FALSE,
   verbose = TRUE,
+  max_tries = 3L,
+  retry_delay = 5,
+  idempotent = FALSE,
+  numeric_policy = c("auto", "exact", "driver"),
   ...
 ) {
-  stopifnot(is.character(sql), length(sql) == 1L, nzchar(sql))
-  con <- fabric_sql_connect(
+  # 1 Validate query options -----------------------------------------------------------------------
+
+  # This convenience function accepts only one result-producing read statement;
+  # callers can use DBI directly for broader SQL workflows
+
+  resolved <- fabric_resolve_token_alias(
+    token = token,
+    dots = list(...),
+    caller = "fabric_sql_query()"
+  )
+  token <- resolved$token
+  result <- match.arg(result)
+  backend <- match.arg(backend)
+  numeric_policy <- match.arg(numeric_policy)
+  fabric_sql_scalar(sql, "sql")
+  fabric_sql_validate_query_statement(sql)
+  if (!is.null(params) && !is.list(params)) {
+    .fabric_abort(
+      "params must be NULL or a list",
+      class = "fabric_sql_execution_error"
+    )
+  }
+
+  if (
+    !is.logical(idempotent) ||
+      length(idempotent) != 1L ||
+      is.na(idempotent)
+  ) {
+    .fabric_abort("idempotent must be TRUE or FALSE")
+  }
+  fabric_sql_retry_settings(max_tries, retry_delay)
+  fabric_sql_require_backend(backend, result = result)
+
+  target_type <- match.arg(target_type)
+  endpoint <- fabric_sql_connection_info(
     server = server,
     database = database,
+    target_type = target_type,
+    port = port
+  )
+  endpoint$server <- fabric_sql_validate_endpoint(endpoint$server)
+  fabric_require_explicit_custom_token(
+    paste0("https://", endpoint$server),
+    token,
+    "server",
+    allowed_hosts = .fabric_audience_hosts$sql
+  )
+
+  # 2 Prepare authentication and parameters --------------------------------------------------------
+
+  # Prepare authentication and parameters once for reuse in the remaining work
+
+  credential <- fabric_credential(
     tenant_id = tenant_id,
     client_id = client_id,
-    access_token = access_token,
-    odbc_driver = odbc_driver,
-    port = port,
-    encrypt = encrypt,
-    trust_server_certificate = trust_server_certificate,
-    timeout = timeout,
-    verbose = verbose,
-    ...
+    token = token,
+    auth_args = auth_args
   )
-  on.exit(try(DBI::dbDisconnect(con), silent = TRUE), add = TRUE)
-  res <- DBI::dbGetQuery(con, sql)
-  tibble::as_tibble(res)
+  params <- .fabric_sql_normalize_params(params)
+  adbc_params <- identical(backend, "adbc") && !is.null(params)
+  query_sql <- if (adbc_params) {
+    fabric_sql_adbc_parameter_sql(sql, params)
+  } else {
+    sql
+  }
+  query_params <- if (adbc_params) {
+    stats::setNames(params, paste0("@p", seq_along(params)))
+  } else {
+    params
+  }
+
+  # 3 Build one-shot connection arguments ----------------------------------------------------------
+
+  # Build one-shot connection arguments from the validated values required by the next step
+
+  connect_args <- c(
+    list(
+      server = server,
+      database = database,
+      target_type = target_type,
+      backend = backend,
+      tenant_id = tenant_id,
+      client_id = client_id,
+      token = credential,
+      auth_args = list(),
+      odbc_driver = odbc_driver,
+      adbc_driver = adbc_driver,
+      port = port,
+      encrypt = encrypt,
+      trust_server_certificate = trust_server_certificate,
+      timeout = timeout,
+      read_only = read_only,
+      verbose = verbose,
+      max_tries = 1L,
+      retry_delay = retry_delay
+    ),
+    resolved$dots
+  )
+
+  # 4 Connect, execute, and close ------------------------------------------------------------------
+
+  # Each retry gets a new connection. Query failures are retried only when the
+  # caller explicitly confirms the statement is safe to repeat
+
+  for (attempt in seq_len(as.integer(max_tries))) {
+    # Refresh authentication after a failed attempt before opening a connection
+    force_refresh <- attempt > 1L
+    connect_args$token <- local({
+      refresh_on_first_use <- force_refresh
+      function(audience, force_refresh = FALSE) {
+        fabric_get_token(
+          credential,
+          audience,
+          force_refresh = isTRUE(force_refresh) || refresh_on_first_use
+        )
+      }
+    })
+
+    # Keep connection cleanup paired with the query attempt
+    con <- NULL
+    preserve_stream <- FALSE
+    outcome <- tryCatch(
+      {
+        con <- do.call(fabric_sql_connect, connect_args)
+        value <- .fabric_sql_db_get_query(
+          con,
+          query_sql,
+          params = query_params,
+          result = result,
+          numeric_policy = numeric_policy
+        )
+        preserve_stream <- identical(result, "arrow_stream")
+        list(
+          value = value,
+          error = NULL
+        )
+      },
+      error = function(error) list(value = NULL, error = error),
+      finally = {
+        if (!is.null(con) && !preserve_stream) {
+          try(
+            .fabric_sql_db_disconnect(
+              con,
+              force = TRUE
+            ),
+            silent = TRUE
+          )
+        }
+      }
+    )
+
+    # Successful streams keep their connection; tabular results can close it
+    if (is.null(outcome$error)) {
+      if (identical(result, "arrow_stream")) {
+        return(outcome$value)
+      }
+
+      return(tibble::as_tibble(outcome$value))
+    }
+
+    # Retry only transient failures that are safe to repeat
+    connection_failure <- inherits(
+      outcome$error,
+      "fabric_sql_connection_error"
+    )
+    retryable <- fabric_sql_transient_error(outcome$error) &&
+      (connection_failure || isTRUE(idempotent))
+    if (attempt == as.integer(max_tries) || !retryable) {
+      if (connection_failure) {
+        rlang::cnd_signal(outcome$error)
+      }
+      .fabric_abort(
+        "Fabric SQL query execution failed",
+        class = "fabric_sql_execution_error",
+        parent = outcome$error
+      )
+    }
+
+    delay <- fabric_sql_retry_delay(attempt, retry_delay)
+    inform(
+      verbose,
+      "Transient SQL query failure; retrying on a new connection in {delay} seconds"
+    )
+    .fabric_sql_sleep(delay)
+  }
+  .fabric_abort("Fabric SQL query retry loop ended unexpectedly")
 }
 
-#' Acquire an Azure AD token for SQL (database.windows.net)
-#' @param tenant_id Tenant GUID.
-#' @param client_id App (client) ID.
-#' @return Bearer access token string.
-#' @keywords internal
-#' @noRd
-fabric_get_sqldb_token <- function(tenant_id, client_id) {
-  tok <- AzureAuth::get_azure_token(
-    resource = c("https://database.windows.net/.default", "offline_access"),
-    tenant = tenant_id,
-    app = client_id,
-    version = 2
+# Validate `sql` as one top-level SELECT or WITH...SELECT statement. Returns
+# invisibly before the one-shot query helper opens a connection
+fabric_sql_validate_query_statement <- function(sql) {
+  tokens <- fabric_sql_top_level_tokens(sql)
+  while (length(tokens) && identical(tokens[[1L]], ";")) {
+    tokens <- tokens[-1L]
+  }
+  terminators <- which(tokens == ";")
+  if (length(terminators)) {
+    valid_terminator <- length(terminators) == 1L &&
+      identical(terminators, length(tokens))
+    if (!valid_terminator) {
+      fabric_sql_statement_error()
+    }
+    tokens <- tokens[-length(tokens)]
+  }
+  first <- if (length(tokens)) tokens[[1L]] else ""
+  select <- match("SELECT", tokens, nomatch = 0L)
+  valid_start <- identical(first, "SELECT") ||
+    (identical(first, "WITH") && select > 0L)
+  select_tokens <- if (select > 0L) {
+    tokens[seq.int(select, length(tokens))]
+  } else {
+    character()
+  }
+  select_positions <- which(select_tokens == "SELECT")
+  set_operators <- c("UNION", "INTERSECT", "EXCEPT")
+  valid_selects <- length(select_positions) > 0L
+  if (length(select_positions) > 1L) {
+    valid_selects <- all(vapply(
+      select_positions[-1L],
+      function(position) {
+        previous <- position - 1L
+        if (
+          previous > 0L &&
+            identical(select_tokens[[previous]], "ALL")
+        ) {
+          previous <- previous - 1L
+        }
+        previous > 0L && select_tokens[[previous]] %in% set_operators
+      },
+      logical(1)
+    ))
+  }
+  # Semicolons are optional for most T-SQL statements, so checking only for a
+  # second terminator does not establish that this is one statement. Reject
+  # top-level tokens that can begin a second statement or turn the batch into a
+  # state-changing/control-flow operation. Quoted identifiers, comments, string
+  # literals, and tokens inside parentheses have already been excluded by the
+  # tokenizer
+  non_query_tokens <- c(
+    "ALTER",
+    "BACKUP",
+    "BEGIN",
+    "BREAK",
+    "BULK",
+    "CHECKPOINT",
+    "CLOSE",
+    "COMMIT",
+    "CREATE",
+    "DBCC",
+    "DEALLOCATE",
+    "DECLARE",
+    "DELETE",
+    "DENY",
+    "DISABLE",
+    "DROP",
+    "ENABLE",
+    "EXEC",
+    "EXECUTE",
+    "GRANT",
+    "INSERT",
+    "KILL",
+    "MERGE",
+    "OPEN",
+    "PRINT",
+    "RAISERROR",
+    "RECONFIGURE",
+    "RESTORE",
+    "RETURN",
+    "REVERT",
+    "ROLLBACK",
+    "SAVE",
+    "SET",
+    "SHUTDOWN",
+    "THROW",
+    "TRANSACTION",
+    "TRUNCATE",
+    "UPDATE",
+    "USE",
+    "WAITFOR",
+    "WHILE"
   )
-  tok$credentials$access_token
+  # A CTE may precede INSERT ... SELECT: the write token can occur before
+  # the first top-level SELECT, so inspect the complete statement.
+  write_capable <- any(c("INTO", non_query_tokens) %in% tokens)
+  valid <- valid_start && valid_selects && !write_capable
+  if (!valid) {
+    fabric_sql_statement_error()
+  }
+  invisible(sql)
 }
 
-#' Normalize a Fabric SQL server value
-#' @param server Input like "Server=host" or "tcp:host" or bare "host".
-#' @return Hostname string.
-#' @keywords internal
-#' @noRd
-fabric_normalize_server <- function(server) {
-  s <- trimws(server)
-  s <- sub("(?i)^server\\s*=\\s*", "", s, perl = TRUE)
-  s <- sub("(?i)^tcp:\\s*", "", s, perl = TRUE)
-  s
+# Raise the shared one-shot SQL statement error. This function does not return
+# and keeps invalid-statement guidance consistent across parser branches
+fabric_sql_statement_error <- function() {
+  .fabric_abort(
+    paste0(
+      "fabric_sql_query() accepts only result-producing SELECT statements, ",
+      "with exactly one statement per call. ",
+      "Use DBI::dbExecute() with fabric_sql_connect() for DDL or DML"
+    ),
+    class = "fabric_sql_statement_error"
+  )
+}
+
+# Tokenize top-level SQL keywords and semicolons while ignoring quoted text and
+# comments. Returns tokens used to enforce the one-shot read-only shape
+fabric_sql_top_level_tokens <- function(sql) {
+  # 1 Prepare tokenizer state ----------------------------------------------------------------------
+
+  # Scan character-by-character so quoted strings and comments cannot masquerade
+  # as executable top-level keywords
+
+  chars <- strsplit(sql, "", fixed = TRUE)[[1L]]
+  tokens <- character()
+  token <- character()
+  depth <- 0L
+  quote <- NULL
+  index <- 1L
+  # Store the current top-level token, if any, then reset its character buffer
+  flush <- function() {
+    if (length(token) && depth == 0L) {
+      tokens <<- c(tokens, toupper(paste0(token, collapse = "")))
+    }
+    token <<- character()
+  }
+
+  # 2 Read top-level tokens ------------------------------------------------------------------------
+
+  # Read top-level tokens once so later checks use a consistent view
+
+  while (index <= length(chars)) {
+    char <- chars[[index]]
+    next_char <- if (index < length(chars)) chars[[index + 1L]] else ""
+
+    # Quoted text is skipped because keywords inside it are not SQL structure
+    if (!is.null(quote)) {
+      if (identical(char, quote)) {
+        if (identical(next_char, quote)) {
+          index <- index + 2L
+          next
+        }
+        quote <- NULL
+      }
+      index <- index + 1L
+      next
+    }
+
+    # Line comments end at the next newline
+    if (identical(char, "-") && identical(next_char, "-")) {
+      flush()
+      newline <- which(
+        chars[seq.int(index + 2L, length(chars))] %in% c("\r", "\n")
+      )
+      index <- if (length(newline)) {
+        index + 1L + newline[[1L]]
+      } else {
+        length(chars) + 1L
+      }
+      next
+    }
+
+    # T-SQL block comments nest, so every opening marker needs its own close
+    if (identical(char, "/") && identical(next_char, "*")) {
+      flush()
+      comment_depth <- 1L
+      index <- index + 2L
+      while (index <= length(chars) && comment_depth > 0L) {
+        comment_char <- chars[[index]]
+        following <- if (index < length(chars)) chars[[index + 1L]] else ""
+        if (identical(comment_char, "/") && identical(following, "*")) {
+          comment_depth <- comment_depth + 1L
+          index <- index + 2L
+        } else if (identical(comment_char, "*") && identical(following, "/")) {
+          comment_depth <- comment_depth - 1L
+          index <- index + 2L
+        } else {
+          index <- index + 1L
+        }
+      }
+      if (comment_depth > 0L) {
+        .fabric_abort("sql contains an unterminated block comment")
+      }
+      next
+    }
+
+    # Opening quote characters switch the tokenizer into quoted-text mode
+    if (char %in% c("'", '"', "[")) {
+      flush()
+      quote <- if (identical(char, "[")) "]" else char
+      index <- index + 1L
+      next
+    }
+
+    # Parentheses track nesting so only top-level semicolons split statements
+    if (identical(char, "(")) {
+      flush()
+      depth <- depth + 1L
+    } else if (identical(char, ")")) {
+      flush()
+      depth <- max(0L, depth - 1L)
+    } else if (
+      (!length(token) && grepl("^[\\p{L}_@#]$", char, perl = TRUE)) ||
+        (length(token) &&
+          grepl("^[\\p{L}\\p{N}_@$#]$", char, perl = TRUE))
+    ) {
+      token <- c(token, char)
+    } else {
+      flush()
+      if (identical(char, ";") && depth == 0L) {
+        tokens <- c(tokens, ";")
+      }
+    }
+    index <- index + 1L
+  }
+
+  # 3 Return the final token sequence --------------------------------------------------------------
+
+  # Return the final token sequence in the stable form expected by the caller
+
+  flush()
+  tokens
+}
+
+# Check that packages required by `backend` and `result` are installed. Returns
+# invisibly before connection or query work begins
+fabric_sql_require_backend <- function(
+  backend = c("odbc", "adbc"),
+  result = NULL
+) {
+  backend <- match.arg(backend)
+  packages <- if (identical(backend, "odbc")) {
+    c("DBI", "odbc")
+  } else {
+    c("DBI", "adbi", "adbcdrivermanager")
+  }
+
+  if (identical(result, "arrow_stream")) {
+    packages <- c(packages, "nanoarrow")
+  }
+  rlang::check_installed(
+    unique(packages),
+    reason = sprintf("to use the Fabric SQL %s backend", backend)
+  )
+  invisible(TRUE)
+}
+
+# Load the configured `adbc_driver` name or path. Returns a driver object passed
+# to the isolated DBI connection seam
+fabric_sql_load_adbc_driver <- function(adbc_driver) {
+  tryCatch(
+    adbcdrivermanager::adbc_driver(adbc_driver),
+    error = function(error) {
+      install_guidance <- if (grepl("^[A-Za-z0-9._-]+$", adbc_driver)) {
+        sprintf("Install it with `dbc install %s`, then retry.", adbc_driver)
+      } else {
+        paste0(
+          "Verify the shared-library path, or install a registered driver ",
+          "with `dbc install <driver>`."
+        )
+      }
+      .fabric_abort(
+        paste(
+          sprintf("Could not load ADBC driver '%s'.", adbc_driver),
+          install_guidance,
+          paste0(
+            "The adbcdrivermanager R package loads installed driver ",
+            "manifests but does not install external driver binaries."
+          )
+        ),
+        class = c(
+          "fabric_sql_driver_error",
+          "fabric_sql_connection_error"
+        ),
+        parent = error
+      )
+    }
+  )
+}
+
+# Require the first mssql release that explicitly supports Fabric Warehouse
+fabric_sql_validate_adbc_driver <- function(connection, adbc_driver) {
+  if (!inherits(connection, "AdbiConnection")) {
+    return(invisible(TRUE))
+  }
+  version <- tryCatch(
+    fabric_sql_adbc_driver_version(connection),
+    error = function(error) {
+      .fabric_abort(
+        paste0(
+          "Could not verify the ADBC mssql driver version. The driver must ",
+          "report version 1.5.0 or newer through ADBC GetInfo."
+        ),
+        class = c(
+          "fabric_sql_driver_version_error",
+          "fabric_sql_driver_error",
+          "fabric_sql_connection_error"
+        ),
+        parent = error
+      )
+    }
+  )
+  fabric_sql_require_adbc_driver_version(version, adbc_driver)
+  invisible(TRUE)
+}
+
+# Read ADBC_INFO_DRIVER_VERSION from an established Adbi connection
+fabric_sql_adbc_driver_version <- function(connection) {
+  stream <- adbcdrivermanager::adbc_connection_get_info(
+    methods::slot(connection, "connection"),
+    101L
+  )
+  on.exit(nanoarrow::nanoarrow_pointer_release(stream), add = TRUE)
+  info <- nanoarrow::convert_array_stream(stream)
+  version <- fabric_sql_adbc_info_string(info)
+  if (is.null(version)) {
+    .fabric_abort("The ADBC driver did not report ADBC_INFO_DRIVER_VERSION")
+  }
+  version
+}
+
+# Find the string member in ADBC's dense-union GetInfo result
+fabric_sql_adbc_info_string <- function(value) {
+  if (is.list(value) && "string_value" %in% names(value)) {
+    candidate <- as.character(value[["string_value"]])
+    candidate <- candidate[!is.na(candidate) & nzchar(candidate)]
+    if (length(candidate)) {
+      return(candidate[[1L]])
+    }
+  }
+  if (is.list(value)) {
+    for (child in value) {
+      candidate <- fabric_sql_adbc_info_string(child)
+      if (!is.null(candidate)) {
+        return(candidate)
+      }
+    }
+  }
+  NULL
+}
+
+# Validate one reported driver version against Fabric's compatibility floor
+fabric_sql_require_adbc_driver_version <- function(version, adbc_driver) {
+  version <- as.character(version)
+  matched <- regmatches(
+    version,
+    regexpr("[0-9]+(?:\\.[0-9]+){1,3}", version, perl = TRUE)
+  )
+  if (
+    length(version) != 1L ||
+      is.na(version) ||
+      !length(matched) ||
+      !nzchar(matched)
+  ) {
+    .fabric_abort(
+      "The ADBC mssql driver reported an unrecognizable version",
+      class = c(
+        "fabric_sql_driver_version_error",
+        "fabric_sql_driver_error",
+        "fabric_sql_connection_error"
+      )
+    )
+  }
+  if (package_version(matched) < package_version("1.5.0")) {
+    .fabric_abort(
+      paste0(
+        "ADBC driver '",
+        adbc_driver,
+        "' reported version ",
+        matched,
+        "; Microsoft Fabric SQL requires mssql 1.5.0 or newer. ",
+        "Update it with `dbc install mssql`."
+      ),
+      class = c(
+        "fabric_sql_driver_version_error",
+        "fabric_sql_driver_error",
+        "fabric_sql_connection_error"
+      ),
+      driver = adbc_driver,
+      driver_version = matched,
+      minimum_driver_version = "1.5.0"
+    )
+  }
+  invisible(matched)
+}
+
+# Build an ADBC SQL Server URI from resolved `info` and connection settings
+# Returns URL text containing the short-lived token for immediate driver use
+fabric_sql_adbc_uri <- function(
+  info,
+  token,
+  encrypt,
+  trust_server_certificate,
+  timeout,
+  read_only
+) {
+  parsed <- httr2::url_parse(
+    sprintf("sqlserver://%s:%d", info$server, info$port)
+  )
+  parsed$query <- c(
+    if (!is.null(info$database)) list(database = info$database) else list(),
+    list(
+      fedauth = "ActiveDirectoryServicePrincipalAccessToken",
+      password = token,
+      encrypt = fabric_sql_adbc_encrypt(encrypt),
+      TrustServerCertificate = fabric_sql_adbc_boolean(
+        trust_server_certificate,
+        "trust_server_certificate"
+      ),
+      `connection timeout` = as.character(as.integer(timeout)),
+      `app name` = "fabricQueryR"
+    ),
+    if (isTRUE(read_only)) list(ApplicationIntent = "ReadOnly") else list()
+  )
+  httr2::url_build(parsed)
+}
+
+# Normalize a logical or yes/no `value` for an ADBC URI. Returns `true` or
+# `false` text and names invalid input with `argument`
+fabric_sql_adbc_boolean <- function(value, argument) {
+  fabric_sql_scalar(value, argument)
+  normalized <- tolower(trimws(value))
+  if (normalized %in% c("true", "yes", "1", "t")) {
+    return("true")
+  }
+
+  if (normalized %in% c("false", "no", "0", "f")) {
+    return("false")
+  }
+  .fabric_abort(
+    sprintf(
+      "%s must be a true/false or yes/no value for the ADBC backend",
+      argument
+    ),
+    class = "fabric_sql_target_error"
+  )
+}
+
+# Normalize the SQL encryption `value` for ADBC. Returns a valid driver spelling
+# while preserving Fabric's secure default
+fabric_sql_adbc_encrypt <- function(value) {
+  fabric_sql_scalar(value, "encrypt")
+  normalized <- tolower(trimws(value))
+  if (normalized %in% c("strict", "mandatory", "disable", "optional")) {
+    return(normalized)
+  }
+  fabric_sql_adbc_boolean(value, "encrypt")
+}
+
+# Replace top-level positional placeholders in `sql` with named ADBC parameters
+# Returns rewritten SQL while leaving quoted text and comments untouched
+fabric_sql_adbc_parameter_sql <- function(sql, params) {
+  .fabric_sql_parameter_sql(sql, sprintf("@p%d", seq_along(params)), "ADBC")
+}
+
+# Replace positional placeholders without changing literals, identifiers or
+# comments. The caller controls SQL parameter types and sends values separately.
+.fabric_sql_parameter_sql <- function(sql, replacements, backend) {
+  # 1 Prepare placeholder parsing ------------------------------------------------------------------
+
+  # Only question marks in executable SQL should become parameter expressions
+
+  chars <- strsplit(sql, "", fixed = TRUE)[[1L]]
+  output <- character()
+  state <- "normal"
+  block_depth <- 0L
+  marker <- 0L
+  position <- 1L
+  total <- length(chars)
+
+  # Append supplied characters to rewritten SQL; updates the local output buffer
+  append_chars <- function(...) {
+    output <<- c(output, ...)
+  }
+  # Return the character after the current position, or empty text at the end
+  next_char <- function() {
+    if (position < total) chars[[position + 1L]] else ""
+  }
+
+  # 2 Rewrite executable placeholders --------------------------------------------------------------
+
+  # Rewrite executable placeholders only after its structure has been validated
+
+  while (position <= total) {
+    current <- chars[[position]]
+    following <- next_char()
+
+    if (identical(state, "normal")) {
+      if (identical(current, "'")) {
+        state <- "single_quote"
+      } else if (identical(current, "\"")) {
+        state <- "double_quote"
+      } else if (identical(current, "[")) {
+        state <- "bracket"
+      } else if (identical(current, "-") && identical(following, "-")) {
+        append_chars(current, following)
+        position <- position + 2L
+        state <- "line_comment"
+        next
+      } else if (identical(current, "/") && identical(following, "*")) {
+        append_chars(current, following)
+        position <- position + 2L
+        state <- "block_comment"
+        block_depth <- 1L
+        next
+      } else if (identical(current, "?")) {
+        marker <- marker + 1L
+        append_chars(
+          if (marker <= length(replacements)) replacements[[marker]] else "?"
+        )
+        position <- position + 1L
+        next
+      }
+      append_chars(current)
+      position <- position + 1L
+      next
+    }
+
+    if (identical(state, "single_quote")) {
+      append_chars(current)
+      if (identical(current, "'")) {
+        if (identical(following, "'")) {
+          append_chars(following)
+          position <- position + 2L
+          next
+        }
+        state <- "normal"
+      }
+      position <- position + 1L
+      next
+    }
+
+    if (identical(state, "double_quote")) {
+      append_chars(current)
+      if (identical(current, "\"")) {
+        if (identical(following, "\"")) {
+          append_chars(following)
+          position <- position + 2L
+          next
+        }
+        state <- "normal"
+      }
+      position <- position + 1L
+      next
+    }
+
+    if (identical(state, "bracket")) {
+      append_chars(current)
+      if (identical(current, "]")) {
+        if (identical(following, "]")) {
+          append_chars(following)
+          position <- position + 2L
+          next
+        }
+        state <- "normal"
+      }
+      position <- position + 1L
+      next
+    }
+
+    if (identical(state, "line_comment")) {
+      append_chars(current)
+      if (current %in% c("\r", "\n")) {
+        state <- "normal"
+      }
+      position <- position + 1L
+      next
+    }
+
+    append_chars(current)
+    if (identical(current, "/") && identical(following, "*")) {
+      append_chars(following)
+      position <- position + 2L
+      block_depth <- block_depth + 1L
+      next
+    }
+
+    if (identical(current, "*") && identical(following, "/")) {
+      append_chars(following)
+      position <- position + 2L
+      block_depth <- block_depth - 1L
+      if (block_depth == 0L) {
+        state <- "normal"
+      }
+      next
+    }
+    position <- position + 1L
+  }
+
+  # 3 Validate and return rewritten SQL ------------------------------------------------------------
+
+  # Check and return rewritten SQL now so later code can rely on safe input
+
+  if (marker != length(replacements)) {
+    .fabric_abort(
+      sprintf(
+        "%s parameter binding found %d SQL placeholder%s for %d value%s",
+        backend,
+        marker,
+        if (marker == 1L) "" else "s",
+        length(replacements),
+        if (length(replacements) == 1L) "" else "s"
+      ),
+      class = "fabric_sql_execution_error"
+    )
+  }
+  paste0(output, collapse = "")
+}
+
+# Validate connection/query retry settings. Returns invisibly before either
+# retry loop starts
+fabric_sql_retry_settings <- function(max_tries, retry_delay) {
+  if (
+    length(max_tries) != 1L ||
+      is.na(max_tries) ||
+      !is.numeric(max_tries) ||
+      !is.finite(max_tries) ||
+      max_tries < 1 ||
+      max_tries != floor(max_tries) ||
+      max_tries > .Machine$integer.max
+  ) {
+    .fabric_abort("max_tries must be one positive integer")
+  }
+
+  if (
+    length(retry_delay) != 1L ||
+      is.na(retry_delay) ||
+      !is.numeric(retry_delay) ||
+      !is.finite(retry_delay) ||
+      retry_delay < 0
+  ) {
+    .fabric_abort("retry_delay must be one non-negative number")
+  }
+  invisible(TRUE)
+}
+
+# Validate SQL `server`. Returns one canonical bare
+# hostname before the SQL access token can be passed to a driver
+fabric_sql_validate_endpoint <- function(server) {
+  fabric_sql_scalar(server, "server")
+  host <- tolower(sub("\\.$", "", trimws(server)))
+  parsed <- try(
+    httr2::url_parse(paste0("sqlserver://", host)),
+    silent = TRUE
+  )
+  labels <- strsplit(host, ".", fixed = TRUE)[[1L]]
+  valid_label <- vapply(
+    labels,
+    function(label) {
+      grepl(
+        "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+        label,
+        perl = TRUE
+      )
+    },
+    logical(1)
+  )
+  valid_host <- !inherits(parsed, "try-error") &&
+    identical(parsed$hostname, host) &&
+    is.null(parsed$username) &&
+    is.null(parsed$password) &&
+    is.null(parsed$port) &&
+    identical(parsed$path, "/") &&
+    is.null(parsed$query) &&
+    is.null(parsed$fragment) &&
+    nchar(host) <= 253L &&
+    length(labels) > 0L &&
+    all(valid_label)
+  if (!valid_host) {
+    .fabric_abort(
+      paste0(
+        "SQL server must be a bare DNS hostname without credentials, a port, ",
+        "a path, a query, or a fragment"
+      ),
+      class = c("fabric_sql_endpoint_error", "fabric_sql_target_error")
+    )
+  }
+  host
+}
+
+# Normalize ODBC option names across case, spaces, punctuation, and underscores
+# Returns compact names used by every security-sensitive option check
+fabric_sql_normalize_odbc_options <- function(option_names) {
+  gsub("[^[:alnum:]]", "", tolower(option_names %||% character()))
+}
+
+# Reject connection-string authentication that conflicts with an access token
+fabric_sql_reject_odbc_auth_options <- function(option_names, location) {
+  normalized <- fabric_sql_normalize_odbc_options(option_names)
+  conflicting <- normalized %in%
+    c(
+      "uid",
+      "pwd",
+      "user",
+      "userid",
+      "password",
+      "authentication",
+      "trustedconnection",
+      "integratedsecurity",
+      "accesstoken",
+      "azuretoken"
+    )
+  if (!any(conflicting)) {
+    return(invisible(NULL))
+  }
+  conflicts <- unique(option_names[conflicting])
+  .fabric_abort(
+    paste0(
+      "ODBC access-token authentication cannot be combined with ",
+      paste(conflicts, collapse = ", "),
+      " in ",
+      location
+    ),
+    class = c("fabric_sql_authentication_error", "fabric_sql_option_error"),
+    conflicting_options = conflicts,
+    location = location
+  )
+}
+
+# Reject ODBC selectors that can replace package-validated connection settings
+# before the package-managed access token reaches the SQL Server driver
+fabric_sql_reject_odbc_managed_options <- function(option_names, location) {
+  normalized <- fabric_sql_normalize_odbc_options(option_names)
+  managed <- normalized %in%
+    c(
+      "connectionstring",
+      "dsn",
+      "filedsn",
+      "savefile",
+      "driver",
+      "server",
+      "datasource",
+      "address",
+      "addr",
+      "networkaddress",
+      "port",
+      "database",
+      "initialcatalog",
+      "catalog",
+      "attachdbfilename",
+      "failoverpartner",
+      "failoverpartnerspn",
+      "serverspn",
+      "hostnameincertificate",
+      "servercertificate",
+      "clientcertificate",
+      "clientkey",
+      "encrypt",
+      "trustservercertificate",
+      "applicationintent",
+      "marsconnection",
+      "multisubnetfailover",
+      "connecttimeout",
+      "connectiontimeout",
+      "logintimeout"
+    )
+  if (!any(managed)) {
+    return(invisible(NULL))
+  }
+  conflicts <- unique(option_names[managed])
+  .fabric_abort(
+    paste0(
+      "ODBC connection settings managed by fabric_sql_connect() cannot be ",
+      "supplied as ",
+      paste(conflicts, collapse = ", "),
+      " in ",
+      location
+    ),
+    class = c("fabric_sql_target_error", "fabric_sql_option_error"),
+    conflicting_options = conflicts,
+    location = location
+  )
+}
+
+# Separate caller ODBC connection arguments and attributes from `dots`. Returns
+# both lists while protecting the package-managed access-token authentication
+fabric_sql_odbc_options <- function(dots) {
+  dot_names <- names(dots) %||% character()
+  positions <- which(tolower(dot_names) == "attributes")
+  if (length(positions) > 1L) {
+    .fabric_abort("attributes may be supplied only once in ...")
+  }
+  attributes <- if (length(positions)) dots[[positions]] else list()
+  if (length(positions)) {
+    dots <- dots[-positions]
+  }
+
+  dot_names <- names(dots)
+  if (
+    length(dots) &&
+      (is.null(dot_names) || anyNA(dot_names) || !all(nzchar(dot_names)))
+  ) {
+    .fabric_abort("ODBC options in ... must have non-empty names")
+  }
+  normalized_dots <- fabric_sql_normalize_odbc_options(dot_names)
+  if (anyDuplicated(normalized_dots)) {
+    .fabric_abort(
+      "ODBC options in ... must have unique names ignoring punctuation and case"
+    )
+  }
+
+  if (!is.list(attributes)) {
+    .fabric_abort("attributes in ... must be a named list")
+  }
+  attribute_names <- names(attributes)
+  if (
+    length(attributes) &&
+      (is.null(attribute_names) ||
+        anyNA(attribute_names) ||
+        !all(nzchar(attribute_names)))
+  ) {
+    .fabric_abort("attributes in ... must be a named list")
+  }
+  normalized <- fabric_sql_normalize_odbc_options(attribute_names)
+  if (anyDuplicated(normalized)) {
+    .fabric_abort(
+      paste0(
+        "attributes in ... must have unique names ignoring punctuation and ",
+        "case"
+      )
+    )
+  }
+
+  if ("azuretoken" %in% normalized) {
+    .fabric_abort(
+      "attributes in ... cannot override the package-managed azure_token"
+    )
+  }
+  fabric_sql_reject_odbc_auth_options(dot_names, "...")
+  fabric_sql_reject_odbc_auth_options(attribute_names, "attributes")
+  fabric_sql_reject_odbc_managed_options(dot_names, "...")
+  fabric_sql_reject_odbc_managed_options(attribute_names, "attributes")
+  list(dots = dots, attributes = attributes)
+}
+
+# Calculate jittered backoff for `attempt` from `retry_delay`. Returns seconds
+# used by both SQL retry loops
+fabric_sql_retry_delay <- function(attempt, retry_delay) {
+  base <- min(60, retry_delay * 2^(attempt - 1L))
+  base * .fabric_sql_runif(1L, 0.8, 1.2)
+}
+
+# Detect whether `error` looks temporary from class, SQL state, or message
+# Returns one logical value used to decide whether reconnecting is safe
+fabric_sql_transient_error <- function(error) {
+  messages <- character()
+  current <- error
+  while (inherits(current, "condition")) {
+    messages <- c(messages, conditionMessage(current))
+    current <- current$parent %||% NULL
+  }
+  grepl(
+    paste0(
+      "(?i)(",
+      "\\b(?:24804|6005|6008|40197|40501|40613|49918|49919|49920|",
+      "10053|10054|10060|11001)\\b|",
+      "temporar(?:y|ily)|timed?\\s*out|timeout|",
+      "transport-level|communication link failure|",
+      "connection.{0,30}(?:reset|closed|broken|forcibly)|",
+      "network-related|service unavailable|server is not currently available|",
+      "shutdown is in progress|system update",
+      ")"
+    ),
+    paste(messages, collapse = "\n"),
+    perl = TRUE
+  )
+}
+
+# Parse a SQL `server` or full connection string. Returns normalized server,
+# database, port, and original fields for connection resolution
+fabric_parse_sql_connection_string <- function(server) {
+  # 1 Split connection-string fields ---------------------------------------------------------------
+
+  # Split the copied string first so each key/value pair can be checked separately
+
+  value <- trimws(server)
+  tokens <- trimws(fabric_split_connection_string(value))
+  tokens <- tokens[nzchar(tokens)]
+  pairs <- tokens[grepl("=", tokens, fixed = TRUE)]
+  fields <- list()
+  if (length(pairs)) {
+    for (pair in pairs) {
+      position <- regexpr("=", pair, fixed = TRUE)[[1L]]
+      key <- tolower(trimws(substr(pair, 1L, position - 1L)))
+      key <- gsub("[ _]", "", key)
+      if (!nzchar(key)) {
+        .fabric_abort(
+          "SQL connection-string option names cannot be empty",
+          class = "fabric_sql_target_error"
+        )
+      }
+      field_value <- fabric_unquote_connection_value(
+        substr(pair, position + 1L, nchar(pair))
+      )
+      if (!is.null(fields[[key]]) && !identical(fields[[key]], field_value)) {
+        .fabric_abort(
+          paste0(
+            "SQL connection-string option `",
+            key,
+            "` has conflicting values"
+          ),
+          class = "fabric_sql_target_error",
+          conflicting_options = key,
+          conflicting_values = if (
+            .httr2_is_secret_field(key) || key == "pwd"
+          ) {
+            rep("<redacted>", 2L)
+          } else {
+            c(fields[[key]], field_value)
+          }
+        )
+      }
+      fields[[key]] <- field_value
+    }
+  }
+
+  # 2 Resolve server and port ----------------------------------------------------------------------
+
+  # Resolve server and port once so later steps use one consistent value
+
+  server_keys <- c(
+    "server",
+    "datasource",
+    "address",
+    "addr",
+    "networkaddress"
+  )
+  server_values <- unlist(fields[intersect(server_keys, names(fields))])
+  if (length(server_values)) {
+    normalized_servers <- tolower(trimws(sub(
+      "(?i)^tcp:\\s*",
+      "",
+      server_values,
+      perl = TRUE
+    )))
+    if (length(unique(normalized_servers)) > 1L) {
+      .fabric_abort(
+        "SQL target contains conflicting Server/Data Source values",
+        class = "fabric_sql_target_error",
+        conflicting_options = intersect(server_keys, names(fields)),
+        conflicting_values = unname(server_values)
+      )
+    }
+  }
+  host <- if (length(server_values)) unname(server_values[[1L]]) else NULL
+  if (is.null(host)) {
+    bare <- tokens[!grepl("=", tokens, fixed = TRUE)]
+    if (length(bare) != 1L) {
+      .fabric_abort(
+        "Could not find a unique Server/Data Source in the SQL target",
+        class = "fabric_sql_target_error"
+      )
+    }
+    host <- fabric_unquote_connection_value(bare[[1L]])
+  }
+  host <- sub("(?i)^tcp:\\s*", "", trimws(host), perl = TRUE)
+  port <- NULL
+  match <- regexec("^(.+?)[,](\\d+)$", host)
+  parts <- regmatches(host, match)[[1L]]
+  if (length(parts)) {
+    host <- trimws(parts[[2L]])
+    port <- as.integer(parts[[3L]])
+  }
+
+  if (!nzchar(host)) {
+    .fabric_abort(
+      "Fabric SQL server is empty",
+      class = "fabric_sql_target_error"
+    )
+  }
+
+  # 3 Return parsed connection details -------------------------------------------------------------
+
+  # Return parsed connection details in the stable form expected by the caller
+
+  database_keys <- c("initialcatalog", "database", "catalog")
+  database_values <- unlist(fields[intersect(database_keys, names(fields))])
+  if (length(unique(database_values)) > 1L) {
+    .fabric_abort(
+      "SQL target contains conflicting Initial Catalog/Database values",
+      class = "fabric_sql_target_error",
+      conflicting_options = intersect(database_keys, names(fields)),
+      conflicting_values = unname(database_values)
+    )
+  }
+  database <- if (length(database_values)) {
+    unname(database_values[[1L]])
+  } else {
+    NULL
+  }
+  list(server = host, database = database, port = port, fields = fields)
+}
+
+# Infer a Fabric SQL target kind from `server`. Returns a target-type string used
+# when the caller selects `target_type = "auto"`
+fabric_infer_sql_target <- function(server) {
+  if (
+    grepl(
+      "(?:\\.database\\.fabric\\.microsoft\\.com|\\.database\\.windows\\.net)$",
+      server,
+      ignore.case = TRUE
+    )
+  ) {
+    "sql_database"
+  } else if (
+    grepl(
+      paste0(
+        "(?:\\.datawarehouse\\.fabric\\.microsoft\\.com|",
+        "\\.datawarehouse\\.pbidedicated\\.microsoft\\.com|",
+        "\\.pbidedicated\\.microsoft\\.com|",
+        "\\.pbidedicated\\.windows\\.net|",
+        "^[^.]+\\.[^.]+\\.fabric\\.microsoft\\.com)$"
+      ),
+      server,
+      ignore.case = TRUE
+    )
+  ) {
+    "sql_analytics_endpoint"
+  } else {
+    "auto"
+  }
+}
+
+# Check `value` as one non-empty string identified by `argument`. Returns
+# invisibly for shared SQL option validation
+fabric_sql_scalar <- function(value, argument) {
+  if (
+    !is.character(value) ||
+      length(value) != 1L ||
+      is.na(value) ||
+      !nzchar(trimws(value))
+  ) {
+    .fabric_abort(
+      sprintf("%s must be one non-empty character value", argument),
+      class = "fabric_sql_target_error"
+    )
+  }
+  invisible(value)
+}
+
+# Validate a numeric SQL `value` as a port within the supplied bounds. Returns
+# invisibly for public connection resolution
+fabric_sql_port <- function(
+  value,
+  argument = "port",
+  allow_zero = FALSE
+) {
+  minimum <- if (allow_zero) 0 else 1
+  if (
+    length(value) != 1L ||
+      is.na(value) ||
+      !is.numeric(value) ||
+      value < minimum ||
+      value > 65535 ||
+      value != floor(value)
+  ) {
+    .fabric_abort(
+      sprintf(
+        "%s must be one integer between %d and 65535",
+        argument,
+        minimum
+      ),
+      class = "fabric_sql_target_error"
+    )
+  }
+  invisible(value)
+}
+
+# Validate SQL timeout `value` as a non-negative whole number. Returns invisibly
+# before a driver connection is attempted
+fabric_sql_timeout <- function(value) {
+  if (
+    length(value) != 1L ||
+      is.na(value) ||
+      !is.numeric(value) ||
+      !is.finite(value) ||
+      value < 0 ||
+      value != floor(value) ||
+      value > .Machine$integer.max
+  ) {
+    .fabric_abort(
+      "timeout must be one non-negative whole number",
+      class = "fabric_sql_target_error"
+    )
+  }
+  invisible(value)
+}
+
+# Redact `error` and raise a typed SQL connection condition. This function does
+# not return and optionally removes short-lived `secrets` from driver messages
+fabric_sql_connection_error <- function(error, secrets = NULL) {
+  message <- fabric_sql_redact_secrets(conditionMessage(error), secrets)
+  class <- if (
+    grepl(
+      "token|authentication|login failed|18456",
+      message,
+      ignore.case = TRUE
+    )
+  ) {
+    "fabric_sql_authentication_error"
+  } else if (
+    grepl(
+      "cannot open database|catalog|database .* (?:not|doesn't) exist",
+      message,
+      ignore.case = TRUE
+    )
+  ) {
+    "fabric_sql_database_error"
+  } else {
+    "fabric_sql_endpoint_error"
+  }
+  .fabric_abort(
+    paste0("Fabric SQL connection failed: ", message),
+    class = c(class, "fabric_sql_connection_error"),
+    # Driver conditions can retain call arguments and backend-specific state
+    # Keep only the already-redacted message in the public condition chain
+    parent = simpleError(message)
+  )
+}
+
+# Remove explicit `secrets` and shared credential patterns from `message`
+# Returns safe text suitable for a public SQL error
+fabric_sql_redact_secrets <- function(message, secrets = NULL) {
+  secrets <- unique(secrets[!is.na(secrets) & nzchar(secrets)])
+  for (secret in secrets) {
+    message <- gsub(secret, "<redacted>", message, fixed = TRUE)
+    encoded <- utils::URLencode(secret, reserved = TRUE)
+    message <- gsub(encoded, "<redacted>", message, fixed = TRUE)
+  }
+  message <- gsub(
+    "(?i)(password=)[^&;[:space:]]+",
+    "\\1<redacted>",
+    message,
+    perl = TRUE
+  )
+  .httr2_redact(message)
+}
+
+# Open ODBC or ADBC from normalized arguments. Returns a DBI connection and is a
+# test seam that keeps driver setup out of public retry logic
+.fabric_sql_db_connect <- function(
+  backend = c("odbc", "adbc"),
+  adbc_driver = NULL,
+  bigint = "integer64",
+  ...
+) {
+  backend <- match.arg(backend)
+  if (identical(backend, "odbc")) {
+    return(DBI::dbConnect(odbc::odbc(), bigint = bigint, ...))
+  }
+  driver <- if (inherits(adbc_driver, "adbc_driver")) {
+    adbc_driver
+  } else {
+    adbcdrivermanager::adbc_driver(adbc_driver)
+  }
+  DBI::dbConnect(adbi::adbi(driver), bigint = bigint, ...)
+}
+
+# Execute one query through `con` and return the requested result shape. This
+# test seam handles DBI binding details for ODBC and ADBC
+.fabric_sql_db_get_query <- function(
+  con,
+  sql,
+  params = NULL,
+  result = c("tibble", "arrow_stream"),
+  numeric_policy = c("auto", "exact", "driver")
+) {
+  result <- match.arg(result)
+  numeric_policy <- match.arg(numeric_policy)
+  if (inherits(con, "OdbcConnection") && !is.null(params)) {
+    binding <- .fabric_sql_odbc_query_params(sql, params)
+    sql <- binding$sql
+    params <- binding$params
+  }
+  native <- inherits(con, "AdbiConnection")
+  if (identical(numeric_policy, "auto")) {
+    numeric_policy <- if (native) "exact" else "driver"
+    if (inherits(con, "OdbcConnection")) {
+      .fabric_warn(
+        c(
+          "ODBC driver conversion may lose numeric precision",
+          "i" = "Use {.code backend = \"adbc\"} for exact conversion, or {.code numeric_policy = \"exact\"} to reject unsafe ODBC results",
+          "i" = "Set {.code numeric_policy = \"driver\"} to accept driver conversion without this warning"
+        ),
+        class = "fabric_sql_precision_warning",
+        .frequency = "once",
+        .frequency_id = "fabricQueryR.sql.odbc_precision",
+        .format = TRUE,
+        call = NULL
+      )
+    }
+  }
+  exact <- identical(numeric_policy, "exact")
+  if (exact && native && identical(result, "tibble")) {
+    query_result <- .fabric_sql_db_send_query(
+      con,
+      sql,
+      "arrow_stream",
+      immediate = is.null(params)
+    )
+    on.exit(.fabric_sql_db_clear_result(query_result), add = TRUE)
+    if (!is.null(params)) {
+      .fabric_sql_db_bind(query_result, params)
+    }
+    stream <- .fabric_sql_db_fetch(query_result, "arrow_stream")
+    on.exit(
+      nanoarrow::nanoarrow_pointer_release(stream),
+      add = TRUE,
+      after = FALSE
+    )
+    return(.fabric_arrow_exact_tibble(stream))
+  }
+  if (exact && inherits(con, "OdbcConnection") && identical(result, "tibble")) {
+    query_result <- .fabric_sql_db_send_query(
+      con,
+      sql,
+      result,
+      immediate = is.null(params)
+    )
+    on.exit(.fabric_sql_db_clear_result(query_result), add = TRUE)
+    if (!is.null(params)) {
+      .fabric_sql_db_bind(query_result, params)
+    }
+    .fabric_sql_validate_odbc_numeric(query_result)
+    return(.fabric_sql_db_fetch(query_result, result))
+  }
+  if (identical(result, "arrow_stream")) {
+    query_result <- .fabric_sql_db_send_query(
+      con,
+      sql,
+      result,
+      immediate = is.null(params)
+    )
+    stream_owned <- FALSE
+    on.exit(
+      if (!stream_owned) {
+        try(.fabric_sql_db_clear_result(query_result), silent = TRUE)
+      },
+      add = TRUE
+    )
+    if (!is.null(params)) {
+      .fabric_sql_db_bind(query_result, params)
+    }
+    if (exact && inherits(con, "OdbcConnection")) {
+      .fabric_sql_validate_odbc_numeric(query_result)
+    }
+    stream <- .fabric_sql_db_fetch(query_result, result)
+    stream <- .fabric_sql_own_arrow_stream(stream, query_result, con)
+    attr(stream, "fabric_sql_stream_source") <- if (native) {
+      "adbc_native"
+    } else {
+      "odbc_converted"
+    }
+    stream_owned <- TRUE
+    return(stream)
+  }
+
+  if (!is.null(params) && inherits(con, "AdbiConnection")) {
+    query_result <- .fabric_sql_db_send_query(con, sql, result)
+    on.exit(
+      try(.fabric_sql_db_clear_result(query_result), silent = TRUE),
+      add = TRUE
+    )
+    .fabric_sql_db_bind(query_result, params)
+    return(.fabric_sql_db_fetch(query_result, result))
+  }
+  DBI::dbGetQuery(con, sql, params = params)
+}
+
+.fabric_sql_odbc_query_params <- function(sql, params) {
+  integer64 <- vapply(params, inherits, logical(1), "integer64")
+  if (any(integer64)) {
+    replacements <- rep("?", length(params))
+    replacements[integer64] <- "CAST(? AS bigint)"
+    sql <- .fabric_sql_parameter_sql(sql, replacements, "ODBC")
+    # ODBC can bind the storage bits of integer64 as doubles. Text preserves
+    # the values, while the SQL cast retains bigint arithmetic and comparison.
+    params[integer64] <- lapply(params[integer64], as.character)
+  }
+  list(sql = sql, params = params)
+}
+
+.fabric_sql_validate_odbc_numeric <- function(result) {
+  if (inherits(result, "DBIResultArrowDefault")) {
+    result <- result@result
+  }
+  columns <- DBI::dbColumnInfo(result)
+  unsafe <- columns$type %in% c(2L, 3L, 4L, -5L)
+  if (any(unsafe)) {
+    .fabric_abort(
+      paste0(
+        "ODBC cannot guarantee lossless DECIMAL, NUMERIC, INT or BIGINT conversion for: ",
+        paste(columns$name[unsafe], collapse = ", "),
+        ". Cast these columns to varchar in SQL, use backend = 'adbc', ",
+        "or explicitly accept driver conversion with numeric_policy = 'driver'."
+      ),
+      class = c("fabric_sql_precision_error", "fabric_sql_execution_error")
+    )
+  }
+  invisible(NULL)
+}
+
+# Bind a lazy Arrow stream to the DBI result and connection that produce it.
+# The finalizer is idempotent because both explicit pointer release and garbage
+# collection may reach it.
+.fabric_sql_own_arrow_stream <- function(stream, query_result, con) {
+  cleanup <- local({
+    released <- FALSE
+    owned_result <- query_result
+    owned_connection <- con
+    function() {
+      if (released) {
+        return(invisible(NULL))
+      }
+      released <<- TRUE
+      try(.fabric_sql_db_clear_result(owned_result), silent = TRUE)
+      try(
+        .fabric_sql_db_disconnect(owned_connection, force = TRUE),
+        silent = TRUE
+      )
+      invisible(NULL)
+    }
+  })
+
+  nanoarrow::array_stream_set_finalizer(stream, cleanup)
+}
+
+# Send `sql` through `con` for the selected `result`. Returns a direct or
+# prepared DBI result object and remains isolated for driver-compatibility tests
+.fabric_sql_db_send_query <- function(con, sql, result, immediate = FALSE) {
+  if (identical(result, "arrow_stream")) {
+    return(DBI::dbSendQueryArrow(con, sql, immediate = immediate))
+  }
+  DBI::dbSendQuery(con, sql, immediate = immediate)
+}
+
+# Bind named `params` to a DBI `result`. Returns the DBI binding result and keeps
+# ADBC parameter behavior behind a test seam
+.fabric_sql_db_bind <- function(result, params) {
+  params <- .fabric_sql_normalize_params(params)
+  if (
+    inherits(result, c("AdbiResult", "AdbiResultArrow")) &&
+      is.list(params) &&
+      !inherits(params, "data.frame")
+  ) {
+    params <- .fabric_sql_adbc_bind_frame(params)
+  }
+  DBI::dbBind(result, params)
+}
+
+# Convert named scalar `params` into a one-row data frame. Returns the binding
+# shape required by the ADBC DBI backend
+.fabric_sql_normalize_params <- function(params) {
+  if (!is.null(params)) {
+    params[] <- lapply(params, function(value) {
+      if (is.factor(value)) as.character(value) else value
+    })
+  }
+  params
+}
+
+.fabric_sql_adbc_bind_frame <- function(params) {
+  # adbi converts lists with syntactic name repair, changing @p1 to X.p1
+  # Supplying a data frame with exact names keeps it aligned with the driver
+  parameter_names <- names(params)
+  frame <- as.data.frame(
+    lapply(params, I),
+    fix.empty.names = FALSE,
+    check.names = FALSE
+  )
+  names(frame) <- parameter_names
+  frame
+}
+
+# Fetch `result` as a data frame or Arrow stream according to `output`. Returns
+# the driver result used by `fabric_sql_query()`
+.fabric_sql_db_fetch <- function(result, output) {
+  if (identical(output, "arrow_stream")) {
+    return(DBI::dbFetchArrow(result))
+  }
+  DBI::dbFetch(result)
+}
+
+# Clear a DBI `result`. Returns the DBI cleanup value and remains a test seam for
+# guaranteed one-shot query cleanup
+.fabric_sql_db_clear_result <- function(result) {
+  DBI::dbClearResult(result)
+}
+
+# Disconnect DBI `con`, optionally forcing ADBC child cleanup. Returns the DBI
+# cleanup value and remains a test seam for stream ownership behavior
+.fabric_sql_db_disconnect <- function(con, force = FALSE) {
+  if (inherits(con, "AdbiConnection")) {
+    return(DBI::dbDisconnect(con, force = force))
+  }
+  DBI::dbDisconnect(con)
+}
+
+# Sleep for retry `delay`. Returns invisibly through base R and remains a test
+# seam so SQL retry tests do not actually wait
+.fabric_sql_sleep <- function(delay) {
+  Sys.sleep(delay)
+}
+
+# Draw retry jitter between `min` and `max`. Returns numeric values and remains a
+# test seam for deterministic retry-delay tests
+.fabric_sql_runif <- function(n, min, max) {
+  stats::runif(n, min, max)
 }

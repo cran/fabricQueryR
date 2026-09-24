@@ -1,0 +1,2708 @@
+test_that("OneLake object writer serializes supported Arrow formats", {
+  skip_if_not_installed("arrow")
+  data <- data.frame(id = 1:3, label = c("a", "b", NA))
+  captured <- list()
+  local_mocked_bindings(
+    fabric_onelake_upload = function(path, source, content_type, ...) {
+      value <- switch(
+        tools::file_ext(path),
+        parquet = as.data.frame(arrow::read_parquet(source)),
+        csv = as.data.frame(arrow::read_csv_arrow(source)),
+        arrow = as.data.frame(arrow::read_ipc_stream(source))
+      )
+      captured[[path]] <<- list(
+        value = value,
+        content_type = content_type,
+        bytes = file.info(source)$size
+      )
+      tibble::tibble(
+        path = path,
+        name = basename(path),
+        is_directory = FALSE,
+        content_length = file.info(source)$size,
+        content_type = content_type,
+        etag = '"etag"',
+        last_modified = NA_character_,
+        content_range = NA_character_,
+        request_id = "request-id"
+      )
+    }
+  )
+
+  for (format in c("parquet", "csv", "arrow")) {
+    path <- paste0("Files/data.", format)
+    result <- fabric_onelake_write_file(
+      "workspace",
+      "lakehouse.Lakehouse",
+      path,
+      data,
+      token = "token"
+    )
+    expect_s3_class(result, "fabric_onelake_file_write_result")
+    expect_identical(result$format, format)
+    expect_identical(result$columns[[1L]], c("id", "label"))
+    expect_gt(captured[[path]]$bytes, 0)
+    expect_equal(captured[[path]]$value$id, 1:3)
+    expect_equal(captured[[path]]$value$label, c("a", "b", NA))
+  }
+  expect_equal(
+    captured[["Files/data.parquet"]]$content_type,
+    "application/vnd.apache.parquet"
+  )
+  expect_equal(
+    captured[["Files/data.csv"]]$content_type,
+    "text/csv; charset=utf-8"
+  )
+  expect_equal(
+    captured[["Files/data.arrow"]]$content_type,
+    "application/vnd.apache.arrow.stream"
+  )
+})
+
+test_that("OneLake object writer consumes lazy Arrow streams", {
+  skip_if_not_installed("arrow")
+  skip_if_not_installed("nanoarrow")
+  uploaded <- NULL
+  reader <- arrow::as_record_batch_reader(data.frame(id = 1:4))
+  stream <- nanoarrow::as_nanoarrow_array_stream(reader)
+  local_mocked_bindings(
+    fabric_onelake_upload = function(source, ...) {
+      uploaded <<- as.data.frame(arrow::read_parquet(source))
+      tibble::tibble(path = "Files/stream.parquet")
+    }
+  )
+
+  result <- fabric_onelake_write_file(
+    "workspace",
+    "lakehouse.Lakehouse",
+    "Files/stream.parquet",
+    stream,
+    token = "token"
+  )
+
+  expect_equal(uploaded$id, 1:4)
+  expect_equal(result$rows, 4)
+})
+
+test_that("OneLake object reader returns tibbles and lazy streams", {
+  skip_if_not_installed("arrow")
+  skip_if_not_installed("nanoarrow")
+  data <- data.frame(id = 1:3, label = c("a", "b", "c"))
+  fixtures <- list()
+  fixtures$parquet <- tempfile(fileext = ".parquet")
+  fixtures$csv <- tempfile(fileext = ".csv")
+  fixtures$arrow <- tempfile(fileext = ".arrow")
+  fixtures$ipc <- tempfile(fileext = ".ipc")
+  on.exit(unlink(unlist(fixtures), force = TRUE), add = TRUE)
+  arrow::write_parquet(data, fixtures$parquet)
+  arrow::write_csv_arrow(data, fixtures$csv)
+  arrow::write_ipc_stream(data, fixtures$arrow)
+  arrow::write_feather(data, fixtures$ipc)
+  local_mocked_bindings(
+    fabric_onelake_download = function(path, dest, ...) {
+      extension <- tools::file_ext(path)
+      file.copy(fixtures[[extension]], dest)
+      invisible(dest)
+    }
+  )
+
+  for (format in names(fixtures)) {
+    value <- fabric_onelake_read_file(
+      "workspace",
+      "lakehouse.Lakehouse",
+      paste0("Files/data.", format),
+      token = "token"
+    )
+    expect_s3_class(value, "tbl_df")
+    expect_equal(value$id, 1:3)
+    expect_equal(value$label, c("a", "b", "c"))
+  }
+
+  for (format in names(fixtures)) {
+    released <- fabric_onelake_read_file(
+      "workspace",
+      "lakehouse.Lakehouse",
+      paste0("Files/data.", format),
+      result = "arrow_stream",
+      token = "token"
+    )
+    released_path <- attr(released, "fabric_onelake_file_path", exact = TRUE)
+    withr::defer(unlink(released_path, force = TRUE))
+    released[["release"]]()
+    expect_false(file.exists(released_path))
+
+    stream <- fabric_onelake_read_file(
+      "workspace",
+      "lakehouse.Lakehouse",
+      paste0("Files/data.", format),
+      result = "arrow_stream",
+      token = "token"
+    )
+    local_path <- attr(stream, "fabric_onelake_file_path", exact = TRUE)
+    withr::defer(unlink(local_path, force = TRUE))
+    expect_s3_class(stream, "nanoarrow_array_stream")
+    expect_true(file.exists(local_path))
+    if (identical(format, "arrow")) {
+      input <- attr(stream, "fabric_onelake_file_owner")$input
+      # Exported buffers must not pin a Windows file mapping after close.
+      expect_identical(input$supports_zero_copy(), FALSE)
+    }
+    reader <- arrow::as_record_batch_reader(stream)
+    table <- reader$read_table()
+    streamed <- as.data.frame(table)
+    expect_equal(streamed, data)
+    reader$Close()
+    expect_false(file.exists(local_path))
+    expect_equal(as.data.frame(table), data)
+  }
+})
+
+test_that("OneLake IPC and Parquet reads retain Null children in non-null structs", {
+  skip_if_not_installed("arrow")
+  skip_if_not_installed("nanoarrow")
+  fixtures <- list(
+    arrow = tempfile(fileext = ".arrow"),
+    parquet = tempfile(fileext = ".parquet")
+  )
+  on.exit(unlink(unlist(fixtures), force = TRUE), add = TRUE)
+
+  nested <- nanoarrow::as_nanoarrow_array(arrow::StructArray$create(
+    always_null = arrow::Array$create(rep(NA, 3L), type = arrow::null()),
+    value = c(10L, 20L, 30L)
+  ))
+  schema <- nanoarrow::na_struct(list(
+    nested = nanoarrow::infer_nanoarrow_schema(nested)
+  ))
+  batch <- nanoarrow::nanoarrow_array_modify(
+    nanoarrow::nanoarrow_array_init(schema),
+    list(length = 3L, children = list(nested = nested))
+  )
+  source <- nanoarrow::basic_array_stream(list(batch), schema = schema)
+  withr::defer(nanoarrow::nanoarrow_pointer_release(source))
+  nanoarrow::write_nanoarrow(source, fixtures$arrow)
+  table <- arrow::read_ipc_stream(fixtures$arrow, as_data_frame = FALSE)
+  arrow::write_parquet(table, fixtures$parquet)
+
+  local_mocked_bindings(
+    fabric_onelake_download = function(path, dest, ...) {
+      file.copy(fixtures[[tools::file_ext(path)]], dest)
+      invisible(dest)
+    }
+  )
+
+  for (format in names(fixtures)) {
+    result <- fabric_onelake_read_file(
+      "workspace",
+      "lakehouse.Lakehouse",
+      paste0("Files/nested-null.", format),
+      token = "token"
+    )
+    expect_s3_class(result$nested$always_null, "vctrs_unspecified")
+    expect_true(all(is.na(result$nested$always_null)))
+    expect_identical(result$nested$value, c(10L, 20L, 30L))
+  }
+})
+
+test_that("OneLake CSV defaults retain exact decimal and oversized numeric text", {
+  skip_if_not_installed("arrow")
+  fixture <- withr::local_tempfile(fileext = ".csv")
+  decimals <- c(
+    "12345678901234567890.123456789012345",
+    "0.123456789012345678901234567890",
+    "1.0000000000000002",
+    "-0.0"
+  )
+  unsigned <- c("18446744073709551615", "18446744073709551614", "0", "1")
+  extremes <- c(
+    "1e999",
+    "1e-999",
+    "4.9406564584124654e-324",
+    "1.7976931348623157e308"
+  )
+  integers <- c(
+    "9007199254740993",
+    "9223372036854775807",
+    "-9223372036854775808",
+    "0"
+  )
+  writeLines(
+    c(
+      "decimal,unsigned,extreme,id",
+      paste(decimals, unsigned, extremes, integers, sep = ",")
+    ),
+    fixture
+  )
+  local_mocked_bindings(fabric_onelake_download = function(dest, ...) {
+    file.copy(fixture, dest)
+    invisible(dest)
+  })
+
+  for (output in c("tibble", "arrow_stream")) {
+    result <- fabric_onelake_read_file(
+      "workspace",
+      "item",
+      "Files/numbers.csv",
+      result = output
+    )
+    if (output == "arrow_stream") {
+      stream <- result
+      withr::defer(nanoarrow::nanoarrow_pointer_release(stream))
+      result <- .fabric_arrow_exact_tibble(stream)
+    }
+    expect_identical(result$decimal, decimals)
+    expect_identical(result$unsigned, unsigned)
+    expect_identical(result$extreme, extremes)
+    expect_identical(as.character(result$id), integers)
+  }
+})
+
+test_that("OneLake CSV column schemas retain exact decimals and uint64 values", {
+  skip_if_not_installed("arrow")
+  fixture <- withr::local_tempfile(fileext = ".csv")
+  writeLines(
+    c(
+      "amount,id,ratio",
+      "12345678901234567890.123456789012345,18446744073709551615,3.141592653589793",
+      "-0.000000000000001,9223372036854775808,4.9406564584124654e-324"
+    ),
+    fixture
+  )
+  local_mocked_bindings(fabric_onelake_download = function(dest, ...) {
+    file.copy(fixture, dest)
+    invisible(dest)
+  })
+  schema <- arrow::schema(
+    amount = arrow::decimal128(38, 15),
+    id = arrow::uint64(),
+    ratio = arrow::float64()
+  )
+
+  for (output in c("tibble", "arrow_stream")) {
+    result <- fabric_onelake_read_file(
+      "workspace",
+      "item",
+      "Files/numbers.csv",
+      result = output,
+      col_types = schema
+    )
+    if (output == "arrow_stream") {
+      stream <- result
+      withr::defer(nanoarrow::nanoarrow_pointer_release(stream))
+      expect_identical(stream$get_schema()$children$amount$format, "d:38,15")
+      expect_identical(stream$get_schema()$children$id$format, "L")
+      result <- .fabric_arrow_exact_tibble(stream)
+    }
+    expect_identical(
+      result$amount,
+      c("12345678901234567890.123456789012345", "-0.000000000000001")
+    )
+    expect_identical(
+      result$id,
+      c("18446744073709551615", "9223372036854775808")
+    )
+    expect_identical(
+      result$ratio,
+      c(pi, .Machine$double.xmin * .Machine$double.eps)
+    )
+  }
+})
+
+test_that("explicit CSV schemas handle values beyond the inference block", {
+  skip_if_not_installed("arrow")
+  fixture <- withr::local_tempfile(fileext = ".csv")
+  # More than Arrow's default 1 MiB inference block for each column.
+  prefix <- rep("1,NA", 300000L)
+  writeLines(c("id,label", prefix, "18446744073709551615,late text"), fixture)
+  local_mocked_bindings(fabric_onelake_download = function(dest, ...) {
+    file.copy(fixture, dest)
+    invisible(dest)
+  })
+  for (output in c("tibble", "arrow_stream")) {
+    read <- function(schema = NULL) {
+      value <- fabric_onelake_read_file(
+        "workspace",
+        "item",
+        "Files/blocks.csv",
+        result = output,
+        col_types = schema
+      )
+      if (output == "arrow_stream") {
+        on.exit(nanoarrow::nanoarrow_pointer_release(value), add = TRUE)
+        .fabric_arrow_exact_tibble(value)
+      } else {
+        value
+      }
+    }
+    # Test both late type changes independently as well as their workaround.
+    for (schema in list(
+      arrow::schema(label = arrow::utf8()),
+      arrow::schema(id = arrow::utf8())
+    )) {
+      error <- rlang::catch_cnd(read(schema), classes = "error")
+      expect_s3_class(error, "error")
+    }
+    rows <- read(arrow::schema(id = arrow::utf8(), label = arrow::utf8()))
+    expect_equal(nrow(rows), length(prefix) + 1L)
+    expect_identical(tail(rows$id, 1L), "18446744073709551615")
+    expect_identical(tail(rows$label, 1L), "late text")
+    expect_identical(sum(is.na(rows$label)), length(prefix))
+  }
+})
+
+test_that("OneLake CSV inference and partial schemas are explicit", {
+  skip_if_not_installed("arrow")
+  fixture <- withr::local_tempfile(fileext = ".csv")
+  writeLines(
+    c(
+      "id,ratio,amount",
+      "00123,3.141592653589793,0.123456789012345678901234567890"
+    ),
+    fixture
+  )
+  local_mocked_bindings(fabric_onelake_download = function(dest, ...) {
+    file.copy(fixture, dest)
+    invisible(dest)
+  })
+
+  for (output in c("tibble", "arrow_stream")) {
+    explicit <- fabric_onelake_read_file(
+      "workspace",
+      "item",
+      "Files/numbers.csv",
+      result = output,
+      col_types = arrow::schema(id = arrow::utf8(), ratio = arrow::float64())
+    )
+    inferred <- fabric_onelake_read_file(
+      "workspace",
+      "item",
+      "Files/numbers.csv",
+      result = output,
+      csv_numeric = "infer"
+    )
+    if (output == "arrow_stream") {
+      explicit_stream <- explicit
+      inferred_stream <- inferred
+      withr::defer(nanoarrow::nanoarrow_pointer_release(explicit_stream))
+      withr::defer(nanoarrow::nanoarrow_pointer_release(inferred_stream))
+      explicit <- .fabric_arrow_exact_tibble(explicit_stream)
+      inferred <- .fabric_arrow_exact_tibble(inferred_stream)
+    }
+    expect_identical(explicit$id, "00123")
+    expect_identical(explicit$ratio, pi)
+    expect_identical(explicit$amount, "0.123456789012345678901234567890")
+    expect_identical(inferred$ratio, pi)
+    expect_identical(inferred$amount, as.numeric("0x1.f9add3746f65fp-4"))
+  }
+})
+
+test_that("OneLake CSV write and read retain exact numeric strings", {
+  skip_if_not_installed("arrow")
+  fixture <- withr::local_tempfile(fileext = ".csv")
+  data <- data.frame(
+    amount = c("12345678901234567890.123456789012345", "-0.0"),
+    id = c("18446744073709551615", "18446744073709551614")
+  )
+  local_mocked_bindings(
+    fabric_onelake_upload = function(source, ...) {
+      file.copy(source, fixture)
+      tibble::tibble(path = "Files/numbers.csv")
+    },
+    fabric_onelake_download = function(dest, ...) {
+      file.copy(fixture, dest)
+      invisible(dest)
+    }
+  )
+
+  fabric_onelake_write_file("workspace", "item", "Files/numbers.csv", data)
+  result <- fabric_onelake_read_file("workspace", "item", "Files/numbers.csv")
+  expect_identical(as.list(result), as.list(data))
+})
+
+test_that("OneLake CSV schemas reject unknown columns and unsafe coercions", {
+  skip_if_not_installed("arrow")
+  fixture <- withr::local_tempfile(fileext = ".csv")
+  writeLines(c("id", "18446744073709551615"), fixture)
+  local_mocked_bindings(fabric_onelake_download = function(dest, ...) {
+    file.copy(fixture, dest)
+    invisible(dest)
+  })
+
+  for (schema in list(
+    arrow::schema(missing = arrow::utf8()),
+    arrow::schema(id = arrow::int64())
+  )) {
+    error <- tryCatch(
+      fabric_onelake_read_file(
+        "workspace",
+        "item",
+        "Files/numbers.csv",
+        col_types = schema
+      ),
+      error = identity
+    )
+    expect_s3_class(error, "fabric_onelake_object_read_error")
+  }
+})
+
+test_that("OneLake Parquet and IPC reads preserve the full uint64 range", {
+  skip_if_not_installed("arrow")
+  values <- c(
+    "0",
+    "9007199254740993",
+    "9223372036854775808",
+    "18446744073709551615",
+    NA
+  )
+  unsigned <- arrow::Array$create(values)$cast(arrow::uint64())
+  data <- arrow::Table$create(
+    value = unsigned,
+    nested = arrow::StructArray$create(value = unsigned)
+  )
+  directory <- withr::local_tempdir()
+  arrow::write_parquet(data, file.path(directory, "numbers.parquet"))
+  arrow::write_ipc_stream(data, file.path(directory, "numbers.arrow"))
+  local_mocked_bindings(
+    fabric_onelake_download = function(path, dest, ...) {
+      file.copy(file.path(directory, basename(path)), dest)
+      invisible(dest)
+    }
+  )
+
+  for (extension in c("parquet", "arrow")) {
+    result <- fabric_onelake_read_file(
+      "workspace",
+      "lakehouse.Lakehouse",
+      paste0("Files/numbers.", extension),
+      token = "synthetic"
+    )
+    expect_identical(result$value, values)
+    expect_identical(result$nested$value, values)
+  }
+})
+
+test_that("OneLake object wrappers retain discovered DFS endpoints", {
+  skip_if_not_installed("arrow")
+  workspace_id <- "11111111-1111-1111-1111-111111111111"
+  item_id <- "22222222-2222-2222-2222-222222222222"
+  private_dfs <- paste0(
+    "https://",
+    workspace_id,
+    ".z12.dfs.fabric.microsoft.com"
+  )
+  workspace <- list(
+    id = workspace_id,
+    oneLakeEndpoints = list(dfsEndpoint = private_dfs)
+  )
+  item <- list(
+    id = item_id,
+    workspaceId = workspace_id,
+    type = "Lakehouse"
+  )
+  fixture <- tempfile(fileext = ".parquet")
+  on.exit(unlink(fixture, force = TRUE), add = TRUE)
+  arrow::write_parquet(data.frame(id = 1L), fixture)
+  endpoints <- list()
+  local_mocked_bindings(
+    fabric_onelake_download = function(
+      workspace,
+      item,
+      path,
+      dest,
+      item_type,
+      dfs_base,
+      ...
+    ) {
+      target <- onelake_resolve_target(
+        workspace,
+        item,
+        path,
+        item_type,
+        dfs_base
+      )
+      endpoints$read <<- target$dfs_base
+      file.copy(fixture, dest)
+      invisible(dest)
+    },
+    fabric_onelake_upload = function(
+      workspace,
+      item,
+      path,
+      source,
+      item_type,
+      dfs_base,
+      ...
+    ) {
+      target <- onelake_resolve_target(
+        workspace,
+        item,
+        path,
+        item_type,
+        dfs_base
+      )
+      endpoints$write <<- target$dfs_base
+      tibble::tibble(path = path)
+    }
+  )
+
+  read <- fabric_onelake_read_file(
+    workspace,
+    item,
+    "Files/input.parquet",
+    token = "token"
+  )
+  write <- fabric_onelake_write_file(
+    workspace,
+    item,
+    "Files/output.parquet",
+    data.frame(id = 1L),
+    token = "token"
+  )
+
+  expect_equal(read$id, 1L)
+  expect_equal(write$path, "Files/output.parquet")
+  expect_identical(endpoints$read, private_dfs)
+  expect_identical(endpoints$write, private_dfs)
+})
+
+test_that("OneLake object file formats are explicit and validated", {
+  expect_identical(
+    .fabric_onelake_object_format("Files/data.PQ", "auto"),
+    "parquet"
+  )
+  expect_identical(
+    .fabric_onelake_object_format("Files/no-extension", "csv"),
+    "csv"
+  )
+  expect_error(
+    .fabric_onelake_object_format("Files/data.json", "auto"),
+    "Could not infer format",
+    class = "fabric_onelake_object_format_error"
+  )
+  expect_error(
+    fabric_onelake_write_file(
+      "workspace",
+      "lakehouse.Lakehouse",
+      "Files/data.csv",
+      data.frame(id = 1L),
+      include_header = NA,
+      token = "token"
+    ),
+    "include_header must be TRUE or FALSE"
+  )
+})
+
+test_that("OneLake rejects conflicting or unverifiable workspace names", {
+  item <- list(
+    id = "22222222-2222-4222-8222-222222222222",
+    workspaceId = "11111111-1111-4111-8111-111111111111",
+    workspaceDisplayName = "Production",
+    type = "Lakehouse"
+  )
+  local_mocked_bindings(
+    onelake_upload_target = function(...) stop("Unexpected upload"),
+    onelake_delete_target = function(...) stop("Unexpected deletion")
+  )
+  for (name in list("Production", NULL)) {
+    item$workspaceDisplayName <- name
+    for (operation in list(
+      function() {
+        fabric_onelake_upload(
+          "Development",
+          item,
+          "Files/data.csv",
+          charToRaw("data"),
+          token = "token"
+        )
+      },
+      function() {
+        fabric_onelake_delete(
+          "Development",
+          item,
+          "Files/data.csv",
+          confirm = TRUE,
+          token = "token"
+        )
+      }
+    )) {
+      expect_s3_class(
+        rlang::catch_cnd(operation()),
+        "fabric_onelake_target_error"
+      )
+    }
+  }
+  item$workspaceDisplayName <- "Production"
+  expect_identical(
+    onelake_resolve_target("Production", item, "Files/data.csv")$workspace,
+    item$workspaceId
+  )
+})
+
+test_that("OneLake targets support IDs, discovery records, and complete paths", {
+  workspace_id <- "11111111-1111-1111-1111-111111111111"
+  item_id <- "22222222-2222-2222-2222-222222222222"
+
+  named <- onelake_resolve_target(
+    "Analytics",
+    "Curated",
+    "Files/café 数据.csv",
+    "Lakehouse"
+  )
+  expect_equal(named$workspace, "Analytics")
+  expect_equal(named$item, "Curated.Lakehouse")
+  expect_match(onelake_path_url(named), "caf%C3%A9%20%E6%95%B0%E6%8D%AE.csv")
+  reserved <- onelake_resolve_target(
+    "Analytics",
+    "Curated.Lakehouse",
+    "Files/a?b#c.csv"
+  )
+  expect_match(onelake_path_url(reserved), "Files/a%3Fb%23c.csv", fixed = TRUE)
+  expect_equal(
+    onelake_resolve_target(
+      "Analytics",
+      "Curated.v2",
+      item_type = "Lakehouse"
+    )$item,
+    "Curated.v2.Lakehouse"
+  )
+
+  discovered <- onelake_resolve_target(
+    NULL,
+    list(id = item_id, workspaceId = workspace_id, type = "Lakehouse"),
+    "Files/nested/file.csv"
+  )
+  expect_equal(discovered$workspace, workspace_id)
+
+  complete_reserved <- onelake_resolve_target(paste0(
+    "https://onelake.dfs.fabric.microsoft.com/",
+    workspace_id,
+    "/",
+    item_id,
+    "/Files/a%3Fb%23c.csv"
+  ))
+  expect_equal(complete_reserved$path, "Files/a?b#c.csv")
+  expect_match(
+    onelake_path_url(complete_reserved),
+    "Files/a%3Fb%23c.csv",
+    fixed = TRUE
+  )
+  expect_error(
+    onelake_resolve_target(paste0(
+      "https://user@onelake.dfs.fabric.microsoft.com/",
+      workspace_id,
+      "/",
+      item_id
+    )),
+    "must not include user information",
+    fixed = TRUE
+  )
+  expect_error(
+    onelake_resolve_target(paste0(
+      "https://onelake.dfs.fabric.microsoft.com:444/",
+      workspace_id,
+      "/",
+      item_id
+    )),
+    "default port",
+    fixed = TRUE
+  )
+  expect_equal(discovered$item, item_id)
+
+  private_dfs <- paste0(
+    "https://",
+    gsub("-", "", workspace_id),
+    ".z12.dfs.fabric.microsoft.com"
+  )
+  discovered_endpoint <- onelake_resolve_target(
+    list(
+      id = workspace_id,
+      oneLakeEndpoints = list(dfsEndpoint = private_dfs)
+    ),
+    list(id = item_id, workspaceId = workspace_id, type = "Lakehouse"),
+    "Files/nested/file.csv"
+  )
+  expect_equal(discovered_endpoint$dfs_base, private_dfs)
+  expect_equal(
+    onelake_resolve_target(
+      list(
+        id = workspace_id,
+        oneLakeEndpoints = list(dfsEndpoint = private_dfs)
+      ),
+      list(id = item_id, workspaceId = workspace_id, type = "Lakehouse"),
+      dfs_base = "https://westeurope-onelake.dfs.fabric.microsoft.com"
+    )$dfs_base,
+    "https://westeurope-onelake.dfs.fabric.microsoft.com"
+  )
+
+  https <- onelake_resolve_target(paste0(
+    "https://onelake.dfs.fabric.microsoft.com/",
+    workspace_id,
+    "/",
+    item_id,
+    "/Files/nested/file.csv"
+  ))
+  abfss <- onelake_resolve_target(paste0(
+    "abfss://",
+    workspace_id,
+    "@onelake.dfs.fabric.microsoft.com/",
+    item_id,
+    "/Files/nested/file.csv"
+  ))
+  expect_equal(
+    https[c("workspace", "item", "path")],
+    abfss[c("workspace", "item", "path")]
+  )
+
+  expect_error(
+    onelake_resolve_target(workspace_id, "Curated.Lakehouse"),
+    "GUIDs to be used together",
+    fixed = TRUE
+  )
+  expect_error(
+    onelake_resolve_target("Analytics", "Curated"),
+    "type suffix",
+    fixed = TRUE
+  )
+  expect_error(
+    onelake_resolve_target("Analytics/Other", "Curated.Lakehouse"),
+    "workspace must be exactly one URI path segment",
+    fixed = TRUE
+  )
+  for (unsafe_workspace in c(".", "..", "%2e%2e", "%252e%252e")) {
+    expect_error(
+      onelake_resolve_target(unsafe_workspace, "Curated.Lakehouse"),
+      "workspace must be exactly one URI path segment",
+      fixed = TRUE
+    )
+  }
+  for (unsafe_item in c(".", "..", "%2f", "%255c")) {
+    expect_error(
+      onelake_resolve_target(
+        "Analytics",
+        unsafe_item,
+        item_type = "Lakehouse"
+      ),
+      "item must be exactly one URI path segment",
+      fixed = TRUE
+    )
+  }
+  expect_error(
+    onelake_resolve_target(
+      "Analytics",
+      "Folder/Curated",
+      item_type = "Lakehouse"
+    ),
+    "item must be exactly one URI path segment",
+    fixed = TRUE
+  )
+  expect_error(
+    onelake_resolve_target(
+      "Analytics",
+      "Curated.Warehouse",
+      item_type = "Lakehouse"
+    ),
+    "conflicts with the item's existing type suffix",
+    fixed = TRUE
+  )
+  expect_error(
+    onelake_resolve_target("https://example.test/ws/item/Files/x"),
+    "not a Microsoft Fabric OneLake host",
+    fixed = TRUE
+  )
+  regional <- onelake_resolve_target(
+    "https://westeurope-api.onelake.fabric.microsoft.com/Analytics/Curated.Lakehouse/Files/x"
+  )
+  expect_equal(
+    regional$dfs_base,
+    "https://westeurope-api.onelake.fabric.microsoft.com"
+  )
+  regional_dfs <- onelake_resolve_target(
+    "https://westeurope-onelake.dfs.fabric.microsoft.com/Analytics/Curated.Lakehouse/Files/x"
+  )
+  expect_equal(
+    regional_dfs$dfs_base,
+    "https://westeurope-onelake.dfs.fabric.microsoft.com"
+  )
+  private_workspace <- onelake_resolve_target(paste0(
+    "https://",
+    workspace_id,
+    ".z12.dfs.fabric.microsoft.com/",
+    workspace_id,
+    "/",
+    item_id,
+    "/Files/x"
+  ))
+  expect_equal(
+    private_workspace$dfs_base,
+    paste0("https://", workspace_id, ".z12.dfs.fabric.microsoft.com")
+  )
+
+  compact_workspace <- gsub("-", "", workspace_id, fixed = TRUE)
+  workspace_dfs <- paste0(
+    "https://",
+    compact_workspace,
+    ".z12.dfs.fabric.microsoft.com"
+  )
+  item_scoped <- onelake_resolve_target(paste0(
+    workspace_dfs,
+    "/",
+    item_id,
+    "/Ingestion/Queue"
+  ))
+  expect_equal(item_scoped$workspace, workspace_id)
+  expect_equal(item_scoped$item, item_id)
+  expect_equal(item_scoped$path, "Ingestion/Queue")
+  expect_equal(item_scoped$dfs_base, workspace_dfs)
+
+  blob_scoped <- onelake_resolve_target(paste0(
+    "https://",
+    compact_workspace,
+    ".z12.blob.fabric.microsoft.com/",
+    item_id,
+    "/Files/x"
+  ))
+  expect_equal(blob_scoped$workspace, workspace_id)
+  expect_equal(blob_scoped$dfs_base, workspace_dfs)
+})
+
+test_that("OneLake listing follows header continuation and preserves hierarchy", {
+  calls <- list()
+  pages <- list(
+    onelake_test_response(
+      body = list(
+        paths = list(
+          list(
+            name = "Curated.Lakehouse/Files/a/duplicate.txt",
+            isDirectory = FALSE,
+            contentLength = "3",
+            etag = "\"one\"",
+            lastModified = "Fri, 24 Jul 2026 10:00:00 GMT"
+          ),
+          list(
+            name = "Curated.Lakehouse/Files/b",
+            isDirectory = "true",
+            contentLength = "0"
+          )
+        )
+      ),
+      headers = list("x-ms-continuation" = "opaque+/= token")
+    ),
+    onelake_test_response(
+      body = list(
+        paths = list(
+          list(
+            name = "Curated.Lakehouse/Files/b/duplicate.txt",
+            isDirectory = FALSE,
+            contentLength = "4",
+            etag = "\"two\""
+          ),
+          list(
+            name = "Curated.Lakehouse/Files/unicode/café-数据.txt",
+            isDirectory = FALSE,
+            contentLength = "5"
+          )
+        )
+      )
+    )
+  )
+  httr2::local_mocked_responses(function(req) {
+    calls[[length(calls) + 1L]] <<- req
+    pages[[length(calls)]]
+  })
+  audiences <- character()
+
+  files <- fabric_onelake_list(
+    "Analytics",
+    "Curated.Lakehouse",
+    path = "Files",
+    recursive = TRUE,
+    page_size = 2L,
+    token = function(audience, force_refresh = FALSE) {
+      audiences <<- c(audiences, audience)
+      "storage-token"
+    }
+  )
+
+  expect_s3_class(files, "tbl_df")
+  expect_equal(nrow(files), 4L)
+  expect_equal(sum(files$name == "duplicate.txt"), 2L)
+  expect_equal(
+    files$path[files$name == "duplicate.txt"],
+    c("Files/a/duplicate.txt", "Files/b/duplicate.txt")
+  )
+  expect_true(any(files$path == "Files/unicode/café-数据.txt"))
+  expect_true(files$is_directory[files$path == "Files/b"])
+  expect_equal(audiences, rep(.fabric_audience$storage, 2L))
+  expect_match(calls[[1L]]$url, "recursive=true")
+  expect_match(calls[[1L]]$url, "maxResults=2")
+  expect_match(calls[[2L]]$url, "continuation=opaque%2B%2F%3D%20token")
+})
+
+test_that("OneLake listings compare GUIDs without changing file path case", {
+  workspace <- "abcdefab-1234-5678-9abc-abcdefabcdef"
+  item <- "fedcbafe-1234-5678-9abc-fedcbafedcba"
+  for (upper_request in c(TRUE, FALSE)) {
+    requested <- if (upper_request) toupper(item) else item
+    returned <- if (upper_request) item else toupper(item)
+    httr2::local_mocked_responses(list(onelake_test_response(
+      body = list(
+        paths = list(
+          list(name = returned, isDirectory = TRUE),
+          list(name = paste0(returned, "/Files/MixedCase.txt"))
+        )
+      )
+    )))
+    listed <- fabric_onelake_list(
+      toupper(workspace),
+      requested,
+      token = "storage-token"
+    )
+    expect_identical(listed$path, c("", "Files/MixedCase.txt"))
+    expect_identical(listed$name, c("", "MixedCase.txt"))
+  }
+  for (pair in list(
+    c(item, workspace),
+    c(item, paste0(item, "extra")),
+    c("Curated.Lakehouse", "curated.Lakehouse")
+  )) {
+    target <- list(item = pair[[1L]], path = "Files")
+    expect_error(
+      onelake_list_tibble(
+        list(list(name = paste0(pair[[2L]], "/Files/x"))),
+        target
+      ),
+      class = "fabric_onelake_protocol_error"
+    )
+  }
+})
+
+test_that("OneLake requests use the documented storage API version", {
+  request <- onelake_request("https://onelake.dfs.fabric.microsoft.com")
+  expect_identical(request$headers[["x-ms-version"]], "2021-06-08")
+
+  withr::local_options(fabricqueryr.onelake.api_version = "2024-11-04")
+  request <- onelake_request("https://onelake.dfs.fabric.microsoft.com")
+  expect_identical(request$headers[["x-ms-version"]], "2024-11-04")
+
+  for (version in list("latest", c("2021-06-08", "2023-08-03"), NA)) {
+    withr::local_options(fabricqueryr.onelake.api_version = version)
+    error <- rlang::catch_cnd(onelake_request(
+      "https://onelake.dfs.fabric.microsoft.com"
+    ))
+    expect_s3_class(error, "rlang_error")
+    expect_match(conditionMessage(error), "must be one YYYY-MM-DD string")
+  }
+})
+
+test_that("OneLake listing rejects repeated continuation tokens", {
+  calls <- 0L
+  httr2::local_mocked_responses(function(req) {
+    calls <<- calls + 1L
+    onelake_test_response(
+      body = list(paths = list()),
+      headers = list("x-ms-continuation" = "repeated-token")
+    )
+  })
+
+  expect_error(
+    fabric_onelake_list(
+      "Analytics",
+      "Curated.Lakehouse",
+      path = "Files",
+      token = "token"
+    ),
+    "repeated pagination URL",
+    fixed = TRUE
+  )
+  expect_equal(calls, 2L)
+})
+
+test_that("OneLake listing rejects malformed JSON envelopes", {
+  malformed <- list(
+    list(value = list()),
+    list(paths = list(entry = list(name = "item/Files/a"))),
+    list(paths = list("not-an-object"))
+  )
+  for (body in malformed) {
+    httr2::local_mocked_responses(list(onelake_test_response(body = body)))
+    error <- rlang::catch_cnd(fabric_onelake_list(
+      "Analytics",
+      "Curated.Lakehouse",
+      path = "Files",
+      token = "token"
+    ))
+    expect_s3_class(error, "fabric_onelake_protocol_error")
+  }
+
+  httr2::local_mocked_responses(list(onelake_test_response(
+    body = charToRaw("{"),
+    headers = list(`content-type` = "application/json")
+  )))
+  error <- rlang::catch_cnd(fabric_onelake_list(
+    "Analytics",
+    "Curated.Lakehouse",
+    path = "Files",
+    token = "token"
+  ))
+  expect_s3_class(error, "fabric_onelake_protocol_error")
+  expect_match(conditionMessage(error), "invalid directory-list JSON")
+  expect_equal(error$page_number, 1L)
+})
+
+test_that("OneLake listing validates every returned path record", {
+  target <- onelake_resolve_target(
+    "Analytics",
+    "Curated.Lakehouse",
+    "Files"
+  )
+  valid <- list(
+    name = "Curated.Lakehouse/Files/a.txt",
+    isDirectory = FALSE,
+    contentLength = "1"
+  )
+  invalid <- list(
+    within_item_but_outside_directory = within(valid, {
+      name <- "Curated.Lakehouse/Tables/orders"
+    }),
+    unsafe_path = within(valid, {
+      name <- "Curated.Lakehouse/Files/../outside"
+    }),
+    wrong_path_case = within(valid, {
+      name <- "Curated.Lakehouse/files/a.txt"
+    }),
+    bad_directory = within(valid, {
+      isDirectory <- "maybe"
+    }),
+    negative_length = within(valid, {
+      contentLength <- "-1"
+    }),
+    vector_etag = within(valid, {
+      etag <- c("one", "two")
+    }),
+    missing_name = within(valid, rm(name))
+  )
+
+  for (record in invalid) {
+    error <- rlang::catch_cnd(onelake_list_tibble(list(record), target))
+    expect_s3_class(error, "fabric_onelake_protocol_error")
+    expect_equal(error$record_number, 1L)
+  }
+
+  valid$isDirectory <- NULL
+  result <- onelake_list_tibble(list(valid), target)
+  expect_false(result$is_directory)
+
+  valid$contentLength <- NULL
+  result <- onelake_list_tibble(list(valid), target)
+  expect_true(is.na(result$content_length))
+  expect_false(result$is_directory)
+})
+
+test_that("OneLake listing enforces page and total-time limits", {
+  target <- onelake_resolve_target(
+    "Analytics",
+    "Curated.Lakehouse",
+    "Files"
+  )
+  credential <- fabric_credential(token = "storage-token")
+  calls <- 0L
+  local_mocked_bindings(
+    .httr2_perform = function(req, ...) {
+      calls <<- calls + 1L
+      onelake_test_response(
+        body = list(paths = list()),
+        headers = list("x-ms-continuation" = paste0("page-", calls)),
+        url = req$url
+      )
+    }
+  )
+
+  page_error <- expect_error(
+    onelake_list_target(
+      target,
+      credential,
+      max_pages = 2L,
+      pagination_timeout = 60
+    ),
+    class = "fabric_onelake_pagination_error"
+  )
+  expect_identical(page_error$max_pages, 2L)
+  expect_identical(calls, 2L)
+
+  started <- as.POSIXct("2026-08-26 12:00:00", tz = "UTC")
+  times <- started + c(0, 0, 2)
+  time_index <- 0L
+  now <- function() {
+    time_index <<- time_index + 1L
+    times[[time_index]]
+  }
+  calls <- 0L
+  time_error <- expect_error(
+    onelake_list_target(
+      target,
+      credential,
+      max_pages = 10L,
+      pagination_timeout = 1,
+      .now = now
+    ),
+    class = "fabric_onelake_pagination_error"
+  )
+  expect_match(conditionMessage(time_error), "total time limit", fixed = TRUE)
+  expect_s3_class(time_error$deadline, "POSIXct")
+  expect_identical(calls, 1L)
+})
+
+test_that("OneLake listing can begin from a lexicographic path", {
+  captured <- NULL
+  httr2::local_mocked_responses(function(req) {
+    captured <<- req
+    onelake_test_response(body = list(paths = list()))
+  })
+  fabric_onelake_list(
+    "Analytics",
+    "Curated.Lakehouse",
+    path = "Tables/table/_delta_log",
+    token = "token",
+    begin_from = "00000000000000000100"
+  )
+
+  expect_match(captured$url, "beginFrom=00000000000000000100")
+  expect_error(
+    fabric_onelake_list(
+      "Analytics",
+      "Curated.Lakehouse",
+      path = "Tables/table/_delta_log",
+      token = "token",
+      begin_from = "../outside"
+    ),
+    "unsafe segment",
+    fixed = TRUE
+  )
+  expect_error(
+    fabric_onelake_list(
+      "Analytics",
+      "Curated.Lakehouse",
+      path = "Files",
+      recursive = FALSE,
+      token = "token",
+      begin_from = "nested/file.csv"
+    ),
+    "one path level",
+    fixed = TRUE
+  )
+})
+
+test_that("OneLake metadata exposes properties and ETags", {
+  captured <- NULL
+  httr2::local_mocked_responses(function(req) {
+    captured <<- req
+    onelake_test_response(
+      headers = list(
+        "content-length" = "17",
+        "content-type" = "text/plain",
+        "etag" = "\"etag-value\"",
+        "last-modified" = "Fri, 24 Jul 2026 10:00:00 GMT",
+        "x-ms-resource-type" = "file",
+        "x-ms-request-id" = "storage-request"
+      ),
+      url = req$url
+    )
+  })
+
+  metadata <- fabric_onelake_metadata(
+    "Analytics",
+    "Curated.Lakehouse",
+    "Files/café.txt",
+    token = "token"
+  )
+
+  expect_equal(captured$method, "HEAD")
+  expect_match(captured$url, "caf%C3%A9.txt")
+  expect_equal(metadata$content_length, 17)
+  expect_equal(metadata$content_type, "text/plain")
+  expect_equal(metadata$etag, "\"etag-value\"")
+  expect_false(metadata$is_directory)
+  expect_equal(metadata$request_id, "storage-request")
+})
+
+test_that("OneLake download supports ranges, ETags, and staged destinations", {
+  captured <- list()
+  httr2::local_mocked_responses(function(req) {
+    captured[[length(captured) + 1L]] <<- req
+    ranged <- !is.null(req$headers$Range)
+    onelake_test_response(
+      status = if (ranged) 206L else 200L,
+      headers = if (ranged) {
+        list(`Content-Range` = "bytes 1-3/5")
+      } else {
+        list()
+      },
+      body = charToRaw(if (ranged) "lph" else "alpha"),
+      url = req$url
+    )
+  })
+
+  value <- fabric_onelake_download(
+    "Analytics",
+    "Curated.Lakehouse",
+    "Files/a.txt",
+    range = c(1, 3),
+    if_match = "\"etag\"",
+    token = "token"
+  )
+  expect_identical(rawToChar(value), "lph")
+  expect_equal(captured[[1L]]$headers$Range, "bytes=1-3")
+  expect_equal(captured[[1L]]$headers[["If-Match"]], "\"etag\"")
+  expect_equal(onelake_if_match("0x8DA58EE365"), "\"0x8DA58EE365\"")
+
+  dest <- tempfile("onelake-destination-")
+  on.exit(unlink(dest), add = TRUE)
+  local_mocked_bindings(
+    .httr2_perform = function(req, download_path = NULL, ...) {
+      writeBin(charToRaw("alpha"), download_path)
+      onelake_test_response(body = charToRaw("alpha"), url = req$url)
+    }
+  )
+  result <- fabric_onelake_download(
+    "Analytics",
+    "Curated.Lakehouse",
+    "Files/a.txt",
+    dest = dest,
+    token = "token"
+  )
+  expect_true(file.exists(dest))
+  expect_equal(readChar(dest, nchars = 5L, useBytes = TRUE), "alpha")
+  expect_equal(result, normalizePath(dest, winslash = "/", mustWork = TRUE))
+  expect_error(
+    fabric_onelake_download(
+      "Analytics",
+      "Curated.Lakehouse",
+      "Files/a.txt",
+      dest = dest,
+      token = "token"
+    ),
+    "Destination already exists",
+    fixed = TRUE
+  )
+  expect_equal(
+    fabric_onelake_download(
+      "Analytics",
+      "Curated.Lakehouse",
+      "Files/a.txt",
+      dest = dest,
+      overwrite = TRUE,
+      token = "token"
+    ),
+    normalizePath(dest, winslash = "/", mustWork = TRUE)
+  )
+  expect_equal(readChar(dest, nchars = 5L, useBytes = TRUE), "alpha")
+})
+
+test_that("OneLake ranged downloads reject invalid partial responses", {
+  responses <- list(
+    onelake_test_response(status = 200L, body = charToRaw("alpha")),
+    onelake_test_response(status = 206L, body = charToRaw("lph")),
+    onelake_test_response(
+      status = 206L,
+      headers = list(`Content-Range` = "bytes 0-2/5"),
+      body = charToRaw("alp")
+    ),
+    onelake_test_response(status = 200L, body = charToRaw("alpha"))
+  )
+  calls <- 0L
+  local_mocked_bindings(
+    .httr2_perform = function(req, download_path = NULL, ...) {
+      calls <<- calls + 1L
+      if (!is.null(download_path)) {
+        writeBin(charToRaw("alpha"), download_path)
+      }
+      responses[[calls]]
+    }
+  )
+
+  errors <- lapply(seq_len(3L), function(index) {
+    rlang::catch_cnd(fabric_onelake_download(
+      "Analytics",
+      "Curated.Lakehouse",
+      "Files/a.txt",
+      range = c(1, 3),
+      token = "token"
+    ))
+  })
+
+  for (error in errors) {
+    expect_s3_class(error, "fabric_onelake_range_response_error")
+  }
+  expect_identical(errors[[1L]]$status_code, 200L)
+  expect_null(errors[[2L]]$response_start)
+  expect_identical(errors[[3L]]$response_start, 0)
+
+  dest <- tempfile("onelake-invalid-range-")
+  on.exit(unlink(dest), add = TRUE)
+  disk_error <- rlang::catch_cnd(fabric_onelake_download(
+    "Analytics",
+    "Curated.Lakehouse",
+    "Files/a.txt",
+    dest = dest,
+    range = c(1, 3),
+    token = "token"
+  ))
+
+  expect_s3_class(disk_error, "fabric_onelake_range_response_error")
+  expect_false(file.exists(dest))
+})
+
+test_that("OneLake ranged downloads verify the received byte count", {
+  payload <- raw()
+  local_mocked_bindings(
+    .httr2_perform = function(req, download_path = NULL, ...) {
+      if (!is.null(download_path)) {
+        writeBin(payload, download_path)
+      }
+      onelake_test_response(
+        status = 206L,
+        headers = list(`Content-Range` = "bytes 1-3/5"),
+        body = payload,
+        url = req$url
+      )
+    }
+  )
+
+  for (received in list(charToRaw("lp"), charToRaw("lpha"))) {
+    payload <- received
+    memory_error <- rlang::catch_cnd(fabric_onelake_download(
+      "Analytics",
+      "Curated.Lakehouse",
+      "Files/a.txt",
+      range = c(1, 3),
+      token = "token"
+    ))
+    expect_s3_class(memory_error, "fabric_onelake_range_response_error")
+    expect_equal(memory_error$expected_length, 3)
+    expect_equal(memory_error$observed_length, length(received))
+
+    dest <- tempfile("onelake-invalid-range-length-")
+    on.exit(unlink(dest, force = TRUE), add = TRUE)
+    disk_error <- rlang::catch_cnd(fabric_onelake_download(
+      "Analytics",
+      "Curated.Lakehouse",
+      "Files/a.txt",
+      dest = dest,
+      range = c(1, 3),
+      token = "token"
+    ))
+    expect_s3_class(disk_error, "fabric_onelake_range_response_error")
+    expect_equal(disk_error$expected_length, 3)
+    expect_equal(disk_error$observed_length, length(received))
+    expect_false(file.exists(dest))
+  }
+})
+
+test_that("OneLake open-ended ranges require the remaining file interval", {
+  httr2::local_mocked_responses(function(req) {
+    onelake_test_response(
+      status = 206L,
+      headers = list(`Content-Range` = "bytes 2-4/5"),
+      body = charToRaw("pha"),
+      url = req$url
+    )
+  })
+
+  value <- fabric_onelake_download(
+    "Analytics",
+    "Curated.Lakehouse",
+    "Files/a.txt",
+    range = 2,
+    token = "token"
+  )
+
+  expect_identical(rawToChar(value), "pha")
+})
+
+test_that("failed atomic replacement leaves the original destination intact", {
+  dest <- tempfile("onelake-existing-")
+  on.exit(unlink(dest), add = TRUE)
+  writeBin(charToRaw("original"), dest)
+  rename_calls <- 0L
+  destination_was_present <- FALSE
+  local_mocked_bindings(
+    .httr2_perform = function(req, download_path = NULL, ...) {
+      writeBin(charToRaw("replacement"), download_path)
+      onelake_test_response(body = charToRaw("replacement"), url = req$url)
+    },
+    .onelake_file_rename = function(from, to) {
+      rename_calls <<- rename_calls + 1L
+      destination_was_present <<- file.exists(to) &&
+        identical(
+          readChar(to, nchars = 8L, useBytes = TRUE),
+          "original"
+        )
+      FALSE
+    }
+  )
+
+  error <- rlang::catch_cnd(fabric_onelake_download(
+    "Analytics",
+    "Curated.Lakehouse",
+    "Files/a.txt",
+    dest = dest,
+    overwrite = TRUE,
+    token = "token"
+  ))
+
+  expect_s3_class(error, "fabric_onelake_atomic_commit_unavailable")
+  expect_equal(
+    readChar(dest, nchars = 8L, useBytes = TRUE),
+    "original"
+  )
+  expect_identical(rename_calls, 1L)
+  expect_true(destination_was_present)
+})
+
+test_that("atomic replacement publishes one complete staged download", {
+  temporary <- tempfile("onelake-staged-")
+  dest <- tempfile("onelake-existing-")
+  on.exit(unlink(c(temporary, dest), force = TRUE), add = TRUE)
+  writeBin(charToRaw("replacement"), temporary)
+  writeBin(charToRaw("original"), dest)
+
+  expect_invisible(onelake_commit_download(temporary, dest, overwrite = TRUE))
+
+  expect_false(file.exists(temporary))
+  expect_identical(
+    readChar(dest, nchars = 11L, useBytes = TRUE),
+    "replacement"
+  )
+})
+
+test_that("OneLake download never replaces a directory destination", {
+  dest <- tempfile("onelake-directory-")
+  dir.create(dest)
+  sentinel <- file.path(dest, "sentinel.txt")
+  writeLines("keep", sentinel)
+  on.exit(unlink(dest, recursive = TRUE, force = TRUE), add = TRUE)
+  performed <- FALSE
+  local_mocked_bindings(
+    .httr2_perform = function(...) {
+      performed <<- TRUE
+      rlang::abort("request should not be performed")
+    }
+  )
+
+  expect_error(
+    fabric_onelake_download(
+      "Analytics",
+      "Curated.Lakehouse",
+      "Files/a.txt",
+      dest = dest,
+      overwrite = TRUE,
+      token = "token"
+    ),
+    "Destination is a directory",
+    fixed = TRUE
+  )
+  expect_false(performed)
+  expect_equal(readLines(sentinel), "keep")
+})
+
+test_that("download commit rechecks no-overwrite destinations", {
+  temporary <- tempfile("onelake-staged-")
+  dest <- tempfile("onelake-raced-")
+  on.exit(unlink(c(temporary, dest), force = TRUE), add = TRUE)
+  writeBin(charToRaw("replacement"), temporary)
+  writeBin(charToRaw("winner"), dest)
+
+  expect_error(
+    onelake_commit_download(temporary, dest, overwrite = FALSE),
+    "Destination already exists",
+    fixed = TRUE
+  )
+  expect_equal(readChar(dest, nchars = 6L, useBytes = TRUE), "winner")
+  expect_true(file.exists(temporary))
+})
+
+test_that("no-overwrite download commit preserves one race winner", {
+  temporary <- tempfile("onelake-staged-")
+  dest <- tempfile("onelake-linked-")
+  on.exit(unlink(c(temporary, dest), force = TRUE), add = TRUE)
+  writeBin(charToRaw("download"), temporary)
+  local_mocked_bindings(
+    .onelake_file_link = function(from, to) {
+      writeBin(charToRaw("winner"), to)
+      FALSE
+    }
+  )
+
+  expect_error(
+    onelake_commit_new_download(temporary, dest),
+    "Destination already exists",
+    fixed = TRUE
+  )
+  expect_equal(readChar(dest, nchars = 6L, useBytes = TRUE), "winner")
+  expect_true(file.exists(temporary))
+})
+
+test_that("no-overwrite publication fails closed without a hard link", {
+  temporary <- tempfile("onelake-staged-")
+  dest <- tempfile("onelake-unpublished-")
+  on.exit(unlink(c(temporary, dest), force = TRUE), add = TRUE)
+  writeBin(charToRaw("download"), temporary)
+  local_mocked_bindings(
+    .onelake_file_link = function(from, to) FALSE
+  )
+
+  error <- rlang::catch_cnd(onelake_commit_new_download(temporary, dest))
+
+  expect_s3_class(error, "fabric_onelake_atomic_commit_unavailable")
+  expect_false(file.exists(dest))
+  expect_true(file.exists(temporary))
+  expect_identical(
+    readChar(temporary, nchars = 8L, useBytes = TRUE),
+    "download"
+  )
+})
+
+test_that("committed hard links survive staging cleanup failures", {
+  temporary <- tempfile("onelake-staged-")
+  dest <- tempfile("onelake-linked-")
+  on.exit(unlink(c(temporary, dest), force = TRUE), add = TRUE)
+  writeBin(charToRaw("download"), temporary)
+  local_mocked_bindings(
+    .onelake_file_unlink = function(path) 1L
+  )
+
+  expect_warning(
+    expect_invisible(onelake_commit_new_download(temporary, dest)),
+    "staging link could not be removed",
+    fixed = TRUE
+  )
+
+  expect_true(file.exists(temporary))
+  expect_true(file.exists(dest))
+  expect_identical(readChar(dest, nchars = 8L, useBytes = TRUE), "download")
+})
+
+test_that("OneLake download returns raw zero bytes for an empty file", {
+  httr2::local_mocked_responses(function(req) {
+    onelake_test_response(
+      body = raw(),
+      headers = list(`content-length` = "0"),
+      url = req$url
+    )
+  })
+
+  value <- fabric_onelake_download(
+    "Analytics",
+    "Curated.Lakehouse",
+    "Files/empty.bin",
+    token = "token"
+  )
+
+  expect_identical(value, raw())
+})
+
+test_that("OneLake staging reservation exclusively creates the containing directory", {
+  target <- onelake_resolve_target(
+    "Analytics",
+    "Curated.Lakehouse",
+    "Files/staging/load/part.parquet"
+  )
+  parents <- NULL
+  local_mocked_bindings(onelake_create_parents = function(target, credential) {
+    parents <<- target$path
+  })
+  requests <- list()
+  httr2::local_mocked_responses(function(req) {
+    requests[[length(requests) + 1L]] <<- req
+    onelake_test_response(status = 201L, url = req$url)
+  })
+  expect_identical(
+    onelake_reserve_staging(target, fabric_credential(token = "token")),
+    TRUE
+  )
+  expect_identical(parents, "Files/staging/load")
+  expect_length(requests, 1L)
+  expect_identical(requests[[1L]]$method, "PUT")
+  expect_match(
+    requests[[1L]]$url,
+    "/Files/staging/load?resource=directory",
+    fixed = TRUE
+  )
+  expect_identical(requests[[1L]]$headers[["If-None-Match"]], "*")
+})
+
+test_that("OneLake upload chunks to a temporary path and renames atomically", {
+  captured <- list()
+  httr2::local_mocked_responses(function(req) {
+    captured[[length(captured) + 1L]] <<- req
+    onelake_test_response(
+      status = if (identical(req$method, "PUT")) 201L else 200L,
+      headers = list(
+        etag = "\"uploaded\"",
+        "last-modified" = "Fri, 24 Jul 2026 10:00:00 GMT"
+      ),
+      url = req$url
+    )
+  })
+
+  uploaded <- fabric_onelake_upload(
+    "Analytics",
+    "Curated.Lakehouse",
+    "Files/file.txt",
+    source = charToRaw("hello"),
+    content_type = "text/plain; charset=utf-8",
+    token = "token"
+  )
+
+  expect_equal(
+    vapply(captured, function(req) req$method, character(1)),
+    c("PUT", "PATCH", "PATCH", "PUT")
+  )
+  expect_match(captured[[1L]]$url, "resource=file")
+  expect_match(captured[[1L]]$url, "fabricqueryr-upload")
+  expect_equal(captured[[1L]]$headers[["If-None-Match"]], "*")
+  expect_equal(
+    captured[[1L]]$headers[["x-ms-content-type"]],
+    "text/plain; charset=utf-8"
+  )
+  expect_match(captured[[2L]]$url, "action=append")
+  expect_match(captured[[2L]]$url, "position=0")
+  expect_identical(captured[[2L]]$body$data, charToRaw("hello"))
+  expect_match(captured[[3L]]$url, "action=flush")
+  expect_match(captured[[3L]]$url, "position=5")
+  expect_equal(
+    captured[[3L]]$headers[["x-ms-content-type"]],
+    "text/plain; charset=utf-8"
+  )
+  expect_match(captured[[4L]]$url, "Files/file.txt\\?mode=posix")
+  expect_match(
+    captured[[4L]]$headers[["x-ms-rename-source"]],
+    "^/Analytics/Curated.Lakehouse/Files/\\.fabricqueryr-upload-"
+  )
+  expect_equal(
+    captured[[4L]]$headers[["x-ms-content-type"]],
+    "text/plain; charset=utf-8"
+  )
+  expect_equal(captured[[4L]]$headers[["If-None-Match"]], "*")
+  expect_equal(uploaded$content_length, 5)
+  expect_equal(uploaded$etag, "\"uploaded\"")
+
+  captured <- list()
+  fabric_onelake_upload(
+    "Analytics",
+    "Curated.Lakehouse",
+    "Files/file.txt",
+    source = raw(),
+    overwrite = TRUE,
+    if_match = "\"old\"",
+    token = "token"
+  )
+  expect_equal(length(captured), 3L)
+  expect_equal(captured[[1L]]$headers[["If-None-Match"]], "*")
+  expect_match(captured[[2L]]$url, "position=0")
+  expect_equal(captured[[3L]]$headers[["If-Match"]], "\"old\"")
+  expect_null(captured[[3L]]$headers[["If-None-Match"]])
+})
+
+test_that("OneLake upload streams local files in configured chunks", {
+  captured <- list()
+  httr2::local_mocked_responses(function(req) {
+    captured[[length(captured) + 1L]] <<- req
+    onelake_test_response(
+      status = if (identical(req$method, "PUT")) 201L else 200L,
+      url = req$url
+    )
+  })
+  source <- tempfile("onelake-upload-")
+  on.exit(unlink(source), add = TRUE)
+  writeBin(charToRaw("abcdefgh"), source)
+
+  fabric_onelake_upload(
+    "Analytics",
+    "Curated.Lakehouse",
+    "Files/chunked.txt",
+    source = source,
+    chunk_size = 3,
+    token = "token"
+  )
+
+  appends <- captured[vapply(
+    captured,
+    function(req) grepl("action=append", req$url, fixed = TRUE),
+    logical(1)
+  )]
+  expect_length(appends, 3L)
+  expect_match(appends[[1L]]$url, "position=0")
+  expect_match(appends[[2L]]$url, "position=3")
+  expect_match(appends[[3L]]$url, "position=6")
+  expect_identical(
+    lapply(appends, function(req) rawToChar(req$body$data)),
+    list("abc", "def", "gh")
+  )
+  expect_match(captured[[5L]]$url, "position=8")
+  expect_equal(captured[[6L]]$method, "PUT")
+})
+
+test_that("OneLake upload removes temporary files after transfer failure", {
+  calls <- list()
+  local_mocked_bindings(
+    .httr2_perform = function(req, ...) {
+      calls[[length(calls) + 1L]] <<- req
+      if (grepl("action=append", req$url, fixed = TRUE)) {
+        rlang::abort("simulated append failure")
+      }
+      onelake_test_response(
+        status = if (identical(req$method, "PUT")) 201L else 200L,
+        url = req$url
+      )
+    }
+  )
+
+  expect_error(
+    fabric_onelake_upload(
+      "Analytics",
+      "Curated.Lakehouse",
+      "Files/failure.txt",
+      source = charToRaw("content"),
+      chunk_size = 3,
+      token = "token"
+    ),
+    "simulated append failure",
+    fixed = TRUE
+  )
+
+  expect_equal(
+    vapply(calls, function(req) req$method, character(1)),
+    c("PUT", "PATCH", "DELETE")
+  )
+  expect_match(calls[[3L]]$url, "fabricqueryr-upload")
+  expect_false(grepl("recursive=", calls[[3L]]$url, fixed = TRUE))
+  expect_false(any(grepl(
+    "Files/failure.txt\\?mode=posix",
+    vapply(
+      calls,
+      `[[`,
+      character(1),
+      "url"
+    )
+  )))
+})
+
+test_that("OneLake upload never deletes a staging path after a rejected create", {
+  for (status in c(400L, 401L, 403L, 404L, 409L, 412L, 429L)) {
+    calls <- list()
+    local_mocked_bindings(
+      .httr2_perform = function(req, ...) {
+        calls[[length(calls) + 1L]] <<- req
+        rlang::abort(
+          "Temporary create rejected",
+          class = "fabric_http_error",
+          status = status
+        )
+      }
+    )
+    error <- rlang::catch_cnd(fabric_onelake_upload(
+      "Analytics",
+      "Curated.Lakehouse",
+      "Files/collision.txt",
+      source = charToRaw("content"),
+      token = "token"
+    ))
+    expect_s3_class(error, "fabric_http_error")
+    expect_identical(error$status, status)
+    expect_length(calls, 1L)
+    expect_identical(calls[[1L]]$method, "PUT")
+    expect_identical(calls[[1L]]$headers[["If-None-Match"]], "*")
+  }
+})
+
+test_that("OneLake upload cleans up an ambiguously failed temporary create", {
+  calls <- list()
+  local_mocked_bindings(
+    .httr2_perform = function(req, ...) {
+      calls[[length(calls) + 1L]] <<- req
+      if (length(calls) == 1L) {
+        rlang::abort("connection closed after the create was sent")
+      }
+      onelake_test_response(status = 200L, url = req$url)
+    }
+  )
+
+  expect_error(
+    fabric_onelake_upload(
+      "Analytics",
+      "Curated.Lakehouse",
+      "Files/create-failure.txt",
+      source = charToRaw("content"),
+      token = "token"
+    ),
+    "connection closed after the create was sent",
+    fixed = TRUE
+  )
+
+  expect_equal(
+    vapply(calls, function(req) req$method, character(1)),
+    c("PUT", "DELETE")
+  )
+  expect_match(calls[[1L]]$url, "fabricqueryr-upload", fixed = TRUE)
+  expect_match(calls[[2L]]$url, "fabricqueryr-upload", fixed = TRUE)
+  expect_equal(
+    sub("\\?.*$", "", calls[[1L]]$url),
+    sub("\\?.*$", "", calls[[2L]]$url)
+  )
+  expect_false(grepl("recursive=", calls[[2L]]$url, fixed = TRUE))
+})
+
+test_that("OneLake upload rejects an existing file as a parent", {
+  calls <- list()
+  local_mocked_bindings(
+    .httr2_perform = function(req, ...) {
+      calls[[length(calls) + 1L]] <<- req
+      onelake_test_response(
+        headers = list(`x-ms-resource-type` = "file"),
+        url = req$url
+      )
+    }
+  )
+
+  error <- rlang::catch_cnd(fabric_onelake_upload(
+    "Analytics",
+    "Curated.Lakehouse",
+    "Files/not-a-directory/file.txt",
+    source = charToRaw("content"),
+    token = "token"
+  ))
+
+  expect_s3_class(error, "fabric_onelake_parent_conflict")
+  expect_identical(error$parent_path, "Files/not-a-directory")
+  expect_length(calls, 1L)
+  expect_identical(calls[[1L]]$method, "HEAD")
+  expect_false(grepl("fabricqueryr-upload", calls[[1L]]$url, fixed = TRUE))
+})
+
+test_that("OneLake parent creation validates concurrent winners", {
+  calls <- list()
+  winner <- "directory"
+  local_mocked_bindings(
+    .httr2_perform = function(
+      req,
+      ...,
+      accepted_status = integer()
+    ) {
+      calls[[length(calls) + 1L]] <<- list(
+        req = req,
+        accepted_status = accepted_status
+      )
+      index <- length(calls)
+      if (index == 1L) {
+        return(onelake_test_response(404L, url = req$url))
+      }
+      if (index == 2L) {
+        return(onelake_test_response(412L, url = req$url))
+      }
+      headers <- if (identical(winner, "missing")) {
+        list()
+      } else {
+        list(`x-ms-resource-type` = winner)
+      }
+      onelake_test_response(
+        status = if (identical(winner, "missing")) 404L else 200L,
+        headers = headers,
+        url = req$url
+      )
+    }
+  )
+  target <- onelake_resolve_target(
+    "Analytics",
+    "Curated.Lakehouse",
+    "Files/nested/file.txt"
+  )
+  credential <- fabric_credential(token = "token")
+
+  expect_invisible(onelake_create_parents(target, credential))
+  expect_identical(
+    vapply(calls, function(call) call$req$method, character(1)),
+    c("HEAD", "PUT", "HEAD")
+  )
+  expect_identical(calls[[2L]]$req$headers[["If-None-Match"]], "*")
+  expect_identical(calls[[2L]]$accepted_status, c(409L, 412L))
+
+  for (winner_value in c("file", "missing")) {
+    calls <- list()
+    winner <- winner_value
+    error <- rlang::catch_cnd(onelake_create_parents(target, credential))
+    expect_s3_class(error, "fabric_onelake_parent_conflict")
+    expect_identical(error$parent_path, "Files/nested")
+    expect_length(calls, 3L)
+  }
+})
+
+test_that("ambiguous OneLake upload renames report unknown staging state", {
+  for (failure in c("transport", "server")) {
+    calls <- list()
+    local_mocked_bindings(
+      .httr2_perform = function(req, ...) {
+        calls[[length(calls) + 1L]] <<- req
+        rename <- !is.null(req$headers[["x-ms-rename-source"]])
+        if (rename && identical(failure, "transport")) {
+          .fabric_abort(
+            "connection reset after request transmission",
+            class = c("fabric_http_transport_error", "fabric_http_error"),
+            call = NULL,
+            .trace = FALSE
+          )
+        }
+        if (rename) {
+          .fabric_abort(
+            "OneLake returned an internal error",
+            class = "fabric_http_error",
+            status = 503L,
+            call = NULL,
+            .trace = FALSE
+          )
+        }
+        onelake_test_response(
+          status = if (identical(req$method, "PUT")) 201L else 200L,
+          url = req$url
+        )
+      }
+    )
+
+    error <- rlang::catch_cnd(fabric_onelake_upload(
+      "Analytics",
+      "Curated.Lakehouse",
+      "Files/ambiguous.txt",
+      source = charToRaw("content"),
+      token = "secret-token-value"
+    ))
+
+    expect_s3_class(error, "fabric_onelake_commit_ambiguous")
+    expect_identical(error$target_path, "Files/ambiguous.txt")
+    expect_match(
+      error$staging_path,
+      "Files/.fabricqueryr-upload-",
+      fixed = TRUE
+    )
+    expect_identical(error$precondition, "if-none-match")
+    expect_identical(error$content_length, 7L)
+    expect_identical(error$workspace, "Analytics")
+    expect_identical(error$item, "Curated.Lakehouse")
+    expect_identical(
+      error$target_url,
+      paste0(
+        "https://onelake.dfs.fabric.microsoft.com/Analytics/",
+        "Curated.Lakehouse/",
+        error$target_path
+      )
+    )
+    expect_identical(
+      error$staging_url,
+      paste0(
+        "https://onelake.dfs.fabric.microsoft.com/Analytics/",
+        "Curated.Lakehouse/",
+        error$staging_path
+      )
+    )
+    expect_true(is.na(error$staging_retained))
+    expect_true(error$staging_may_exist)
+    expect_match(error$commit_error$message, "connection reset|internal error")
+    expect_false(any(vapply(
+      calls,
+      function(req) identical(req$method, "DELETE"),
+      logical(1)
+    )))
+    diagnostic <- paste(capture.output(str(error)), collapse = "\n")
+    expect_false(grepl("secret-token-value", diagnostic, fixed = TRUE))
+  }
+})
+
+test_that("OneLake upload preserves conflict errors and creates nested parents", {
+  calls <- list()
+  httr2::local_mocked_responses(function(req) {
+    calls[[length(calls) + 1L]] <<- req
+    if (identical(req$method, "HEAD")) {
+      return(onelake_test_response(404L, url = req$url))
+    }
+    if (
+      identical(req$method, "PUT") &&
+        !is.null(req$headers[["x-ms-rename-source"]])
+    ) {
+      return(onelake_test_response(
+        412L,
+        body = list(error = list(code = "PathAlreadyExists")),
+        url = req$url
+      ))
+    }
+    onelake_test_response(201L, url = req$url)
+  })
+
+  error <- expect_error(
+    fabric_onelake_upload(
+      "Analytics",
+      "Curated.Lakehouse",
+      "Files/nested/deeper/file.txt",
+      source = charToRaw("content"),
+      token = "token"
+    ),
+    "HTTP 412",
+    fixed = TRUE
+  )
+  expect_match(conditionMessage(error), "PathAlreadyExists")
+  expect_equal(
+    vapply(calls[1:4], function(req) req$method, character(1)),
+    c("HEAD", "PUT", "HEAD", "PUT")
+  )
+  expect_match(calls[[2L]]$url, "Files/nested\\?resource=directory")
+  expect_match(calls[[4L]]$url, "Files/nested/deeper\\?resource=directory")
+  expect_identical(calls[[2L]]$headers[["If-None-Match"]], "*")
+  expect_identical(calls[[4L]]$headers[["If-None-Match"]], "*")
+  deletes <- calls[vapply(
+    calls,
+    function(req) identical(req$method, "DELETE"),
+    logical(1)
+  )]
+  expect_length(deletes, 1L)
+  expect_match(deletes[[1L]]$url, "fabricqueryr-upload", fixed = TRUE)
+})
+
+test_that("OneLake deletion is explicit, safe, conditional, and resumable", {
+  expect_error(
+    fabric_onelake_delete(
+      "Analytics",
+      "Curated.Lakehouse",
+      "Files/folder",
+      token = "token"
+    ),
+    "disabled by default",
+    fixed = TRUE
+  )
+  expect_error(
+    fabric_onelake_delete(
+      "Analytics",
+      "Curated.Lakehouse",
+      "Files",
+      confirm = TRUE,
+      token = "token"
+    ),
+    "Fabric-managed first-level folder",
+    fixed = TRUE
+  )
+
+  calls <- list()
+  httr2::local_mocked_responses(function(req) {
+    calls[[length(calls) + 1L]] <<- req
+    if (identical(req$method, "HEAD")) {
+      return(onelake_test_response(
+        headers = list("x-ms-resource-type" = "directory"),
+        url = req$url
+      ))
+    }
+    onelake_test_response(
+      status = 200L,
+      headers = if (length(calls) == 2L) {
+        list("x-ms-continuation" = "delete-token")
+      } else {
+        list()
+      },
+      url = req$url
+    )
+  })
+  expect_true(fabric_onelake_delete(
+    "Analytics",
+    "Curated.Lakehouse",
+    "Files/folder",
+    recursive = TRUE,
+    confirm = TRUE,
+    if_match = "\"etag\"",
+    token = "token"
+  ))
+  expect_equal(length(calls), 3L)
+  expect_equal(calls[[1L]]$method, "HEAD")
+  expect_true(all(
+    vapply(calls[-1L], function(req) req$method, character(1)) == "DELETE"
+  ))
+  expect_match(calls[[2L]]$url, "recursive=true")
+  expect_match(calls[[3L]]$url, "continuation=delete-token")
+  expect_identical(
+    grepl(
+      "paginated=",
+      vapply(calls[-1L], function(req) req$url, character(1)),
+      fixed = TRUE
+    ),
+    c(FALSE, FALSE)
+  )
+  expect_equal(calls[[2L]]$headers[["If-Match"]], "\"etag\"")
+})
+
+test_that("OneLake deletion omits directory parameters for files", {
+  calls <- list()
+  httr2::local_mocked_responses(function(req) {
+    calls[[length(calls) + 1L]] <<- req
+    onelake_test_response(
+      headers = if (identical(req$method, "HEAD")) {
+        list("x-ms-resource-type" = "file")
+      } else {
+        list()
+      },
+      url = req$url
+    )
+  })
+
+  expect_true(fabric_onelake_delete(
+    "Analytics",
+    "Curated.Lakehouse",
+    "Files/file.txt",
+    recursive = TRUE,
+    confirm = TRUE,
+    token = "token"
+  ))
+  expect_equal(
+    vapply(calls, function(req) req$method, character(1)),
+    c("HEAD", "DELETE")
+  )
+  expect_false(grepl("recursive=", calls[[2L]]$url, fixed = TRUE))
+  expect_false(grepl("paginated=", calls[[2L]]$url, fixed = TRUE))
+})
+
+test_that("OneLake deletion reconciles an ambiguous retry with 404", {
+  accepted <- NULL
+  local_mocked_bindings(
+    .httr2_perform = function(
+      req,
+      ...,
+      accepted_status = integer()
+    ) {
+      accepted <<- accepted_status
+      onelake_test_response(status = 404L, url = req$url)
+    }
+  )
+  target <- onelake_resolve_target(
+    "Analytics",
+    "Curated.Lakehouse",
+    "Files/already-deleted.txt"
+  )
+
+  expect_true(onelake_delete_target(
+    target,
+    fabric_credential(token = "token"),
+    is_directory = FALSE
+  ))
+  expect_identical(accepted, 404L)
+})
+
+test_that("OneLake deletion rejects repeated continuation tokens", {
+  calls <- 0L
+  httr2::local_mocked_responses(function(req) {
+    calls <<- calls + 1L
+    if (identical(req$method, "HEAD")) {
+      return(onelake_test_response(
+        headers = list("x-ms-resource-type" = "directory"),
+        url = req$url
+      ))
+    }
+    onelake_test_response(
+      status = 200L,
+      headers = list("x-ms-continuation" = "repeated-token"),
+      url = req$url
+    )
+  })
+
+  expect_error(
+    fabric_onelake_delete(
+      "Analytics",
+      "Curated.Lakehouse",
+      "Files/folder",
+      recursive = TRUE,
+      confirm = TRUE,
+      token = "token"
+    ),
+    "repeated pagination URL",
+    fixed = TRUE
+  )
+  expect_equal(calls, 3L)
+})
+
+test_that("OneLake validates ranges and protected paths before I/O", {
+  expect_error(onelake_validate_range(c(-1, 2)), "non-negative")
+  expect_error(onelake_validate_range(c(3, 2)), "non-negative")
+  target <- onelake_resolve_target(
+    "Analytics",
+    "Curated.Lakehouse",
+    "Files"
+  )
+  credential <- fabric_credential(token = "token")
+  for (page_size in list(
+    0,
+    5001,
+    1.5,
+    NA_real_,
+    Inf,
+    "10",
+    c(1, 2),
+    .Machine$integer.max + 1,
+    1e10,
+    -.Machine$double.xmax,
+    .Machine$double.xmax
+  )) {
+    expect_warning(
+      expect_error(
+        onelake_list_target(target, credential, page_size = page_size),
+        "page_size must be one whole number between 1 and 5000",
+        fixed = TRUE
+      ),
+      NA
+    )
+  }
+  expect_error(
+    fabric_onelake_upload(
+      "Analytics",
+      "Curated.Lakehouse",
+      "Files",
+      source = raw(),
+      token = "token"
+    ),
+    "Fabric-managed first-level folder",
+    fixed = TRUE
+  )
+  expect_error(
+    onelake_resolve_target(
+      "Analytics",
+      "Curated.Lakehouse",
+      "Files/../Tables/data"
+    ),
+    "unsafe segment",
+    fixed = TRUE
+  )
+})
+
+test_that("OneLake blocks managed Delta file mutations by default", {
+  upload_calls <- 0L
+  local_mocked_bindings(
+    onelake_upload_target = function(...) {
+      upload_calls <<- upload_calls + 1L
+      invisible(TRUE)
+    }
+  )
+  protected <- c(
+    "Tables/orders/_delta_log/00000000000000000001.json",
+    "Tables/orders/part-00001.parquet",
+    "Tables/sales/orders/_delta_log/00000000000000000001.json",
+    "tables/sales/orders/part-00001.parquet"
+  )
+  for (path in protected) {
+    expect_error(
+      fabric_onelake_upload(
+        "Analytics",
+        "Curated.Lakehouse",
+        path,
+        source = raw(),
+        token = "token"
+      ),
+      "below Tables/ is blocked",
+      fixed = TRUE
+    )
+    expect_error(
+      fabric_onelake_delete(
+        "Analytics",
+        "Curated.Lakehouse",
+        path,
+        confirm = TRUE,
+        token = "token"
+      ),
+      "below Tables/ is blocked",
+      fixed = TRUE
+    )
+  }
+  expect_identical(upload_calls, 0L)
+})
+
+test_that("OneLake managed-table mutations require a dangerous opt-in", {
+  target <- onelake_resolve_target(
+    "Analytics",
+    "Curated.Lakehouse",
+    "Tables/orders/part-00001.parquet"
+  )
+  expect_no_error(onelake_require_mutable_path(
+    target,
+    "upload",
+    allow_managed_tables = TRUE
+  ))
+  expect_error(
+    onelake_require_mutable_path(
+      target,
+      "upload",
+      allow_managed_tables = NA
+    ),
+    "must be TRUE or FALSE",
+    fixed = TRUE
+  )
+})
+
+test_that("OneLake DFS bases must be canonical HTTPS origins", {
+  resolve <- function(dfs_base) {
+    onelake_resolve_target(
+      "Analytics",
+      "Curated.Lakehouse",
+      dfs_base = dfs_base
+    )
+  }
+  host <- "onelake.dfs.fabric.microsoft.com"
+
+  expect_error(
+    resolve(paste0("https://user:secret@", host)),
+    "must not include user information",
+    fixed = TRUE
+  )
+  expect_error(
+    resolve(paste0("https://", host, ":444")),
+    "default HTTPS port",
+    fixed = TRUE
+  )
+  expect_error(
+    resolve(paste0("https://", host, "?x=y")),
+    "query string or fragment",
+    fixed = TRUE
+  )
+  expect_error(
+    resolve(paste0("https://", host, "#fragment")),
+    "query string or fragment",
+    fixed = TRUE
+  )
+
+  target <- resolve(paste0("https://", host, ":443"))
+  expect_equal(target$dfs_base, paste0("https://", host, ":443"))
+
+  blob_target <- resolve("https://onelake.blob.fabric.microsoft.com/")
+  expect_equal(
+    blob_target$dfs_base,
+    "https://onelake.dfs.fabric.microsoft.com"
+  )
+  request <- onelake_request(onelake_path_url(blob_target))
+  expect_match(
+    request$url,
+    "^https://onelake[.]dfs[.]fabric[.]microsoft[.]com/",
+    perl = TRUE
+  )
+
+  private_blob <- "https://workspace.z12.blob.fabric.microsoft.com"
+  expect_equal(
+    resolve(private_blob)$dfs_base,
+    "https://workspace.z12.dfs.fabric.microsoft.com"
+  )
+})
+test_that("OneLake distinguishes literal percent filenames from URI escapes", {
+  target <- onelake_resolve_target("ws", "lh.Lakehouse", "Files/a%2Fb%20c.txt")
+  expect_match(
+    onelake_path_url(target),
+    "/Files/a%252Fb%2520c.txt$",
+    fixed = FALSE
+  )
+  uri <- "https://onelake.dfs.fabric.microsoft.com/ws/lh.Lakehouse/%54ables/orders/part.parquet"
+  target <- onelake_parse_uri(uri)
+  expect_identical(target$path, "Tables/orders/part.parquet")
+  error <- tryCatch(
+    onelake_require_mutable_path(target, "delete", FALSE),
+    error = identity
+  )
+  expect_s3_class(error, "error")
+  expect_match(conditionMessage(error), "below Tables/", fixed = TRUE)
+  target <- onelake_parse_uri(
+    "https://onelake.dfs.fabric.microsoft.com/ws/lh.Lakehouse/Files/a%252Fb.txt"
+  )
+  expect_identical(target$path, "Files/a%2Fb.txt")
+  expect_match(onelake_path_url(target), "/Files/a%252Fb.txt$", fixed = FALSE)
+})
+test_that("large CSV round trips preserve quoted embedded newlines", {
+  skip_if_not_installed("arrow")
+  fixture <- withr::local_tempfile(fileext = ".csv")
+  local_mocked_bindings(
+    fabric_onelake_upload = function(source, ...) {
+      file.copy(source, fixture, overwrite = TRUE)
+      tibble::tibble(path = "Files/multiline.csv")
+    },
+    fabric_onelake_download = function(dest, ...) {
+      file.copy(fixture, dest)
+      invisible(dest)
+    }
+  )
+  data <- tibble::tibble(
+    id = seq_len(40000L),
+    value = rep(paste0(strrep("a", 50L), "\n", strrep("b", 50L)), 40000L)
+  )
+  fabric_onelake_write_file("workspace", "item", "Files/multiline.csv", data)
+  expect_gt(file.size(fixture), 4 * 1024^2)
+  for (output in c("tibble", "arrow_stream")) {
+    result <- fabric_onelake_read_file(
+      "workspace",
+      "item",
+      "Files/multiline.csv",
+      result = output
+    )
+    if (output == "arrow_stream") {
+      stream <- result
+      withr::defer(nanoarrow::nanoarrow_pointer_release(stream))
+      result <- .fabric_arrow_exact_tibble(stream)
+    }
+    expect_equal(result, data)
+  }
+})
+
+test_that("CSV round trips retain leading trailing consecutive and all missing rows", {
+  skip_if_not_installed("arrow")
+  fixture <- withr::local_tempfile(fileext = ".csv")
+  local_mocked_bindings(
+    fabric_onelake_upload = function(source, ...) {
+      file.copy(source, fixture, overwrite = TRUE)
+      tibble::tibble(path = "Files/missing.csv")
+    },
+    fabric_onelake_download = function(dest, ...) {
+      file.copy(fixture, dest)
+      invisible(dest)
+    }
+  )
+  read_values <- function(output, header) {
+    result <- fabric_onelake_read_file(
+      "workspace",
+      "item",
+      "Files/missing.csv",
+      result = output,
+      col_names = if (header) TRUE else "value",
+      col_types = arrow::schema(value = arrow::float64())
+    )
+    if (output == "arrow_stream") {
+      on.exit(nanoarrow::nanoarrow_pointer_release(result))
+      .fabric_arrow_exact_tibble(result)$value
+    } else {
+      result$value
+    }
+  }
+
+  for (values in list(
+    c(NA_real_, pi, NA_real_, NA_real_, 1 / 3, NA_real_),
+    rep(NA_real_, 3L),
+    NA_real_
+  )) {
+    for (header in c(TRUE, FALSE)) {
+      fabric_onelake_write_file(
+        "workspace",
+        "item",
+        "Files/missing.csv",
+        data.frame(value = values),
+        include_header = header
+      )
+      for (output in c("tibble", "arrow_stream")) {
+        expect_identical(read_values(output, header), values)
+      }
+    }
+  }
+})
+
+test_that("CSV readers retain legacy empty records under an explicit NA policy", {
+  skip_if_not_installed("arrow")
+  fixture <- withr::local_tempfile(fileext = ".csv")
+  local_mocked_bindings(fabric_onelake_download = function(dest, ...) {
+    file.copy(fixture, dest)
+    invisible(dest)
+  })
+  read_values <- function(output, header) {
+    result <- fabric_onelake_read_file(
+      "workspace",
+      "item",
+      "Files/missing.csv",
+      result = output,
+      col_names = if (header) TRUE else "value",
+      na = c("", "NA"),
+      col_types = arrow::schema(value = arrow::float64())
+    )
+    if (output == "arrow_stream") {
+      on.exit(nanoarrow::nanoarrow_pointer_release(result))
+      .fabric_arrow_exact_tibble(result)$value
+    } else {
+      result$value
+    }
+  }
+
+  for (expected in list(
+    c(NA_real_, 1, NA_real_, NA_real_, 3, NA_real_),
+    rep(NA_real_, 3L)
+  )) {
+    for (header in c(TRUE, FALSE)) {
+      records <- ifelse(is.na(expected), "", as.character(expected))
+      writeLines(c(if (header) "value", records), fixture)
+      for (output in c("tibble", "arrow_stream")) {
+        expect_identical(read_values(output, header), expected)
+      }
+    }
+  }
+})
+
+test_that("CSV readers retain missing rows with generated headerless names", {
+  skip_if_not_installed("arrow")
+  local_mocked_bindings(fabric_onelake_download = function(dest, ...) {
+    writeLines(c("NA", "2", "NA"), dest)
+    invisible(dest)
+  })
+  read_values <- function(output) {
+    value <- fabric_onelake_read_file(
+      "workspace",
+      "item",
+      "Files/missing.csv",
+      result = output,
+      col_names = FALSE
+    )
+    if (output == "arrow_stream") {
+      on.exit(nanoarrow::nanoarrow_pointer_release(value))
+      .fabric_arrow_exact_tibble(value)
+    } else {
+      value
+    }
+  }
+  for (output in c("tibble", "arrow_stream")) {
+    value <- read_values(output)
+    expect_identical(names(value), "f0")
+    expect_identical(as.character(value[[1L]]), c(NA, "2", NA))
+  }
+})
+
+test_that("CSV missing markers remain distinct from empty strings", {
+  skip_if_not_installed("arrow")
+  fixture <- withr::local_tempfile(fileext = ".csv")
+  local_mocked_bindings(
+    fabric_onelake_upload = function(source, ...) {
+      file.copy(source, fixture, overwrite = TRUE)
+      tibble::tibble(path = "Files/missing.csv")
+    },
+    fabric_onelake_download = function(dest, ...) {
+      file.copy(fixture, dest)
+      invisible(dest)
+    }
+  )
+  read_values <- function(output, na) {
+    result <- fabric_onelake_read_file(
+      "workspace",
+      "item",
+      "Files/missing.csv",
+      result = output,
+      na = na
+    )
+    if (output == "arrow_stream") {
+      on.exit(nanoarrow::nanoarrow_pointer_release(result))
+      .fabric_arrow_exact_tibble(result)$value
+    } else {
+      result$value
+    }
+  }
+
+  values <- c("", NA_character_, "text", "")
+  fabric_onelake_write_file(
+    "workspace",
+    "item",
+    "Files/missing.csv",
+    data.frame(value = values)
+  )
+  for (output in c("tibble", "arrow_stream")) {
+    result <- fabric_onelake_read_file(
+      "workspace",
+      "item",
+      "Files/missing.csv",
+      result = output
+    )
+    if (output == "arrow_stream") {
+      stream <- result
+      withr::defer(nanoarrow::nanoarrow_pointer_release(stream))
+      result <- .fabric_arrow_exact_tibble(stream)
+    }
+    expect_identical(result$value, values)
+  }
+  custom <- c("", NA_character_, "NA", "text", "")
+  fabric_onelake_write_file(
+    "workspace",
+    "item",
+    "Files/missing.csv",
+    data.frame(value = custom),
+    na = "MISSING"
+  )
+  for (output in c("tibble", "arrow_stream")) {
+    expect_identical(read_values(output, "MISSING"), custom)
+  }
+})
+
+test_that("CSV reads preserve headerless rows and custom missing values", {
+  skip_if_not_installed("arrow")
+  skip_if_not_installed("nanoarrow")
+  local_mocked_bindings(fabric_onelake_download = function(dest, ...) {
+    arrow::write_csv_arrow(
+      data.frame(id = c(1L, NA_integer_, 3L)),
+      dest,
+      include_header = FALSE,
+      na = "MISSING"
+    )
+  })
+  for (result in c("tibble", "arrow_stream")) {
+    value <- fabric_onelake_read_file(
+      "ws",
+      "lh.Lakehouse",
+      "Files/test.csv",
+      result = result,
+      col_names = "id",
+      na = "MISSING",
+      token = "synthetic"
+    )
+    if (result == "arrow_stream") {
+      reader <- arrow::as_record_batch_reader(value)
+      value <- as.data.frame(reader)
+      reader$Close()
+    }
+    expect_equal(value$id, c(1L, NA_integer_, 3L))
+  }
+})
+test_that("encoded managed-table URIs are rejected before mutation transport", {
+  uri <- paste0(
+    "https://onelake.dfs.fabric.microsoft.com/",
+    "ws/lh.Lakehouse/%54ables/orders/part.parquet"
+  )
+  httr2::local_mocked_responses(function(req) stop("unexpected transport"))
+  upload <- tryCatch(
+    fabric_onelake_upload(uri, source = raw(), token = "test"),
+    error = identity
+  )
+  delete <- tryCatch(
+    fabric_onelake_delete(uri, confirm = TRUE, token = "test"),
+    error = identity
+  )
+  for (error in list(upload, delete)) {
+    expect_s3_class(error, "error")
+    expect_match(
+      conditionMessage(error),
+      "below Tables/ is blocked",
+      fixed = TRUE
+    )
+  }
+})
+test_that("OneLake Parquet and IPC tibbles preserve exact numeric boundaries", {
+  skip_if_not_installed("arrow")
+  table <- arrow::read_ipc_stream(
+    test_path("fixtures", "exact-numerics.arrow"),
+    as_data_frame = FALSE
+  )
+  path <- withr::local_tempfile()
+  local_mocked_bindings(fabric_onelake_download = function(..., dest) {
+    file.copy(path, dest, overwrite = TRUE)
+    invisible(dest)
+  })
+  for (format in c("parquet", "arrow")) {
+    if (format == "parquet") {
+      arrow::write_parquet(table, path)
+    } else {
+      arrow::write_ipc_stream(table, path)
+    }
+    value <- fabric_onelake_read_file(
+      "workspace",
+      "lakehouse.Lakehouse",
+      paste0("Files/exact.", format),
+      token = "test"
+    )
+    expect_identical(value$amount, c("12345678901234567890.1234", NA))
+    expect_identical(value$i32, c(-2147483648, NA))
+    expect_identical(value$i64, c("-9223372036854775808", NA))
+  }
+})

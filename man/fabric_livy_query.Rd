@@ -2,7 +2,7 @@
 % Please edit documentation in R/fabric_livy.R
 \name{fabric_livy_query}
 \alias{fabric_livy_query}
-\title{Run a Livy API query (Spark code) in Microsoft Fabric}
+\title{Run Spark code in a temporary Microsoft Fabric Livy session}
 \usage{
 fabric_livy_query(
   livy_url,
@@ -11,163 +11,179 @@ fabric_livy_query(
   tenant_id = Sys.getenv("FABRICQUERYR_TENANT_ID"),
   client_id = Sys.getenv("FABRICQUERYR_CLIENT_ID", unset =
     "04b07795-8ddb-461a-bbee-02f9e1bf7b46"),
-  access_token = NULL,
+  token = NULL,
+  auth_args = list(),
+  audience = NULL,
   environment_id = NULL,
   conf = NULL,
   verbose = TRUE,
-  poll_interval = 2L,
-  timeout = 600L
+  poll_interval = 2,
+  timeout = 600,
+  ...
 )
 }
 \arguments{
-\item{livy_url}{Character. Livy session job connection string, e.g.
-\code{"https://api.fabric.microsoft.com/v1/workspaces/.../lakehouses/.../livyapi/versions/2023-12-01/sessions"}
-(see details).}
+\item{livy_url}{A Livy connection URL copied from the Lakehouse settings, or
+an enriched Lakehouse object from \code{\link[=fabric_lakehouses]{fabric_lakehouses()}} or \code{\link[=fabric_item]{fabric_item()}}
+A discovered object avoids copying workspace and Lakehouse IDs}
 
-\item{code}{Character. Code to run in the Livy session.}
+\item{code}{One string containing the Spark code to run. Objects created in
+this temporary session are lost after the function returns, although
+writes made to Lakehouse storage persist}
 
-\item{kind}{Character. One of \code{"spark"}, \code{"pyspark"}, \code{"sparkr"}, or \code{"sql"}.
-Indicates the type of Spark code being submitted for evaluation.}
+\item{kind}{Statement language. Use \code{"pyspark"} for Python with Spark,
+\code{"spark"} for Scala, \code{"sql"} for Spark SQL, or \code{"sparkr"} for SparkR. This
+must match the syntax in \code{code}. The \code{sparklyr} package is an R API, not a
+separate Livy language: experimental code that initializes \code{sparklyr}
+through item-scoped Livy still uses \code{"sparkr"}. SparkR is deprecated
+upstream in Spark 4.x; see \strong{R on Runtime 2.0} below for the distinction}
 
-\item{tenant_id}{Microsoft Azure tenant ID. Defaults to \code{Sys.getenv("FABRICQUERYR_TENANT_ID")} if missing.}
+\item{tenant_id}{Microsoft Entra tenant ID. Defaults to
+\code{FABRICQUERYR_TENANT_ID}}
 
-\item{client_id}{Microsoft Azure application (client) ID used to authenticate. Defaults to
-\code{Sys.getenv("FABRICQUERYR_CLIENT_ID")}. You may be able to use the Azure CLI app id
-\code{"04b07795-8ddb-461a-bbee-02f9e1bf7b46"}, but may want to make your own
-app registration in your tenant for better control.}
+\item{client_id}{Microsoft Entra application/client ID. Defaults to
+\code{FABRICQUERYR_CLIENT_ID}, then the Azure CLI application ID}
 
-\item{access_token}{Optional character. If supplied, use this bearer token
-instead of acquiring a new one via \code{{AzureAuth}}.}
+\item{token}{Optional access token or token-provider function. Leave \code{NULL}
+to let 'fabricQueryR' use its normal sign-in flow. HTTPS validation does
+not prove ownership or token audience for a custom host; use one only when
+your organization controls it, with a token or provider issued for its
+intended audience}
 
-\item{environment_id}{Optional character. Fabric Environment (pool) ID to use
-for the session. If \code{NULL} (default), the default environment for the user
-will be used.}
+\item{auth_args}{Additional sign-in options passed to
+\code{\link[AzureAuth:get_azure_token]{AzureAuth::get_azure_token()}}}
 
-\item{conf}{Optional list. Spark configuration settings to apply to the session.}
+\item{audience}{Optional sign-in scopes. For delegated sign-in, \code{NULL}
+requests the four required Livy scopes listed below. An explicit vector
+replaces those defaults, so include every required scope plus any optional
+\verb{Code.Access*} scope the Spark code needs. Client credentials require one
+\code{.default} audience}
 
-\item{verbose}{Logical. Emit progress via \code{{cli}}. Default \code{TRUE}.}
+\item{environment_id}{Optional GUID of a published Fabric Environment whose
+libraries and Spark settings should be used. Leave \code{NULL} to use the
+Lakehouse/workspace defaults}
 
-\item{poll_interval}{Integer. Polling interval in seconds when waiting for session/statement readiness.}
+\item{conf}{Optional named list of Spark configuration overrides, for example
+\code{list("spark.sql.shuffle.partitions" = "100")}. Most users can leave this
+\code{NULL} and configure shared settings in a Fabric Environment}
 
-\item{timeout}{Integer. Timeout in seconds when waiting for session/statement readiness.}
+\item{verbose}{Logical. Show session startup, execution, and cleanup progress}
+
+\item{poll_interval}{Seconds between status checks. Lower values update
+sooner but make more API calls}
+
+\item{timeout}{Maximum seconds to wait for session readiness and, separately,
+statement completion}
+
+\item{...}{Compatibility arguments. The former named \code{access_token}
+argument is accepted here as a deprecated alias for \code{token}; all other
+arguments are rejected}
 }
 \value{
-A list with statement details and results. The list contains:
-\itemize{
-\item \code{id}: Statement ID.
-\item \code{state}: Final statement state (should be \code{"available"}).
-\item \code{started_local}: Local timestamp when statement started running.
-\item \code{completed_local}: Local timestamp when statement completed.
-\item \code{duration_sec}: Duration in seconds (local).
-\item \code{output}: A list with raw output details:
-\itemize{
-\item \code{status}: Output status (e.g., \code{"ok"}).
-\item \code{execution_count}: Execution count (if applicable). The number of
-statements that have been executed in the session.
-\item \code{data}: Raw data list with MIME types as keys (e.g.
-\code{"text/plain"}, \code{"application/json"}).
-\item \code{parsed}: Parsed output, if possible. This may be a data frame (tibble)
-if the output was JSON tabular data, or a character vector if it was
-plain text. May be \code{NULL} if parsing was not possible.
-}
-\item \code{url}: URL of the statement resource in the Livy API.
-}
+Invisibly, a \code{fabric_livy_statement_result} list. The most useful
+component is \code{output$parsed}: a tibble for tabular output, an R object for
+JSON, or a character vector for text. The result also keeps status, timing,
+submitted code, errors, and the original response. A successful statement
+is still returned when session cleanup fails, with a
+\code{fabric_livy_cleanup_warning} identifying the retained session. When both
+execution and cleanup fail, a \code{fabric_livy_execution_cleanup_error} retains
+the execution error and safe cleanup diagnostics
 }
 \description{
-High-level helper that creates a Livy session in Microsoft Fabric, waits for
-it to become idle, submits a statement with Spark code for execution, retrieves
-the result, and closes the session.
+Starts Spark, runs one piece of code, returns its output, and closes the Spark
+session. This is the simplest Livy helper for a one-off operation. For quick
+reads from a Lakehouse or Warehouse, SQL is often faster to start
 }
-\details{
-\itemize{
-\item In Microsoft Fabric, you can find and copy the Livy session URL by going
-to a 'Lakehouse' item, then go to 'Settings' -> 'Livy Endpoint' -> 'Session job connection string'.
-\item By default we request a token for \verb{https://api.fabric.microsoft.com/.default}.
-\item \pkg{AzureAuth} is used to acquire the token. Be wary of
-caching behavior; you may want to call \code{\link[AzureAuth:get_azure_token]{AzureAuth::clean_token_directory()}}
-to clear cached tokens if you run into issues
+\section{Tabular column names}{
+
+Duplicate SQL aliases and joined column names are repaired with
+\code{make.unique(names, sep = "...")}: for example, \verb{id, id} becomes
+\verb{id, id...1}. Every column retains its positional values. The \code{spark_schema}
+attribute keeps the original header names and types, and the result retains
+the original response.
 }
+
+\section{Before you run code}{
+
+Fabric needs a workspace on supported capacity, a Lakehouse, and the tenant
+admin setting for the Livy API enabled. In the Fabric portal, open the
+Lakehouse settings, find \strong{Livy endpoint}, and copy the session-job
+connection string. For several statements that reuse variables and Spark
+state, use \code{\link[=fabric_livy_session]{fabric_livy_session()}}. To run a complete Python, Scala/Java, or
+R application file, use \code{\link[=fabric_livy_batch_submit]{fabric_livy_batch_submit()}}
+
+A delegated caller needs the \code{Lakehouse.Execute.All}, \code{Lakehouse.Read.All},
+\code{Code.AccessFabric.All}, and \code{Code.AccessStorage.All} scopes and must be a
+Contributor in the workspace. For session jobs, Microsoft's current guide
+also documents service-principal (SPN) tokens. The service principal must be
+added to the workspace as a Contributor, but that role alone does not
+override tenant settings or other service-side identity restrictions. Add
+\code{Code.AccessAzureKeyvault.All}, \code{Code.AccessAzureDataLake.All},
+\code{Code.AccessAzureDataExplorer.All}, or \code{Code.AccessSQL.All} only when the
+Spark code accesses that Azure service at runtime
+
+Spark long and decimal columns are returned as character values when needed
+to preserve them exactly. Dates and timestamps with a time zone use R
+temporal classes; timestamps without a time zone remain wall-clock text
+Fabric's SQL JSON output represents non-finite floating-point values as
+\code{null}, so those values are returned as typed missing values. Binary and
+nested values use list-columns
+Nested decimal values retain their JSON spelling. Fabric may round these
+values before sending SQL JSON output; cast decimal leaves to STRING in
+Spark when full precision is required across that service boundary.
+Generic JSON arrays combine compatible numbers into numeric vectors.
+Mixed scalar types remain lists or tibble list-columns so numbers and
+exact integer or decimal strings retain their original values.
 }
+
+\section{R on Runtime 2.0}{
+
+Microsoft Fabric distributes \code{sparklyr} and documents
+\code{sparklyr::spark_connect(method = "synapse")} for Fabric notebooks and Spark
+job definitions. Microsoft does not currently document that connection from
+an item-scoped Livy session, and this package's live suite validates the
+\code{"sparkr"} interpreter but not a \code{sparklyr} connection over it. Treat that
+adaptation as experimental and verify it in the target runtime before use.
+It still depends on the SparkR JVM bridge, which Spark 4.x deprecates. Prefer
+PySpark or Spark SQL when the remote workload must be independent of that
+bridge
+}
+
 \examples{
-# Find your session URL in Fabric by going to a 'Lakehouse' item,
-#   then go to 'Settings' -> 'Livy Endpoint' -> 'Session job connection string'
-sess_url <- "https://api.fabric.microsoft.com/v1/workspaces/.../lakehouses/.../livyapi/..."
+# Livy can run SQL, PySpark, Spark, and SparkR code in Microsoft Fabric
+# This function is not called automatically because it requires credentials
+fabric_livy_query_example <- function() {
+  # Discover a Lakehouse whose record contains its Fabric Livy endpoint
+  workspace <- fabric_workspaces()[[1L]]
+  lakehouse <- fabric_lakehouses(workspace)[[1L]]
+  table <- fabric_lakehouse_tables(lakehouse)[1L, ]
 
-# Livy API can run SQL, SparkR, PySpark, & Spark
-# Below are examples of 1) SQL & 2) SparkR usage
-
-# Example is not executed since it requires configured credentials for Fabric
-\dontrun{
-## 1 Livy & SQL
-
-# Here we run SQL remotely in Microsoft Fabric with Spark, to get data to local R
-# Since Livy API cannot directly give back a proper DF, we build it from returned schema & matrix
-
-# Run Livy SQL query
-livy_sql_result <- fabric_livy_query(
-  livy_url = sess_url,
-  kind = "sql",
-  code = "SELECT * FROM Patienten LIMIT 1000",
-  tenant_id = Sys.getenv("FABRICQUERYR_TENANT_ID"),
-  client_id = Sys.getenv("FABRICQUERYR_CLIENT_ID")
-)
-
-# '$schema$fields' contains column info, & '$data' contains data as matrix without column names
-payload <- livy_sql_result$output$data[["application/json"]]
-schema  <- as_tibble(payload$schema$fields) # has columns: name, type, nullable
-col_nms <- schema$name
-
-# Build dataframe (tibble) from the Livy result
-df_livy_sql <- payload$data |>
-  as_tibble(.name_repair = "minimal") |>
-  set_names(col_nms) |>
-  mutate(
-    # cast by schema$type (add more cases if your schema includes them)
-    across(all_of(schema$name[schema$type == "long"]),    readr::parse_integer),
-    across(all_of(schema$name[schema$type == "double"]),  readr::parse_double),
-    across(all_of(schema$name[schema$type == "boolean"]), readr::parse_logical),
-    across(all_of(schema$name[schema$type == "string"]),  as.character)
+  # Build SQL from the discovered table, then close the temporary session
+  sql <- sprintf(
+    "SELECT COUNT(*) AS row_count FROM `\%s`.`\%s`",
+    table$schema[[1L]],
+    table$name[[1L]]
+  )
+  sql_result <- fabric_livy_query(
+    livy_url = lakehouse,
+    kind = "sql",
+    code = sql
   )
 
-## 2 Livy & SparkR
+  # PySpark avoids the SparkR bridge. The Livy vignette separately labels the
+  # item-scoped sparklyr adaptation experimental and not live-validated here
+  pyspark_result <- fabric_livy_query(
+    livy_url = lakehouse,
+    kind = "pyspark",
+    code = "print(1 + 2)"
+  )
 
-# Here we run R code remotely in Microsoft Fabric with SparkR, to get data to local R
-# Since Livy API cannot directly give back a proper DF, we encode/decode B64 in SparkR/local R
-
-# Run Livy SparkR query
-livy_sparkr_result <- fabric_livy_query(
-  livy_url = sess_url,
-  kind = "sparkr",
-  code = paste(
-    # Obtain data in remote R (SparkR)
-    'library(SparkR); library(base64enc)',
-    'df <- sql("SELECT * FROM Patienten") |> limit(1000L) |> collect()',
-
-    # serialize -> gzip -> base64
-    'r_raw <- serialize(df, connection = NULL)',
-    'raw_gz <- memCompress(r_raw, type = "gzip")',
-    'b64 <- base64enc::base64encode(raw_gz)',
-
-    # output marked B64 string
-    'cat("<<B64RDS>>", b64, "<<END>>", sep = "")',
-    sep = "\n"
-  ),
-  tenant_id = Sys.getenv("FABRICQUERYR_TENANT_ID"),
-  client_id = Sys.getenv("FABRICQUERYR_CLIENT_ID")
-)
-
-# Extract marked B64 string from Livy output
-txt <- livy_sparkr_result$output$data$`text/plain`
-b64 <- sub('.*<<B64RDS>>', '', txt)
-b64 <- sub('<<END>>.*', '', b64)
-
-# Decode to dataframe
-raw_gz <- base64enc::base64decode(b64)
-r_raw  <- memDecompress(raw_gz, type = "gzip")
-df_livy_sparkr <- unserialize(r_raw)
+  invisible(list(sql = sql_result, pyspark = pyspark_result))
 }
 }
 \seealso{
-\href{https://learn.microsoft.com/en-us/fabric/data-engineering/api-livy-overview}{Livy API overview - Microsoft Fabric - 'What is the Livy API for Data Engineering?'};
-\href{https://livy.apache.org/docs/latest/rest-api.html}{Livy Docs - REST API}.
+\href{https://learn.microsoft.com/en-us/fabric/data-engineering/api-livy-overview}{Microsoft Fabric Livy API overview},
+\href{https://learn.microsoft.com/en-us/fabric/data-engineering/get-started-api-livy}{Livy API setup and authorization},
+\href{https://learn.microsoft.com/en-us/fabric/data-science/r-use-sparklyr}{Use sparklyr in Fabric},
+and \href{https://learn.microsoft.com/en-us/fabric/data-engineering/runtime-2-0}{Fabric Runtime 2.0}
 }

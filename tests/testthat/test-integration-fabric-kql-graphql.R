@@ -1,0 +1,1177 @@
+# Fabric integration coverage: KQL analytics queries and the GraphQL API
+# The tests query seeded Eventhouse and Warehouse data in the live sandbox,
+# covering types, parameters, pagination, mutations, and service errors
+
+test_that("inline and deferred Kusto truncation retain typed partial results", {
+  manifest <- fabric_test_manifest()
+  database <- fabric_test_manifest_item(manifest, "TestKQLDatabase")
+  for (deferred in c(FALSE, TRUE)) {
+    error <- rlang::catch_cnd(
+      fabric_kql_query(
+        database$query_service_uri,
+        database = database$database_name,
+        query = "datatable(value:int)[1,2,3]",
+        request_properties = list(
+          truncationmaxrecords = 1L,
+          deferpartialqueryfailures = deferred
+        ),
+        token = fabric_test_token_provider()
+      ),
+      classes = "error"
+    )
+    expect_s3_class(error, "fabric_kql_partial_error")
+    expect_identical(error$partial_data$value, 1L)
+    expect_match(conditionMessage(error), "E_QUERY_RESULT_SET_TOO_LARGE")
+  }
+})
+
+test_that("progressive Kusto queries assemble live table fragments", {
+  manifest <- fabric_test_manifest()
+  database <- fabric_test_manifest_item(manifest, "TestKQLDatabase")
+  result <- fabric_kql_query(
+    database$query_service_uri,
+    database = database$database_name,
+    query = "datatable(value:int)[1,2,3]",
+    request_properties = list(results_progressive_enabled = TRUE),
+    token = fabric_test_token_provider()
+  )
+  expect_identical(result$value, 1:3)
+})
+
+test_that("fabric_kql_query returns typed seeded Eventhouse data", {
+  manifest <- fabric_test_manifest()
+  database <- fabric_test_manifest_item(manifest, "TestKQLDatabase")
+  token <- fabric_test_token_provider()
+  result <- fabric_kql_query(
+    database$query_service_uri,
+    query = paste(
+      database$tables$events,
+      "| order by id asc"
+    ),
+    database = database$database_name,
+    token = token
+  )
+
+  expect_s3_class(result, "tbl_df")
+  expect_named(
+    result,
+    c(
+      "id",
+      "name",
+      "category",
+      "amount",
+      "observed_at",
+      "active",
+      "correlation_id",
+      "metadata"
+    )
+  )
+  expect_equal(result$id, c(1L, 2L, 3L))
+  expect_equal(result$name, c("alpha", "beta", "gamma"))
+  expect_equal(result$category, c("A", "B", "A"))
+  expect_identical(result$amount, c(10.5, 20, NA_real_))
+  expect_s3_class(result$observed_at, "POSIXct")
+  expect_equal(
+    as.Date(result$observed_at),
+    as.Date(c("2026-01-01", "2026-01-02", "2026-01-03"))
+  )
+  expect_equal(result$active, c(TRUE, FALSE, TRUE))
+  expect_equal(
+    result$correlation_id,
+    c(
+      "11111111-1111-1111-1111-111111111111",
+      "22222222-2222-2222-2222-222222222222",
+      "33333333-3333-3333-3333-333333333333"
+    )
+  )
+  expect_equal(result$metadata[[1L]]$source, "sandbox")
+  expect_equal(result$metadata[[1L]]$rank, 1L)
+
+  exact_longs <- fabric_kql_query(
+    database$query_service_uri,
+    query = "print a=long(10000000000), b=long(10000000001), c=long(1000000000000001), d=long(-1000000000000001)",
+    database = database$database_name,
+    token = token
+  )
+  expect_identical(
+    vapply(exact_longs, as.character, character(1)),
+    c(
+      a = "10000000000",
+      b = "10000000001",
+      c = "1000000000000001",
+      d = "-1000000000000001"
+    )
+  )
+
+  exact_decimal <- fabric_kql_query(
+    database$query_service_uri,
+    query = paste0(
+      "print positive=decimal(1234567890123456789.123456789012345), ",
+      "negative=decimal(-1234567890123456789.123456789012345)"
+    ),
+    database = database$database_name,
+    token = token
+  )
+  expect_identical(
+    exact_decimal$positive,
+    "1234567890123456789.123456789012345"
+  )
+  expect_identical(
+    exact_decimal$negative,
+    "-1234567890123456789.123456789012345"
+  )
+})
+
+test_that("fabric_kql_read_table reads projected seeded Eventhouse data", {
+  manifest <- fabric_test_manifest()
+  database <- fabric_test_manifest_item(manifest, "TestKQLDatabase")
+  rows <- fabric_kql_read_table(
+    database$query_service_uri,
+    database$tables$events,
+    database = database$database_name,
+    columns = c("id", "name", "amount"),
+    limit = 3,
+    token = fabric_test_token_provider()
+  )
+  rows <- rows[order(rows$id), ]
+
+  expect_s3_class(rows, "tbl_df")
+  expect_named(rows, c("id", "name", "amount"))
+  expect_equal(rows$id, 1:3)
+  expect_equal(rows$name, c("alpha", "beta", "gamma"))
+  expect_equal(rows$amount, c(10.5, 20, NA_real_))
+})
+
+test_that("fabric_kql_tables discovers seeded Eventhouse metadata", {
+  manifest <- fabric_test_manifest()
+  database <- fabric_test_manifest_item(manifest, "TestKQLDatabase")
+  tables <- fabric_kql_tables(
+    database$query_service_uri,
+    database = database$database_name,
+    detail = TRUE,
+    token = fabric_test_token_provider()
+  )
+  discovered <- tables[
+    tables$name == database$tables$events,
+    ,
+    drop = FALSE
+  ]
+
+  expect_s3_class(discovered, "tbl_df")
+  expect_equal(nrow(discovered), 1L)
+  expect_equal(discovered$database, database$database_name)
+  expect_equal(
+    vapply(discovered$columns[[1L]], `[[`, character(1), "Name"),
+    c(
+      "id",
+      "name",
+      "category",
+      "amount",
+      "observed_at",
+      "active",
+      "correlation_id",
+      "metadata"
+    )
+  )
+})
+
+test_that("fabric_kql_query discovers targets and binds safe parameters", {
+  manifest <- fabric_test_manifest()
+  provisioned <- fabric_test_manifest_item(manifest, "TestKQLDatabase")
+  kusto_token <- fabric_test_token("FABRIC_TEST_KUSTO_TOKEN")
+  target <- fabric_item(
+    manifest$workspace_id,
+    provisioned$id,
+    type = "KQLDatabase",
+    token = fabric_test_token("FABRIC_TEST_API_TOKEN")
+  )
+
+  selected <- fabric_kql_query(
+    target,
+    query = paste(
+      "declare query_parameters(selected_category:string);",
+      provisioned$tables$events,
+      "| where category == selected_category",
+      "| order by id asc"
+    ),
+    parameters = list(selected_category = "A"),
+    token = kusto_token
+  )
+  expect_equal(selected$id, c(1L, 3L))
+
+  localized <- withr::with_options(
+    list(OutDec = ","),
+    fabric_kql_query(
+      target,
+      query = paste(
+        "declare query_parameters(value:real, elapsed:timespan);",
+        "print value=value, elapsed_seconds=elapsed / 1s"
+      ),
+      parameters = list(
+        value = 1.5,
+        elapsed = as.difftime(1.5, units = "secs")
+      ),
+      token = kusto_token
+    )
+  )
+  expect_equal(localized$value, 1.5)
+  expect_equal(localized$elapsed_seconds, 1.5)
+
+  hostile <- fabric_kql_query(
+    target,
+    query = paste(
+      "declare query_parameters(selected_name:string);",
+      provisioned$tables$events,
+      "| where name == selected_name"
+    ),
+    parameters = list(
+      selected_name = "alpha'; drop table fabricqueryr_events; --"
+    ),
+    token = kusto_token
+  )
+  expect_s3_class(hostile, "tbl_df")
+  expect_equal(nrow(hostile), 0L)
+
+  still_present <- fabric_kql_query(
+    target,
+    query = paste(provisioned$tables$events, "| count"),
+    token = kusto_token
+  )
+  expect_equal(as.numeric(still_present$Count), 3)
+
+  empty_dynamic <- fabric_kql_query(
+    target,
+    query = paste(
+      "declare query_parameters(selected:dynamic, options:dynamic);",
+      "print selected_count=array_length(selected),",
+      "option_count=array_length(bag_keys(options))"
+    ),
+    parameters = list(
+      selected = character(),
+      options = setNames(list(), character())
+    ),
+    token = kusto_token
+  )
+  expect_equal(empty_dynamic$selected_count, 0L)
+  expect_equal(empty_dynamic$option_count, 0L)
+
+  fractional_input <- structure(
+    1767225600 + 2^-21,
+    class = c("POSIXct", "POSIXt"),
+    tzone = "UTC"
+  )
+  fractional <- fabric_kql_query(
+    target,
+    query = paste(
+      "declare query_parameters(value:datetime);",
+      "print value=value,",
+      "matches=value == datetime(2026-01-01T00:00:00.0000005Z)"
+    ),
+    parameters = list(value = fractional_input),
+    token = kusto_token
+  )
+  expect_true(fractional$matches)
+  expect_identical(
+    writeBin(as.double(fractional$value), raw(), endian = .Platform$endian),
+    writeBin(as.double(fractional_input), raw(), endian = .Platform$endian)
+  )
+})
+
+test_that("fabric_kql_query preserves exact dynamic numeric parameters in Fabric", {
+  manifest <- fabric_test_manifest()
+  database <- fabric_test_manifest_item(manifest, "TestKQLDatabase")
+  result <- fabric_kql_query(
+    database$query_service_uri,
+    query = paste(
+      "declare query_parameters(scalar:real, values:dynamic, object:dynamic);",
+      "print scalar_matches=toreal(values[0]) == scalar,",
+      "below_matches=toreal(values[1]) == real(0.99999999999999989),",
+      "above_matches=toreal(values[2]) == real(1.0000000000000002),",
+      "small_matches=toreal(values[3]) == real(2.2250738585072014e-308),",
+      "large_matches=toreal(values[4]) == real(1.7976931348623157e308),",
+      "integer_matches=toreal(values[5]) == real(9007199254740994),",
+      "negative_zero_matches=(1.0 / toreal(values[6])) == real(-inf),",
+      "nested_matches=toreal(object.nested.value) == -scalar,",
+      "value=toreal(values[0])"
+    ),
+    database = database$database_name,
+    parameters = list(
+      scalar = pi,
+      values = c(
+        pi,
+        1 - .Machine$double.eps / 2,
+        1 + .Machine$double.eps,
+        .Machine$double.xmin,
+        .Machine$double.xmax,
+        2^53 + 2,
+        -0
+      ),
+      object = list(nested = list(value = -pi))
+    ),
+    token = fabric_test_token_provider()
+  )
+
+  expect_identical(
+    unname(unlist(result[grepl("_matches$", names(result))])),
+    rep(TRUE, 8L)
+  )
+  expect_identical(result$value, pi)
+})
+
+test_that("fabric_kql_query preserves scientific scalar parameters in Fabric", {
+  manifest <- fabric_test_manifest()
+  database <- fabric_test_manifest_item(manifest, "TestKQLDatabase")
+  values <- c(
+    as.numeric("0x1.a4a3bd7d8804dp+709"),
+    as.numeric("-0x1.92be36a62eeeep+787"),
+    1e-200,
+    .Machine$double.xmax
+  )
+  result <- fabric_kql_query(
+    database$query_service_uri,
+    query = paste(
+      "declare query_parameters(a:real, b:real, small:real, large:real, elapsed:timespan);",
+      "print a_matches=a == real(4.425243029857038e213),",
+      "b_matches=b == real(-1.280544414187844e237),",
+      "small_matches=small == real(1e-200),",
+      "large_matches=large == real(1.7976931348623157e308),",
+      "a=a, b=b, small=small, large=large, elapsed_seconds=elapsed / 1s"
+    ),
+    database = database$database_name,
+    parameters = c(
+      stats::setNames(as.list(values), c("a", "b", "small", "large")),
+      list(elapsed = as.difftime(5e-7, units = "secs"))
+    ),
+    token = fabric_test_token_provider()
+  )
+
+  expect_identical(
+    unname(unlist(result[grepl("_matches$", names(result))])),
+    rep(TRUE, 4L)
+  )
+  expect_identical(
+    unname(unlist(result[c("a", "b", "small", "large")])),
+    values
+  )
+  expect_identical(result$elapsed_seconds, 5e-7)
+})
+
+test_that("fabric_kql_query returns multiple live primary tables", {
+  manifest <- fabric_test_manifest()
+  database <- fabric_test_manifest_item(manifest, "TestKQLDatabase")
+  table <- database$tables$events
+  result <- fabric_kql_query(
+    database$query_service_uri,
+    query = paste0(
+      table,
+      " | summarize row_count=count(); ",
+      table,
+      " | summarize amount_sum=sum(amount)"
+    ),
+    database = database$database_name,
+    token = fabric_test_token("FABRIC_TEST_KUSTO_TOKEN")
+  )
+
+  expect_s3_class(result, "fabric_kql_tables")
+  expect_length(result, 2L)
+  expect_equal(as.numeric(result[[1L]]$row_count), 3)
+  expect_equal(result[[2L]]$amount_sum, 30.5)
+})
+
+test_that("fabric_kql_query surfaces live Kusto service errors", {
+  manifest <- fabric_test_manifest()
+  database <- fabric_test_manifest_item(manifest, "TestKQLDatabase")
+  expect_error(
+    fabric_kql_query(
+      database$query_service_uri,
+      query = "fabricqueryr_table_that_does_not_exist | take 1",
+      database = database$database_name,
+      token = fabric_test_token("FABRIC_TEST_KUSTO_TOKEN")
+    ),
+    "(?i)(failed|HTTP 4)"
+  )
+})
+
+test_that("tracked Eventhouse ingestion completes and prevents duplicates", {
+  manifest <- fabric_test_manifest()
+  database <- fabric_test_manifest_item(manifest, "TestKQLDatabase")
+  lakehouse <- fabric_test_manifest_item(manifest, "TestLakehouse")
+  token <- fabric_test_token_provider()
+  table <- database$tables$ingestion %||% "fabricqueryr_ingestion"
+  mapping <- database$mappings$ingestion_csv %||%
+    "fabricqueryr_ingestion_csv"
+  source <- paste0(
+    lakehouse$one_lake_files_path,
+    "/fixtures/basic.csv;token=",
+    token(.fabric_audience$storage)
+  )
+  idempotency_key <- paste0(
+    "fabricqueryr-priority7-",
+    format(Sys.time(), "%Y%m%d%H%M%OS6", tz = "UTC"),
+    "-",
+    Sys.getpid()
+  )
+  count_rows <- function() {
+    result <- fabric_kql_query(
+      database$query_service_uri,
+      query = paste(table, "| count"),
+      database = database$database_name,
+      token = token
+    )
+    as.numeric(result$Count)
+  }
+  before <- count_rows()
+
+  ingestion <- fabric_kql_ingest(
+    database,
+    table = table,
+    sources = source,
+    format = "csv",
+    source_ids = kusto_ingestion_source_id(),
+    raw_sizes = 66,
+    mapping = mapping,
+    tags = "fabricqueryr-integration",
+    ingest_if_not_exists = idempotency_key,
+    ignore_first_record = TRUE,
+    skip_batching = TRUE,
+    token = token
+  )
+  expect_s3_class(ingestion, "fabric_kql_ingestion")
+  expect_true(fabric_is_guid(ingestion$sources$source_id))
+  expect_true(
+    paste0("ingest-by:", idempotency_key) %in% ingestion$tags
+  )
+
+  status <- fabric_kql_ingestion_status(
+    ingestion,
+    wait = TRUE,
+    timeout = 600,
+    poll_interval = 2
+  )
+  expect_equal(status$state, "Succeeded")
+  expect_true(status$complete)
+  expect_equal(status$succeeded, 1)
+  expect_equal(status$details$source_id, ingestion$sources$source_id)
+
+  recovered <- fabric_kql_ingestion_status(
+    ingestion$id,
+    cluster = database,
+    table = table,
+    token = token
+  )
+  resumed <- fabric_kql_ingestion_status(
+    unserialize(serialize(recovered, NULL)),
+    token = token
+  )
+  expect_equal(
+    fabric_kql_ingestion_status(resumed, wait = TRUE)$state,
+    "Succeeded"
+  )
+
+  rows <- fabric_kql_query(
+    database$query_service_uri,
+    query = paste(table, "| order by id asc"),
+    database = database$database_name,
+    token = token
+  )
+  expect_equal(nrow(rows), before + 3)
+  expect_true(all(c("alpha", "beta", "gamma") %in% rows$name))
+
+  duplicate <- fabric_kql_ingest(
+    database,
+    table = table,
+    sources = source,
+    format = "csv",
+    source_ids = kusto_ingestion_source_id(),
+    raw_sizes = 66,
+    mapping = mapping,
+    ingest_if_not_exists = idempotency_key,
+    ignore_first_record = TRUE,
+    skip_batching = TRUE,
+    token = token
+  )
+  duplicate_status <- fabric_kql_ingestion_status(
+    duplicate,
+    wait = TRUE,
+    timeout = 600,
+    poll_interval = 2,
+    error_on_failure = FALSE
+  )
+  expect_true(duplicate_status$complete)
+  expect_gt(duplicate_status$failed, 0)
+  expect_equal(count_rows(), before + 3)
+})
+
+test_that("R and lazy Arrow objects write through tracked Eventhouse staging", {
+  manifest <- fabric_test_manifest()
+  fabric_test_require_package("arrow")
+  database <- fabric_test_manifest_item(manifest, "TestKQLDatabase")
+  token <- fabric_test_token_provider()
+  table <- database$tables$ingestion %||% "fabricqueryr_ingestion"
+  nonce <- paste0(
+    format(Sys.time(), "%Y%m%d%H%M%OS6", tz = "UTC"),
+    "-",
+    Sys.getpid()
+  )
+  base_id <- as.integer(as.numeric(Sys.time()) %% 100000000) * 10L
+  frame_category <- paste0("r-frame-", nonce)
+  arrow_category <- paste0("r-arrow-", nonce)
+
+  frame <- data.frame(
+    id = base_id + 1:2,
+    name = c("frame-a", "frame-b"),
+    category = frame_category,
+    amount = c(10.5, 20.5),
+    stringsAsFactors = FALSE
+  )
+  frame_result <- fabric_kql_write_table(
+    database,
+    table = table,
+    data = frame[c("category", "amount", "name", "id")],
+    ingest_if_not_exists = paste0("frame-", nonce),
+    skip_batching = TRUE,
+    timeout = 600,
+    token = token
+  )
+  expect_equal(frame_result$status$state, "Succeeded")
+  expect_equal(frame_result$rows, 2)
+  expect_gt(frame_result$buffer_bytes, 0)
+  expect_true(all(is.na(frame_result$ingestion$sources$raw_size)))
+  expect_false(frame_result$staging_retained)
+  stored <- fabric_kql_query(
+    database,
+    query = paste(
+      "declare query_parameters(category_value:string);",
+      table,
+      "| where category == category_value | project id, name, category, amount",
+      "| order by id asc"
+    ),
+    parameters = list(category_value = frame_category),
+    token = token
+  )
+  expect_equal(as.data.frame(stored), frame, ignore_attr = TRUE)
+
+  dataset_path <- tempfile("fabricqueryr-kql-dataset-")
+  dir.create(dataset_path)
+  on.exit(unlink(dataset_path, recursive = TRUE, force = TRUE), add = TRUE)
+  arrow::write_parquet(
+    data.frame(
+      id = base_id + 3:4,
+      name = c("arrow-a", "arrow-b"),
+      category = arrow_category,
+      amount = c(30.5, 40.5),
+      stringsAsFactors = FALSE
+    ),
+    file.path(dataset_path, "part-1.parquet")
+  )
+  arrow::write_parquet(
+    data.frame(
+      id = base_id + 5L,
+      name = "arrow-c",
+      category = arrow_category,
+      amount = 50.5,
+      stringsAsFactors = FALSE
+    ),
+    file.path(dataset_path, "part-2.parquet")
+  )
+  dataset <- arrow::open_dataset(dataset_path)
+  arrow_result <- fabric_kql_write_table(
+    database,
+    table = table,
+    data = dataset,
+    skip_batching = TRUE,
+    max_rows_per_file = 1,
+    timeout = 600,
+    token = token
+  )
+  expect_equal(arrow_result$status$state, "Succeeded")
+  expect_equal(arrow_result$rows, 3)
+  expect_equal(arrow_result$file_count, 3L)
+  expect_true(all(is.na(arrow_result$ingestion$sources$raw_size)))
+  expect_false(arrow_result$staging_retained)
+
+  rows <- fabric_test_eventually(function() {
+    value <- fabric_kql_query(
+      database,
+      query = paste(
+        "declare query_parameters(frame_category:string,",
+        "arrow_category:string);",
+        table,
+        "| where category == frame_category or category == arrow_category",
+        "| summarize rows=count() by category"
+      ),
+      parameters = list(
+        frame_category = frame_category,
+        arrow_category = arrow_category
+      ),
+      token = token
+    )
+    if (sum(as.numeric(value$rows)) != 5L) {
+      return(NULL)
+    }
+    value
+  })
+  counts <- setNames(as.numeric(rows$rows), rows$category)
+  expect_equal(unname(counts[[frame_category]]), 2)
+  expect_equal(unname(counts[[arrow_category]]), 3)
+})
+
+test_that("R data creates a missing KQL table from its Arrow schema", {
+  manifest <- fabric_test_manifest()
+  fabric_test_require_package("arrow")
+  database <- fabric_test_manifest_item(manifest, "TestKQLDatabase")
+  token <- fabric_test_token_provider()
+  table <- paste0(
+    "fabricqueryr_r_create_",
+    format(Sys.time(), "%Y%m%d%H%M%S", tz = "UTC"),
+    "_",
+    Sys.getpid()
+  )
+  target <- kusto_resolve_target(database)
+  credential <- fabric_credential(token = token)
+  drop_command <- paste(
+    ".drop table",
+    kusto_write_identifier(table, "table"),
+    "ifexists"
+  )
+  drop_table <- function() {
+    kusto_export_management(
+      target,
+      drop_command,
+      credential,
+      deadline = Sys.time() + 60,
+      idempotent = TRUE,
+      operation = "DropCreatedTable"
+    )
+  }
+  try(drop_table(), silent = TRUE)
+  on.exit(try(drop_table(), silent = TRUE), add = TRUE)
+
+  written <- fabric_kql_write_table(
+    database,
+    table,
+    data.frame(
+      id = 1:2,
+      label = c("created-a", "created-b"),
+      amount = c(10.5, 20.5),
+      active = c(TRUE, FALSE),
+      observed_at = as.POSIXct(
+        c("2026-08-14 10:00:00", "2026-08-14 11:00:00"),
+        tz = "UTC"
+      )
+    ),
+    create_if_missing = TRUE,
+    skip_batching = TRUE,
+    timeout = 600,
+    token = token
+  )
+  expect_true(written$table_creation_requested)
+  expect_equal(written$status$state, "Succeeded")
+
+  rows <- fabric_test_eventually(function() {
+    value <- fabric_kql_query(
+      database,
+      query = paste0(
+        kusto_write_identifier(table, "table"),
+        " | project id, label, amount, active | order by id asc"
+      ),
+      token = token
+    )
+    if (nrow(value) != 2L) NULL else value
+  })
+  expect_equal(as.integer(rows$id), 1:2)
+  expect_equal(rows$label, c("created-a", "created-b"))
+  expect_equal(rows$amount, c(10.5, 20.5))
+  expect_equal(rows$active, c(TRUE, FALSE))
+})
+
+test_that("server-side KQL export writes readable Parquet artifacts to OneLake", {
+  manifest <- fabric_test_manifest()
+  fabric_test_require_package("arrow")
+  database <- fabric_test_manifest_item(manifest, "TestKQLDatabase")
+  lakehouse <- fabric_test_manifest_item(manifest, "TestLakehouse")
+  token <- fabric_test_token_provider()
+  root <- paste0(
+    "Files/fabricqueryr-kql-export/",
+    format(Sys.time(), "%Y%m%d%H%M%OS6", tz = "UTC"),
+    "-",
+    Sys.getpid()
+  )
+  destinations <- paste0(
+    "https://onelake.dfs.fabric.microsoft.com/",
+    manifest$workspace_id,
+    "/",
+    lakehouse$id,
+    "/",
+    root,
+    c("/primary", "/secondary")
+  )
+  removed <- FALSE
+  on.exit(
+    if (!removed) {
+      try(
+        fabric_onelake_delete(
+          manifest$workspace_id,
+          lakehouse$id,
+          root,
+          recursive = TRUE,
+          confirm = TRUE,
+          token = token
+        ),
+        silent = TRUE
+      )
+    },
+    add = TRUE
+  )
+
+  exported <- fabric_kql_export(
+    database,
+    query = paste(
+      database$tables$events,
+      "| project id, name, category, amount"
+    ),
+    destination = destinations,
+    format = "parquet",
+    name_prefix = "events",
+    compression_type = "snappy",
+    timeout = 600,
+    poll_interval = 2,
+    token = token
+  )
+  expect_s3_class(exported, "fabric_kql_export_result")
+  expect_equal(exported$state, "Completed")
+  expect_length(exported$destination, 2L)
+  expect_gte(exported$file_count, 1L)
+  expect_equal(as.numeric(exported$records), 3)
+
+  files <- fabric_test_eventually(function() {
+    value <- fabric_onelake_list(
+      manifest$workspace_id,
+      lakehouse$id,
+      path = root,
+      recursive = TRUE,
+      token = token
+    )
+    parquet <- value[
+      !value$is_directory & grepl("[.]parquet$", value$path),
+      ,
+      drop = FALSE
+    ]
+    if (!nrow(parquet)) NULL else parquet
+  })
+  rows <- dplyr::bind_rows(lapply(files$path, function(file) {
+    fabric_onelake_read_file(
+      manifest$workspace_id,
+      lakehouse$id,
+      path = file,
+      format = "parquet",
+      token = token
+    )
+  }))
+  rows <- rows[order(rows$id), , drop = FALSE]
+  expect_equal(rows$id, 1:3)
+  expect_equal(rows$name, c("alpha", "beta", "gamma"))
+  expect_equal(rows$category, c("A", "B", "A"))
+  expect_equal(rows$amount, c(10.5, 20, NA_real_))
+
+  expect_true(fabric_onelake_delete(
+    manifest$workspace_id,
+    lakehouse$id,
+    root,
+    recursive = TRUE,
+    confirm = TRUE,
+    token = token
+  ))
+  removed <- TRUE
+})
+
+test_that("fabric_graphql_query executes variables and preserves nulls", {
+  manifest <- fabric_test_manifest()
+  provisioned <- fabric_test_manifest_item(manifest, "TestGraphQL")
+  auth <- fabric_test_azure_auth_config()
+  api <- fabric_item(
+    manifest$workspace_id,
+    provisioned$id,
+    type = "GraphQLApi",
+    tenant_id = auth$tenant_id,
+    client_id = auth$client_id,
+    auth_args = auth$auth_args
+  )
+  expect_equal(api$graphql_endpoint, provisioned$endpoint)
+  expect_null(api$workspaceApiEndpoint)
+  root_field <- provisioned$root_field
+
+  result <- api$query(
+    query = paste(
+      "query Filtered($category: String!) {",
+      paste0("  ", root_field, "("),
+      "    filter: {category: {eq: $category}},",
+      "    orderBy: {id: ASC}",
+      "  ) {",
+      "    items { id name category amount loaded_at }",
+      "    hasNextPage",
+      "    endCursor",
+      "  }",
+      "}"
+    ),
+    variables = list(category = "A"),
+    operation_name = "Filtered",
+    error_policy = "error"
+  )
+
+  expect_s3_class(result, "fabric_graphql_result")
+  expect_length(result$errors, 0L)
+  expect_length(result$data[[root_field]]$items, 2L)
+  expect_equal(
+    vapply(
+      result$data[[root_field]]$items,
+      `[[`,
+      integer(1),
+      "id"
+    ),
+    c(1L, 3L)
+  )
+  expect_equal(
+    vapply(
+      result$data[[root_field]]$items,
+      `[[`,
+      character(1),
+      "name"
+    ),
+    c("alpha", "gamma")
+  )
+  expect_identical(result$data[[root_field]]$items[[1L]]$amount, "10.50")
+  expect_null(result$data[[root_field]]$items[[2L]]$amount)
+})
+
+test_that("GraphQL discovery by workspace name uses workspace-specific endpoints", {
+  manifest <- fabric_test_manifest()
+  provisioned <- fabric_test_manifest_item(manifest, "TestGraphQL")
+  auth <- fabric_test_azure_auth_config()
+  api <- fabric_item(
+    manifest$workspace_name,
+    provisioned$id,
+    type = "GraphQLApi",
+    tenant_id = auth$tenant_id,
+    client_id = auth$client_id,
+    auth_args = auth$auth_args
+  )
+  expect_match(api$workspaceApiEndpoint, "^https://")
+  expect_equal(
+    api$graphql_endpoint,
+    sub(
+      "^https://api[.]fabric[.]microsoft[.]com",
+      sub("/+$", "", api$workspaceApiEndpoint),
+      provisioned$endpoint
+    )
+  )
+
+  result <- api$query("{ __typename }", error_policy = "error")
+  expect_length(result$errors, 0L)
+  expect_identical(result$data$`__typename`, "Query")
+})
+
+test_that("disabled Fabric GraphQL introspection reports its setting", {
+  manifest <- fabric_test_manifest()
+  api <- fabric_test_manifest_item(manifest, "TestGraphQL")
+  auth <- fabric_test_azure_auth_config()
+  endpoint <- Sys.getenv("FABRIC_TEST_GRAPHQL_DISABLED_ENDPOINT")
+  if (!nzchar(endpoint)) {
+    endpoint <- api$endpoint
+  }
+  outcome <- expect_error(
+    fabric_graphql_schema(
+      endpoint,
+      tenant_id = auth$tenant_id,
+      client_id = auth$client_id,
+      auth_args = auth$auth_args
+    ),
+    class = "fabric_graphql_introspection_error"
+  )
+  expect_match(outcome$message, "API Settings > Introspection", fixed = TRUE)
+  expect_length(outcome$errors, 1L)
+  expect_identical(outcome$errors[[1L]]$extensions$code, "HC0046")
+})
+
+test_that("enabled Fabric GraphQL introspection resolves collection type references", {
+  endpoint <- fabric_test_feature_environment(
+    "introspection",
+    "FABRIC_TEST_GRAPHQL_INTROSPECTION_ENDPOINT"
+  )
+  root <- fabric_test_feature_environment(
+    "introspection",
+    "FABRIC_TEST_GRAPHQL_INTROSPECTION_ROOT"
+  )
+  fabric_test_manifest()
+  auth <- fabric_test_azure_auth_config()
+  token <- fabric_credential(
+    tenant_id = auth$tenant_id,
+    client_id = auth$client_id,
+    auth_args = auth$auth_args
+  )
+  schema <- fabric_graphql_schema(endpoint, token = token)
+  expect_s3_class(schema, "fabric_graphql_schema")
+  types <- stats::setNames(
+    schema$types,
+    vapply(schema$types, `[[`, character(1), "name")
+  )
+  unwrap <- function(type) {
+    while (type$kind %in% c("NON_NULL", "LIST")) {
+      expect_type(type$ofType, "list")
+      type <- type$ofType
+    }
+    expect_true(type$name %in% names(types))
+    types[[type$name]]
+  }
+  query <- types[[schema$queryType$name]]
+  field <- Filter(function(field) identical(field$name, root), query$fields)
+  expect_length(field, 1L)
+  collection <- unwrap(field[[1L]]$type)
+  items <- Filter(
+    function(field) identical(field$name, "items"),
+    collection$fields
+  )
+  expect_length(items, 1L)
+  row_type <- unwrap(items[[1L]]$type)
+  expect_identical(row_type$kind, "OBJECT")
+  pages <- fabric_graphql_paginate(
+    endpoint,
+    query = paste0(
+      "query($after: String) { ",
+      root,
+      "(first: 2, after: $after) { items { __typename } hasNextPage endCursor } }"
+    ),
+    variables = list(after = NULL),
+    next_cursor = fabric_graphql_cursor(root),
+    token = token,
+    error_policy = "error"
+  )
+  rows <- fabric_graphql_collect(pages, c(root, "items"))
+  expect_true(attr(rows, "complete"))
+  expect_gt(nrow(rows), 0L)
+  expect_true(all(rows$`__typename` == row_type$name))
+})
+
+test_that("Fabric GraphQL cursor pagination traverses every seeded row", {
+  manifest <- fabric_test_manifest()
+  api <- fabric_test_manifest_item(manifest, "TestGraphQL")
+  token <- fabric_test_token_provider()
+  root_field <- api$root_field
+  pages <- fabric_graphql_paginate(
+    api$endpoint,
+    query = paste(
+      "query Paged($first: Int!, $after: String) {",
+      paste0("  ", root_field, "("),
+      "    first: $first, after: $after, orderBy: {id: ASC}",
+      "  ) {",
+      "    items { id name amount }",
+      "    hasNextPage",
+      "    endCursor",
+      "  }",
+      "}"
+    ),
+    variables = list(first = 2L, after = NULL),
+    operation_name = "Paged",
+    next_cursor = fabric_graphql_cursor(root_field),
+    error_policy = "error",
+    token = token,
+    audience = "https://api.fabric.microsoft.com/.default"
+  )
+  items <- unlist(
+    lapply(
+      pages$pages,
+      function(page) page$data[[root_field]]$items
+    ),
+    recursive = FALSE
+  )
+
+  expect_s3_class(pages, "fabric_graphql_pages")
+  expect_true(pages$complete)
+  expect_length(pages$pages, 2L)
+  expect_equal(vapply(items, `[[`, integer(1), "id"), c(1L, 2L, 3L))
+  expect_equal(
+    vapply(items, `[[`, character(1), "name"),
+    c("alpha", "beta", "gamma")
+  )
+
+  rows <- fabric_graphql_collect(pages, c(root_field, "items"))
+  expect_s3_class(rows, "fabric_graphql_rows")
+  expect_identical(rows$id, c(1L, 2L, 3L))
+  expect_identical(rows$name, c("alpha", "beta", "gamma"))
+  expect_identical(rows$amount, c("10.50", "20.00", NA_character_))
+  expect_true(attr(rows, "complete"))
+  expect_identical(attr(rows, "page_count"), 2L)
+  expect_length(attr(rows, "errors"), 0L)
+})
+
+test_that("Fabric GraphQL executes a live mutation", {
+  manifest <- fabric_test_manifest()
+  api <- fabric_test_manifest_item(manifest, "TestGraphQL")
+  warehouse <- fabric_test_manifest_item(manifest, "TestWarehouse")
+  token <- fabric_test_token_provider()
+  sql_token <- fabric_test_token("FABRIC_TEST_SQL_TOKEN")
+  con <- fabric_sql_connect(
+    warehouse$connection_string,
+    database = warehouse$database_name,
+    token = sql_token,
+    verbose = FALSE
+  )
+  on.exit(
+    {
+      try(
+        DBI::dbExecute(
+          con,
+          "DELETE FROM dbo.fabricqueryr_graphql WHERE id = -99"
+        ),
+        silent = TRUE
+      )
+      try(DBI::dbDisconnect(con), silent = TRUE)
+    },
+    add = TRUE
+  )
+  DBI::dbExecute(
+    con,
+    "DELETE FROM dbo.fabricqueryr_graphql WHERE id = -99"
+  )
+
+  result <- fabric_graphql_query(
+    api$endpoint,
+    query = paste0(
+      "mutation CreateFixture {",
+      "  ",
+      api$create_field,
+      "(",
+      "    item: {",
+      "      id: -99,",
+      '      name: "mutation",',
+      '      category: "M",',
+      "      amount: 12.5,",
+      '      loaded_at: "2026-01-01T00:00:00Z"',
+      "    }",
+      "  ) { __typename }",
+      "}"
+    ),
+    operation_name = "CreateFixture",
+    error_policy = "error",
+    token = token,
+    audience = "https://api.fabric.microsoft.com/.default"
+  )
+
+  expect_equal(
+    result$data[[api$create_field]]$`__typename`,
+    "DbOperationResult"
+  )
+  created <- DBI::dbGetQuery(
+    con,
+    paste(
+      "SELECT id, name, category, amount",
+      "FROM dbo.fabricqueryr_graphql",
+      "WHERE id = -99"
+    )
+  )
+  expect_equal(created$id, -99L)
+  expect_equal(created$name, "mutation")
+  expect_equal(created$category, "M")
+  expect_equal(as.numeric(created$amount), 12.5)
+  read_fixture <- DBI::dbGetQuery(
+    con,
+    "SELECT COUNT(*) AS n, SUM(amount) AS total FROM dbo.fabricqueryr_sql_types"
+  )
+  expect_equal(read_fixture$n, 3L)
+  expect_equal(as.numeric(read_fixture$total), 30.5)
+})
+
+test_that("Fabric GraphQL surfaces schema and authentication failures", {
+  manifest <- fabric_test_manifest()
+  api <- fabric_test_manifest_item(manifest, "TestGraphQL")
+  token <- fabric_test_token_provider()
+
+  invalid_query <- fabric_graphql_query(
+    api$endpoint,
+    query = "{ fabricqueryr_field_that_does_not_exist }",
+    token = token,
+    audience = "https://api.fabric.microsoft.com/.default"
+  )
+  expect_null(invalid_query$data)
+  expect_gt(length(invalid_query$errors), 0L)
+  expect_match(invalid_query$errors[[1L]]$message, "(?i)(field|query)")
+
+  expect_error(
+    fabric_graphql_query(
+      api$endpoint,
+      query = "{ __typename }",
+      token = "fabricqueryr-invalid-token"
+    ),
+    "HTTP (401|403)"
+  )
+})
+test_that("live KQL dynamic JSON-looking strings retain their types", {
+  manifest <- fabric_test_manifest()
+  database <- fabric_test_manifest_item(manifest, "TestKQLDatabase")
+  value <- fabric_kql_query(
+    database$query_service_uri,
+    database = database$database_name,
+    token = fabric_test_token_provider(),
+    query = paste0(
+      'print n=dynamic("123"), b=dynamic("true"), ',
+      'z=dynamic("null"), a=dynamic("[1,2]"), actual=dynamic([1,2])'
+    )
+  )
+  expect_identical(value$n[[1L]], "123")
+  expect_identical(value$b[[1L]], "true")
+  expect_identical(value$z[[1L]], "null")
+  expect_identical(value$a[[1L]], "[1,2]")
+  expect_type(value$actual[[1L]], "list")
+})
+test_that("Storage multipart writes refresh every source before ingestion", {
+  manifest <- fabric_test_manifest()
+  fabric_test_require_package("arrow")
+  database <- fabric_test_manifest_item(manifest, "TestKQLDatabase")
+  token <- fabric_test_token_provider()
+  target <- kusto_resolve_target(database)
+  credential <- fabric_credential(token = token)
+  table <- paste0("fabricqueryr_storage_", Sys.getpid())
+  on.exit(
+    try(
+      kusto_export_management(
+        target,
+        paste(".drop table", table, "ifexists"),
+        credential,
+        deadline = Sys.time() + 60,
+        idempotent = TRUE,
+        operation = "StorageTestCleanup"
+      ),
+      silent = TRUE
+    ),
+    add = TRUE
+  )
+  original_configuration <- kusto_ingestion_configuration
+  configuration_calls <- 0L
+  local_mocked_bindings(kusto_ingestion_configuration = function(...) {
+    config <- original_configuration(...)
+    configuration_calls <<- configuration_calls + 1L
+    expect_gt(length(config$storage_containers), 0L)
+    config$preferred_upload_method <- "Storage"
+    config$lake_folders <- character()
+    config$refresh_interval <- 0.01
+    config
+  })
+  written <- fabric_kql_write_table(
+    database,
+    table,
+    data.frame(id = 1:2),
+    create_if_missing = TRUE,
+    max_rows_per_file = 1,
+    skip_batching = TRUE,
+    timeout = 600,
+    token = token
+  )
+  expect_identical(written$status$state, "Succeeded")
+  expect_equal(written$file_count, 2L)
+  expect_gt(configuration_calls, 2L)
+  expect_identical(written$staging_retained, FALSE)
+  expect_identical(
+    any(grepl("onelake", written$staging_paths, fixed = TRUE)),
+    FALSE
+  )
+})

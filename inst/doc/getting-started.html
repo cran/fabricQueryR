@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta charset="utf-8" />
+<meta name="generator" content="pandoc" />
+<meta http-equiv="X-UA-Compatible" content="IE=EDGE" />
+
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+
+
+
+<title>Get started with ‘fabricQueryR’</title>
+
+<script>// Pandoc 2.9 adds attributes on both header and div. We remove the former (to
+// be compatible with the behavior of Pandoc < 2.8).
+document.addEventListener('DOMContentLoaded', function(e) {
+  var hs = document.querySelectorAll("div.section[class*='level'] > :first-child");
+  var i, h, a;
+  for (i = 0; i < hs.length; i++) {
+    h = hs[i];
+    if (!/^h[1-6]$/i.test(h.tagName)) continue;  // it should be a header h1-h6
+    a = h.attributes;
+    while (a.length > 0) h.removeAttribute(a[0].name);
+  }
+});
+</script>
+
+<style type="text/css">
+code{white-space: pre-wrap;}
+span.smallcaps{font-variant: small-caps;}
+span.underline{text-decoration: underline;}
+div.column{display: inline-block; vertical-align: top; width: 50%;}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+</style>
+
+
+
+<style type="text/css">
+code {
+white-space: pre;
+}
+.sourceCode {
+overflow: visible;
+}
+</style>
+<style type="text/css" data-origin="pandoc">
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+{ counter-reset: source-line 0; }
+pre.numberSource code > span
+{ position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+{ content: counter(source-line);
+position: relative; left: -1em; text-align: right; vertical-align: baseline;
+border: none; display: inline-block;
+-webkit-touch-callout: none; -webkit-user-select: none;
+-khtml-user-select: none; -moz-user-select: none;
+-ms-user-select: none; user-select: none;
+padding: 0 4px; width: 4em;
+color: #aaaaaa;
+}
+pre.numberSource { margin-left: 3em; border-left: 1px solid #aaaaaa; padding-left: 4px; }
+div.sourceCode
+{ }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+code span.al { color: #ff0000; font-weight: bold; } 
+code span.an { color: #60a0b0; font-weight: bold; font-style: italic; } 
+code span.at { color: #7d9029; } 
+code span.bn { color: #40a070; } 
+code span.bu { color: #008000; } 
+code span.cf { color: #007020; font-weight: bold; } 
+code span.ch { color: #4070a0; } 
+code span.cn { color: #880000; } 
+code span.co { color: #60a0b0; font-style: italic; } 
+code span.cv { color: #60a0b0; font-weight: bold; font-style: italic; } 
+code span.do { color: #ba2121; font-style: italic; } 
+code span.dt { color: #902000; } 
+code span.dv { color: #40a070; } 
+code span.er { color: #ff0000; font-weight: bold; } 
+code span.ex { } 
+code span.fl { color: #40a070; } 
+code span.fu { color: #06287e; } 
+code span.im { color: #008000; font-weight: bold; } 
+code span.in { color: #60a0b0; font-weight: bold; font-style: italic; } 
+code span.kw { color: #007020; font-weight: bold; } 
+code span.op { color: #666666; } 
+code span.ot { color: #007020; } 
+code span.pp { color: #bc7a00; } 
+code span.sc { color: #4070a0; } 
+code span.ss { color: #bb6688; } 
+code span.st { color: #4070a0; } 
+code span.va { color: #19177c; } 
+code span.vs { color: #4070a0; } 
+code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; } 
+</style>
+<script>
+// apply pandoc div.sourceCode style to pre.sourceCode instead
+(function() {
+  var sheets = document.styleSheets;
+  for (var i = 0; i < sheets.length; i++) {
+    if (sheets[i].ownerNode.dataset["origin"] !== "pandoc") continue;
+    try { var rules = sheets[i].cssRules; } catch (e) { continue; }
+    var j = 0;
+    while (j < rules.length) {
+      var rule = rules[j];
+      // check if there is a div.sourceCode rule
+      if (rule.type !== rule.STYLE_RULE || rule.selectorText !== "div.sourceCode") {
+        j++;
+        continue;
+      }
+      var style = rule.style.cssText;
+      // check if color or background-color is set
+      if (rule.style.color === '' && rule.style.backgroundColor === '') {
+        j++;
+        continue;
+      }
+      // replace div.sourceCode by a pre.sourceCode rule
+      sheets[i].deleteRule(j);
+      sheets[i].insertRule('pre.sourceCode{' + style + '}', j);
+    }
+  }
+})();
+</script>
+
+
+
+
+<style type="text/css">body {
+background-color: #fff;
+margin: 1em auto;
+max-width: 700px;
+overflow: visible;
+padding-left: 2em;
+padding-right: 2em;
+font-family: "Open Sans", "Helvetica Neue", Helvetica, Arial, sans-serif;
+font-size: 14px;
+line-height: 1.35;
+}
+#TOC {
+clear: both;
+margin: 0 0 10px 10px;
+padding: 4px;
+width: 400px;
+border: 1px solid #CCCCCC;
+border-radius: 5px;
+background-color: #f6f6f6;
+font-size: 13px;
+line-height: 1.3;
+}
+#TOC .toctitle {
+font-weight: bold;
+font-size: 15px;
+margin-left: 5px;
+}
+#TOC ul {
+padding-left: 40px;
+margin-left: -1.5em;
+margin-top: 5px;
+margin-bottom: 5px;
+}
+#TOC ul ul {
+margin-left: -2em;
+}
+#TOC li {
+line-height: 16px;
+}
+table {
+margin: 1em auto;
+border-width: 1px;
+border-color: #DDDDDD;
+border-style: outset;
+border-collapse: collapse;
+}
+table th {
+border-width: 2px;
+padding: 5px;
+border-style: inset;
+}
+table td {
+border-width: 1px;
+border-style: inset;
+line-height: 18px;
+padding: 5px 5px;
+}
+table, table th, table td {
+border-left-style: none;
+border-right-style: none;
+}
+table thead, table tr.even {
+background-color: #f7f7f7;
+}
+p {
+margin: 0.5em 0;
+}
+blockquote {
+background-color: #f6f6f6;
+padding: 0.25em 0.75em;
+}
+hr {
+border-style: solid;
+border: none;
+border-top: 1px solid #777;
+margin: 28px 0;
+}
+dl {
+margin-left: 0;
+}
+dl dd {
+margin-bottom: 13px;
+margin-left: 13px;
+}
+dl dt {
+font-weight: bold;
+}
+ul {
+margin-top: 0;
+}
+ul li {
+list-style: circle outside;
+}
+ul ul {
+margin-bottom: 0;
+}
+pre, code {
+background-color: #f7f7f7;
+border-radius: 3px;
+color: #333;
+white-space: pre-wrap; 
+}
+pre {
+border-radius: 3px;
+margin: 5px 0px 10px 0px;
+padding: 10px;
+}
+pre:not([class]) {
+background-color: #f7f7f7;
+}
+code {
+font-family: Consolas, Monaco, 'Courier New', monospace;
+font-size: 85%;
+}
+p > code, li > code {
+padding: 2px 0px;
+}
+div.figure {
+text-align: center;
+}
+img {
+background-color: #FFFFFF;
+padding: 2px;
+border: 1px solid #DDDDDD;
+border-radius: 3px;
+border: 1px solid #CCCCCC;
+margin: 0 5px;
+}
+h1 {
+margin-top: 0;
+font-size: 35px;
+line-height: 40px;
+}
+h2 {
+border-bottom: 4px solid #f7f7f7;
+padding-top: 10px;
+padding-bottom: 2px;
+font-size: 145%;
+}
+h3 {
+border-bottom: 2px solid #f7f7f7;
+padding-top: 10px;
+font-size: 120%;
+}
+h4 {
+border-bottom: 1px solid #f7f7f7;
+margin-left: 8px;
+font-size: 105%;
+}
+h5, h6 {
+border-bottom: 1px solid #ccc;
+font-size: 105%;
+}
+a {
+color: #0033dd;
+text-decoration: none;
+}
+a:hover {
+color: #6666ff; }
+a:visited {
+color: #800080; }
+a:visited:hover {
+color: #BB00BB; }
+a[href^="http:"] {
+text-decoration: underline; }
+a[href^="https:"] {
+text-decoration: underline; }
+
+code > span.kw { color: #555; font-weight: bold; } 
+code > span.dt { color: #902000; } 
+code > span.dv { color: #40a070; } 
+code > span.bn { color: #d14; } 
+code > span.fl { color: #d14; } 
+code > span.ch { color: #d14; } 
+code > span.st { color: #d14; } 
+code > span.co { color: #888888; font-style: italic; } 
+code > span.ot { color: #007020; } 
+code > span.al { color: #ff0000; font-weight: bold; } 
+code > span.fu { color: #900; font-weight: bold; } 
+code > span.er { color: #a61717; background-color: #e3d2d2; } 
+</style>
+
+
+
+
+</head>
+
+<body>
+
+
+
+
+<h1 class="title toc-ignore">Get started with ‘fabricQueryR’</h1>
+
+
+
+<p>Microsoft Fabric is a collection of services for storing,
+transforming, and reporting on data. ‘fabricQueryR’ lets you work with
+many of those services from R: you can read Fabric data, send R data to
+Fabric, and start work that runs inside Fabric.</p>
+<p>This guide introduces the basic Fabric concepts and completes one
+small read. Start here if you are new to either Fabric or
+‘fabricQueryR’, then continue to a task-specific vignette.</p>
+<div id="the-fabric-objects-you-will-see" class="section level2">
+<h2>The Fabric objects you will see</h2>
+<p>A <em>workspace</em> is a shared area that contains Fabric items. An
+<em>item</em> is a resource inside a workspace, such as a Lakehouse,
+Warehouse, semantic model, or notebook.</p>
+<p>The most common data items have different purposes:</p>
+<table>
+<colgroup>
+<col width="33%" />
+<col width="33%" />
+<col width="33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Item</th>
+<th>Think of it as</th>
+<th>A common R task</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Lakehouse</td>
+<td>Files plus managed data tables</td>
+<td>Read or write a table or file</td>
+</tr>
+<tr class="even">
+<td>Warehouse</td>
+<td>A relational SQL database</td>
+<td>Query or load business tables</td>
+</tr>
+<tr class="odd">
+<td>Eventhouse</td>
+<td>A database for event and time-series data</td>
+<td>Query with KQL or ingest events</td>
+</tr>
+<tr class="even">
+<td>Semantic model</td>
+<td>Report-ready tables, relationships, and calculations</td>
+<td>Query with DAX or refresh the model</td>
+</tr>
+<tr class="odd">
+<td>API for GraphQL</td>
+<td>A structured API in front of Fabric data</td>
+<td>Request selected fields</td>
+</tr>
+</tbody>
+</table>
+<p><em>OneLake</em> is the storage layer shared by Fabric items. In a
+Lakehouse, the <code>Files/</code> area contains ordinary files and the
+<code>Tables/</code> area contains managed Delta tables. Delta is a
+storage format that supports efficient reads and writes, schema
+evolution, and transactional consistency.</p>
+</div>
+<div id="sign-in" class="section level2">
+<h2>Sign in</h2>
+<p>This guide uses APIs available in ‘fabricQueryR’ 1.0.0 and later.
+Install the package, load it, and set your organization’s Microsoft
+Entra tenant ID:</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb1-1"><a href="#cb1-1" tabindex="-1"></a><span class="fu">install.packages</span>(<span class="st">&quot;fabricQueryR&quot;</span>)</span>
+<span id="cb1-2"><a href="#cb1-2" tabindex="-1"></a></span>
+<span id="cb1-3"><a href="#cb1-3" tabindex="-1"></a><span class="fu">library</span>(fabricQueryR)</span>
+<span id="cb1-4"><a href="#cb1-4" tabindex="-1"></a><span class="fu">Sys.setenv</span>(<span class="at">FABRICQUERYR_TENANT_ID =</span> <span class="st">&quot;&lt;your-tenant-id&gt;&quot;</span>)</span></code></pre></div>
+<p>The first Fabric call may open a browser. Sign in with the same work
+or school account that you use in the Fabric portal.</p>
+<p>If your organization requires an approved application, your
+administrator may also give you a client ID to set as
+<code>FABRICQUERYR_CLIENT_ID</code>.</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb2-1"><a href="#cb2-1" tabindex="-1"></a><span class="co"># Run this only when your administrator supplies a client ID:</span></span>
+<span id="cb2-2"><a href="#cb2-2" tabindex="-1"></a><span class="fu">Sys.setenv</span>(<span class="at">FABRICQUERYR_CLIENT_ID =</span> <span class="st">&quot;&lt;your-app-client-id&gt;&quot;</span>)</span></code></pre></div>
+<p>The <a href="authentication.html">authentication vignette</a>
+explains this setup and the different ways to authenticate in more
+detail.</p>
+</div>
+<div id="find-a-workspace-and-an-item" class="section level2">
+<h2>Find a workspace and an item</h2>
+<p>Start by listing the workspaces that your account can access:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb3-1"><a href="#cb3-1" tabindex="-1"></a><span class="co"># List all workspaces you can access</span></span>
+<span id="cb3-2"><a href="#cb3-2" tabindex="-1"></a>workspaces <span class="ot">&lt;-</span> <span class="fu">fabric_workspaces</span>()</span></code></pre></div>
+<p>The result is a list of <code>FabricWorkspace</code> R6 objects. Each
+object keeps the workspace fields returned by Fabric and provides
+discovery methods. For example, <code>$items()</code> corresponds to
+<code>fabric_items()</code>, and <code>$lakehouses()</code> corresponds
+to <code>fabric_lakehouses()</code>. If the list is empty, check that
+your account has been granted access to a workspace in the Fabric
+portal. If the list is not empty, select a specific workspace:</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb4-1"><a href="#cb4-1" tabindex="-1"></a><span class="co"># Select the first workspace in the list</span></span>
+<span id="cb4-2"><a href="#cb4-2" tabindex="-1"></a>workspace <span class="ot">&lt;-</span> workspaces[[<span class="dv">1</span><span class="dt">L</span>]]</span>
+<span id="cb4-3"><a href="#cb4-3" tabindex="-1"></a>workspace<span class="sc">$</span>displayName</span></code></pre></div>
+<p>For a script that will run repeatedly, selecting by exact name is
+more robust:</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb5-1"><a href="#cb5-1" tabindex="-1"></a><span class="co"># Select a workspace by name</span></span>
+<span id="cb5-2"><a href="#cb5-2" tabindex="-1"></a>workspaces <span class="ot">&lt;-</span> <span class="fu">fabric_workspaces</span>()</span>
+<span id="cb5-3"><a href="#cb5-3" tabindex="-1"></a>matches <span class="ot">&lt;-</span> <span class="fu">Filter</span>(</span>
+<span id="cb5-4"><a href="#cb5-4" tabindex="-1"></a>  \(x) <span class="fu">identical</span>(x<span class="sc">$</span>displayName, <span class="st">&quot;Analytics workspace&quot;</span>),</span>
+<span id="cb5-5"><a href="#cb5-5" tabindex="-1"></a>  workspaces</span>
+<span id="cb5-6"><a href="#cb5-6" tabindex="-1"></a>)</span>
+<span id="cb5-7"><a href="#cb5-7" tabindex="-1"></a><span class="fu">stopifnot</span>(<span class="fu">length</span>(matches) <span class="sc">==</span> <span class="dv">1</span><span class="dt">L</span>)</span>
+<span id="cb5-8"><a href="#cb5-8" tabindex="-1"></a>workspace <span class="ot">&lt;-</span> matches[[<span class="dv">1</span><span class="dt">L</span>]]</span></code></pre></div>
+<p>Now list all items with <code>$items()</code>
+(<code>fabric_items()</code>), or ask directly for Lakehouses with
+<code>$lakehouses()</code> (<code>fabric_lakehouses()</code>):</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb6-1"><a href="#cb6-1" tabindex="-1"></a><span class="co"># List all items in the workspace</span></span>
+<span id="cb6-2"><a href="#cb6-2" tabindex="-1"></a>items <span class="ot">&lt;-</span> workspace<span class="sc">$</span><span class="fu">items</span>()</span>
+<span id="cb6-3"><a href="#cb6-3" tabindex="-1"></a>items</span>
+<span id="cb6-4"><a href="#cb6-4" tabindex="-1"></a></span>
+<span id="cb6-5"><a href="#cb6-5" tabindex="-1"></a><span class="co"># The generic interface also filters types without a typed convenience method</span></span>
+<span id="cb6-6"><a href="#cb6-6" tabindex="-1"></a>reports <span class="ot">&lt;-</span> workspace<span class="sc">$</span><span class="fu">items</span>(<span class="at">type =</span> <span class="st">&quot;Report&quot;</span>)</span>
+<span id="cb6-7"><a href="#cb6-7" tabindex="-1"></a></span>
+<span id="cb6-8"><a href="#cb6-8" tabindex="-1"></a><span class="co"># List only Lakehouses in the workspace</span></span>
+<span id="cb6-9"><a href="#cb6-9" tabindex="-1"></a>lakehouses <span class="ot">&lt;-</span> workspace<span class="sc">$</span><span class="fu">lakehouses</span>()</span>
+<span id="cb6-10"><a href="#cb6-10" tabindex="-1"></a>lakehouse <span class="ot">&lt;-</span> lakehouses[[<span class="dv">1</span><span class="dt">L</span>]]</span>
+<span id="cb6-11"><a href="#cb6-11" tabindex="-1"></a>lakehouse<span class="sc">$</span>displayName</span></code></pre></div>
+<p>A discovered item is a read-only R6 object. Read its Fabric metadata
+through fields such as <code>$displayName</code>, <code>$type</code>,
+and <code>$id</code>; methods matched to its type perform the useful
+next actions. For example, a <code>FabricLakehouse</code> provides
+<code>$tables()</code> (<code>fabric_lakehouse_tables()</code>),
+<code>$read_table()</code> (<code>fabric_lakehouse_read_table()</code>),
+and <code>$write_table()</code>
+(<code>fabric_lakehouse_write_table()</code>), plus OneLake, SQL, and
+Livy methods. Use <code>$as_list()</code> or <code>as.list()</code> only
+when another interface specifically requires a plain record. The typed
+workspace methods are an intentional convenience subset of Fabric’s
+larger item catalog. <code>$items(type = ...)</code> can discover other
+service types; those items retain all returned fields as generic
+<code>FabricItem</code> objects when the package has no
+workload-specific subclass.</p>
+</div>
+<div id="complete-a-first-read" class="section level2">
+<h2>Complete a first read</h2>
+<p>If the workspace contains a Lakehouse, reading one managed table is a
+simple first workflow. Use <code>$tables()</code>
+(<code>fabric_lakehouse_tables()</code>) to discover its tables and
+<code>$read_table()</code> (<code>fabric_lakehouse_read_table()</code>)
+to read one:</p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb7-1"><a href="#cb7-1" tabindex="-1"></a><span class="co"># List the tables in the Lakehouse</span></span>
+<span id="cb7-2"><a href="#cb7-2" tabindex="-1"></a>tables <span class="ot">&lt;-</span> lakehouse<span class="sc">$</span><span class="fu">tables</span>()</span>
+<span id="cb7-3"><a href="#cb7-3" tabindex="-1"></a>tables[<span class="fu">c</span>(<span class="st">&quot;schema&quot;</span>, <span class="st">&quot;name&quot;</span>, <span class="st">&quot;type&quot;</span>)]</span>
+<span id="cb7-4"><a href="#cb7-4" tabindex="-1"></a></span>
+<span id="cb7-5"><a href="#cb7-5" tabindex="-1"></a><span class="co"># Select the first table and read a small number of rows</span></span>
+<span id="cb7-6"><a href="#cb7-6" tabindex="-1"></a>first_table <span class="ot">&lt;-</span> tables[<span class="dv">1</span><span class="dt">L</span>, ]</span>
+<span id="cb7-7"><a href="#cb7-7" tabindex="-1"></a>rows <span class="ot">&lt;-</span> lakehouse<span class="sc">$</span><span class="fu">read_table</span>(</span>
+<span id="cb7-8"><a href="#cb7-8" tabindex="-1"></a>  first_table,</span>
+<span id="cb7-9"><a href="#cb7-9" tabindex="-1"></a>  <span class="at">limit =</span> <span class="dv">100</span><span class="dt">L</span></span>
+<span id="cb7-10"><a href="#cb7-10" tabindex="-1"></a>)</span>
+<span id="cb7-11"><a href="#cb7-11" tabindex="-1"></a></span>
+<span id="cb7-12"><a href="#cb7-12" tabindex="-1"></a><span class="co"># Show the first few rows</span></span>
+<span id="cb7-13"><a href="#cb7-13" tabindex="-1"></a><span class="fu">head</span>(rows)</span></code></pre></div>
+<p>The result is a tibble, which can be used with base R, ‘dplyr’,
+plotting packages, or other familiar R tools. <code>limit = 100L</code>
+keeps this first request small while you confirm that access and table
+selection are correct.</p>
+<p>This direct Delta read uses Python through ‘reticulate’. The first
+read may download the required runtime and packages. Use
+<code>fabric_delta_config()</code> to inspect requirements, or
+<code>fabric_delta_config(initialize = TRUE)</code> to prepare the
+runtime before reading. Direct reads also need OneLake data access; use
+SQL or Spark if the table uses an unsupported Delta feature. The <a href="reading-data.html">reading guide</a> explains these choices.</p>
+</div>
+<div id="choose-the-next-guide" class="section level2">
+<h2>Choose the next guide</h2>
+<p>There are often several valid ways to move the same data. The
+vignettes below compare the options and show how to use them. Continue
+with one of the following vignettes:</p>
+<ul>
+<li><a href="reading-data.html">Bring Fabric data into R</a> compares
+SQL, Lakehouse, Warehouse, Eventhouse, semantic-model, OneLake-file,
+GraphQL, and Spark reads</li>
+<li><a href="ingesting-data.html">Bring R data into Microsoft Fabric</a>
+compares ways to send an R object or an existing file to Fabric</li>
+<li><a href="onelake-and-lakehouse.html">Working with Fabric Lakehouses
+and OneLake</a> explains Lakehouse files and tables in more detail</li>
+<li><a href="spark-with-livy.html">Working with Livy (Spark)</a>
+introduces remote Spark work after the simpler read and write paths</li>
+</ul>
+</div>
+
+
+
+<!-- code folding -->
+
+
+<!-- dynamically load mathjax for compatibility with self-contained -->
+<script>
+  (function () {
+    var script = document.createElement("script");
+    script.type = "text/javascript";
+    script.src  = "https://mathjax.rstudio.com/latest/MathJax.js?config=TeX-AMS-MML_HTMLorMML";
+    document.getElementsByTagName("head")[0].appendChild(script);
+  })();
+</script>
+
+</body>
+</html>

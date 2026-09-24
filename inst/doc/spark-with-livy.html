@@ -1,0 +1,678 @@
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta charset="utf-8" />
+<meta name="generator" content="pandoc" />
+<meta http-equiv="X-UA-Compatible" content="IE=EDGE" />
+
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+
+
+
+<title>Working with Livy (Spark)</title>
+
+<script>// Pandoc 2.9 adds attributes on both header and div. We remove the former (to
+// be compatible with the behavior of Pandoc < 2.8).
+document.addEventListener('DOMContentLoaded', function(e) {
+  var hs = document.querySelectorAll("div.section[class*='level'] > :first-child");
+  var i, h, a;
+  for (i = 0; i < hs.length; i++) {
+    h = hs[i];
+    if (!/^h[1-6]$/i.test(h.tagName)) continue;  // it should be a header h1-h6
+    a = h.attributes;
+    while (a.length > 0) h.removeAttribute(a[0].name);
+  }
+});
+</script>
+
+<style type="text/css">
+code{white-space: pre-wrap;}
+span.smallcaps{font-variant: small-caps;}
+span.underline{text-decoration: underline;}
+div.column{display: inline-block; vertical-align: top; width: 50%;}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+</style>
+
+
+
+<style type="text/css">
+code {
+white-space: pre;
+}
+.sourceCode {
+overflow: visible;
+}
+</style>
+<style type="text/css" data-origin="pandoc">
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+{ counter-reset: source-line 0; }
+pre.numberSource code > span
+{ position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+{ content: counter(source-line);
+position: relative; left: -1em; text-align: right; vertical-align: baseline;
+border: none; display: inline-block;
+-webkit-touch-callout: none; -webkit-user-select: none;
+-khtml-user-select: none; -moz-user-select: none;
+-ms-user-select: none; user-select: none;
+padding: 0 4px; width: 4em;
+color: #aaaaaa;
+}
+pre.numberSource { margin-left: 3em; border-left: 1px solid #aaaaaa; padding-left: 4px; }
+div.sourceCode
+{ }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+code span.al { color: #ff0000; font-weight: bold; } 
+code span.an { color: #60a0b0; font-weight: bold; font-style: italic; } 
+code span.at { color: #7d9029; } 
+code span.bn { color: #40a070; } 
+code span.bu { color: #008000; } 
+code span.cf { color: #007020; font-weight: bold; } 
+code span.ch { color: #4070a0; } 
+code span.cn { color: #880000; } 
+code span.co { color: #60a0b0; font-style: italic; } 
+code span.cv { color: #60a0b0; font-weight: bold; font-style: italic; } 
+code span.do { color: #ba2121; font-style: italic; } 
+code span.dt { color: #902000; } 
+code span.dv { color: #40a070; } 
+code span.er { color: #ff0000; font-weight: bold; } 
+code span.ex { } 
+code span.fl { color: #40a070; } 
+code span.fu { color: #06287e; } 
+code span.im { color: #008000; font-weight: bold; } 
+code span.in { color: #60a0b0; font-weight: bold; font-style: italic; } 
+code span.kw { color: #007020; font-weight: bold; } 
+code span.op { color: #666666; } 
+code span.ot { color: #007020; } 
+code span.pp { color: #bc7a00; } 
+code span.sc { color: #4070a0; } 
+code span.ss { color: #bb6688; } 
+code span.st { color: #4070a0; } 
+code span.va { color: #19177c; } 
+code span.vs { color: #4070a0; } 
+code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; } 
+</style>
+<script>
+// apply pandoc div.sourceCode style to pre.sourceCode instead
+(function() {
+  var sheets = document.styleSheets;
+  for (var i = 0; i < sheets.length; i++) {
+    if (sheets[i].ownerNode.dataset["origin"] !== "pandoc") continue;
+    try { var rules = sheets[i].cssRules; } catch (e) { continue; }
+    var j = 0;
+    while (j < rules.length) {
+      var rule = rules[j];
+      // check if there is a div.sourceCode rule
+      if (rule.type !== rule.STYLE_RULE || rule.selectorText !== "div.sourceCode") {
+        j++;
+        continue;
+      }
+      var style = rule.style.cssText;
+      // check if color or background-color is set
+      if (rule.style.color === '' && rule.style.backgroundColor === '') {
+        j++;
+        continue;
+      }
+      // replace div.sourceCode by a pre.sourceCode rule
+      sheets[i].deleteRule(j);
+      sheets[i].insertRule('pre.sourceCode{' + style + '}', j);
+    }
+  }
+})();
+</script>
+
+
+
+
+<style type="text/css">body {
+background-color: #fff;
+margin: 1em auto;
+max-width: 700px;
+overflow: visible;
+padding-left: 2em;
+padding-right: 2em;
+font-family: "Open Sans", "Helvetica Neue", Helvetica, Arial, sans-serif;
+font-size: 14px;
+line-height: 1.35;
+}
+#TOC {
+clear: both;
+margin: 0 0 10px 10px;
+padding: 4px;
+width: 400px;
+border: 1px solid #CCCCCC;
+border-radius: 5px;
+background-color: #f6f6f6;
+font-size: 13px;
+line-height: 1.3;
+}
+#TOC .toctitle {
+font-weight: bold;
+font-size: 15px;
+margin-left: 5px;
+}
+#TOC ul {
+padding-left: 40px;
+margin-left: -1.5em;
+margin-top: 5px;
+margin-bottom: 5px;
+}
+#TOC ul ul {
+margin-left: -2em;
+}
+#TOC li {
+line-height: 16px;
+}
+table {
+margin: 1em auto;
+border-width: 1px;
+border-color: #DDDDDD;
+border-style: outset;
+border-collapse: collapse;
+}
+table th {
+border-width: 2px;
+padding: 5px;
+border-style: inset;
+}
+table td {
+border-width: 1px;
+border-style: inset;
+line-height: 18px;
+padding: 5px 5px;
+}
+table, table th, table td {
+border-left-style: none;
+border-right-style: none;
+}
+table thead, table tr.even {
+background-color: #f7f7f7;
+}
+p {
+margin: 0.5em 0;
+}
+blockquote {
+background-color: #f6f6f6;
+padding: 0.25em 0.75em;
+}
+hr {
+border-style: solid;
+border: none;
+border-top: 1px solid #777;
+margin: 28px 0;
+}
+dl {
+margin-left: 0;
+}
+dl dd {
+margin-bottom: 13px;
+margin-left: 13px;
+}
+dl dt {
+font-weight: bold;
+}
+ul {
+margin-top: 0;
+}
+ul li {
+list-style: circle outside;
+}
+ul ul {
+margin-bottom: 0;
+}
+pre, code {
+background-color: #f7f7f7;
+border-radius: 3px;
+color: #333;
+white-space: pre-wrap; 
+}
+pre {
+border-radius: 3px;
+margin: 5px 0px 10px 0px;
+padding: 10px;
+}
+pre:not([class]) {
+background-color: #f7f7f7;
+}
+code {
+font-family: Consolas, Monaco, 'Courier New', monospace;
+font-size: 85%;
+}
+p > code, li > code {
+padding: 2px 0px;
+}
+div.figure {
+text-align: center;
+}
+img {
+background-color: #FFFFFF;
+padding: 2px;
+border: 1px solid #DDDDDD;
+border-radius: 3px;
+border: 1px solid #CCCCCC;
+margin: 0 5px;
+}
+h1 {
+margin-top: 0;
+font-size: 35px;
+line-height: 40px;
+}
+h2 {
+border-bottom: 4px solid #f7f7f7;
+padding-top: 10px;
+padding-bottom: 2px;
+font-size: 145%;
+}
+h3 {
+border-bottom: 2px solid #f7f7f7;
+padding-top: 10px;
+font-size: 120%;
+}
+h4 {
+border-bottom: 1px solid #f7f7f7;
+margin-left: 8px;
+font-size: 105%;
+}
+h5, h6 {
+border-bottom: 1px solid #ccc;
+font-size: 105%;
+}
+a {
+color: #0033dd;
+text-decoration: none;
+}
+a:hover {
+color: #6666ff; }
+a:visited {
+color: #800080; }
+a:visited:hover {
+color: #BB00BB; }
+a[href^="http:"] {
+text-decoration: underline; }
+a[href^="https:"] {
+text-decoration: underline; }
+
+code > span.kw { color: #555; font-weight: bold; } 
+code > span.dt { color: #902000; } 
+code > span.dv { color: #40a070; } 
+code > span.bn { color: #d14; } 
+code > span.fl { color: #d14; } 
+code > span.ch { color: #d14; } 
+code > span.st { color: #d14; } 
+code > span.co { color: #888888; font-style: italic; } 
+code > span.ot { color: #007020; } 
+code > span.al { color: #ff0000; font-weight: bold; } 
+code > span.fu { color: #900; font-weight: bold; } 
+code > span.er { color: #a61717; background-color: #e3d2d2; } 
+</style>
+
+
+
+
+</head>
+
+<body>
+
+
+
+
+<h1 class="title toc-ignore">Working with Livy (Spark)</h1>
+
+
+
+<p>Apache Spark processes data using compute that runs in Fabric.
+<em>Livy</em> is the service that lets an R program submit Spark code
+and receive its status and output. The Spark code runs on Fabric; it
+does not run in your local R process.</p>
+<p>Use Spark when a transformation is too large for one computer, needs
+a Spark-specific library or format, or already exists as a Spark
+application. For a small table read, SQL or a direct Lakehouse reader is
+usually simpler and starts faster. This guide begins with one small
+statement, then moves to reusable sessions, complete applications, and
+shared environments.</p>
+<div id="before-the-first-call" class="section level2">
+<h2>Before the first call</h2>
+<p>You need a Fabric workspace on supported capacity, a Lakehouse with a
+Livy endpoint, and the <em>tenant admin setting for the Livy API
+enabled</em>.</p>
+<p>A delegated caller needs all four of these Microsoft Entra
+scopes:</p>
+<ul>
+<li><code>Lakehouse.Execute.All</code></li>
+<li><code>Lakehouse.Read.All</code></li>
+<li><code>Code.AccessFabric.All</code></li>
+<li><code>Code.AccessStorage.All</code></li>
+</ul>
+<p>With delegated sign-in and <code>audience = NULL</code>,
+‘fabricQueryR’ requests those four scopes. The following
+<code>Code.*</code> scopes are optional; add one only when the Spark
+code needs the corresponding Azure service at runtime:</p>
+<table>
+<colgroup>
+<col width="50%" />
+<col width="50%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Optional scope</th>
+<th>Runtime access</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>Code.AccessAzureKeyvault.All</code></td>
+<td>Azure Key Vault secrets, keys, or certificates</td>
+</tr>
+<tr class="even">
+<td><code>Code.AccessAzureDataLake.All</code></td>
+<td>Azure Data Lake Storage Gen1</td>
+</tr>
+<tr class="odd">
+<td><code>Code.AccessAzureDataExplorer.All</code></td>
+<td>Azure Data Explorer (Kusto)</td>
+</tr>
+<tr class="even">
+<td><code>Code.AccessSQL.All</code></td>
+<td>Azure SQL</td>
+</tr>
+</tbody>
+</table>
+<p>Client-credentials authentication instead uses the single
+Fabric/Power BI <code>.default</code> audience selected by the package.
+Microsoft currently documents service-principal (SPN) tokens for session
+jobs. Add that principal to the workspace as a <em>Contributor</em>, and
+confirm that the tenant’s Livy settings allow it; the workspace role
+alone does not guarantee service-side acceptance.</p>
+<p>Microsoft’s current batch guide is internally inconsistent: its
+introduction says Azure SPN is unsupported, while its authentication
+section gives a certificate-based SPN example. ‘fabricQueryR’ can
+acquire and send an app-only token, but it cannot override a
+service-side identity restriction. Verify unattended batch
+authentication in the target tenant and use a delegated user if Fabric
+rejects the SPN.</p>
+<p>The delegated user must be a <em>Contributor</em> in the workspace
+containing the Livy endpoint and data-source items.</p>
+<p>Then, you can discover the Lakehouse item which you want to use Livy
+with:</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb1-1"><a href="#cb1-1" tabindex="-1"></a><span class="fu">library</span>(fabricQueryR)</span>
+<span id="cb1-2"><a href="#cb1-2" tabindex="-1"></a></span>
+<span id="cb1-3"><a href="#cb1-3" tabindex="-1"></a>workspaces <span class="ot">&lt;-</span> <span class="fu">fabric_workspaces</span>()</span>
+<span id="cb1-4"><a href="#cb1-4" tabindex="-1"></a>matches <span class="ot">&lt;-</span> <span class="fu">Filter</span>(</span>
+<span id="cb1-5"><a href="#cb1-5" tabindex="-1"></a>  \(x) <span class="fu">identical</span>(x<span class="sc">$</span>displayName, <span class="st">&quot;Analytics workspace&quot;</span>),</span>
+<span id="cb1-6"><a href="#cb1-6" tabindex="-1"></a>  workspaces</span>
+<span id="cb1-7"><a href="#cb1-7" tabindex="-1"></a>)</span>
+<span id="cb1-8"><a href="#cb1-8" tabindex="-1"></a><span class="fu">stopifnot</span>(<span class="fu">length</span>(matches) <span class="sc">==</span> <span class="dv">1</span><span class="dt">L</span>)</span>
+<span id="cb1-9"><a href="#cb1-9" tabindex="-1"></a>workspace <span class="ot">&lt;-</span> matches[[<span class="dv">1</span><span class="dt">L</span>]]</span>
+<span id="cb1-10"><a href="#cb1-10" tabindex="-1"></a>lakehouse <span class="ot">&lt;-</span> workspace<span class="sc">$</span><span class="fu">lakehouses</span>()[[<span class="dv">1</span><span class="dt">L</span>]]</span></code></pre></div>
+<p><code>$lakehouses()</code> is the workspace method for
+<code>fabric_lakehouses()</code>.</p>
+<p>The discovered <code>FabricLakehouse</code> is a read-only R6 object.
+Its fields expose the service metadata. <code>$livy_query()</code>,
+<code>$livy_session()</code>, and <code>$livy_batch_submit()</code>
+correspond to <code>fabric_livy_query()</code>,
+<code>fabric_livy_session()</code>, and
+<code>fabric_livy_batch_submit()</code>.</p>
+<p>An explicit <code>audience</code> replaces the defaults rather than
+extending them. For example, include all four required scopes when
+adding Azure SQL access. The Lakehouse <code>$livy_query()</code> method
+below calls <code>fabric_livy_query()</code>:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb2-1"><a href="#cb2-1" tabindex="-1"></a>livy_scopes <span class="ot">&lt;-</span> <span class="fu">paste0</span>(</span>
+<span id="cb2-2"><a href="#cb2-2" tabindex="-1"></a>  <span class="fu">paste0</span>(<span class="st">&quot;https&quot;</span>, <span class="st">&quot;://api.fabric.microsoft.com/&quot;</span>),</span>
+<span id="cb2-3"><a href="#cb2-3" tabindex="-1"></a>  <span class="fu">c</span>(</span>
+<span id="cb2-4"><a href="#cb2-4" tabindex="-1"></a>    <span class="st">&quot;Lakehouse.Execute.All&quot;</span>,</span>
+<span id="cb2-5"><a href="#cb2-5" tabindex="-1"></a>    <span class="st">&quot;Lakehouse.Read.All&quot;</span>,</span>
+<span id="cb2-6"><a href="#cb2-6" tabindex="-1"></a>    <span class="st">&quot;Code.AccessFabric.All&quot;</span>,</span>
+<span id="cb2-7"><a href="#cb2-7" tabindex="-1"></a>    <span class="st">&quot;Code.AccessStorage.All&quot;</span>,</span>
+<span id="cb2-8"><a href="#cb2-8" tabindex="-1"></a>    <span class="st">&quot;Code.AccessSQL.All&quot;</span></span>
+<span id="cb2-9"><a href="#cb2-9" tabindex="-1"></a>  )</span>
+<span id="cb2-10"><a href="#cb2-10" tabindex="-1"></a>)</span>
+<span id="cb2-11"><a href="#cb2-11" tabindex="-1"></a></span>
+<span id="cb2-12"><a href="#cb2-12" tabindex="-1"></a><span class="co"># `$livy_query()` is the object interface to `fabric_livy_query()`</span></span>
+<span id="cb2-13"><a href="#cb2-13" tabindex="-1"></a>result <span class="ot">&lt;-</span> lakehouse<span class="sc">$</span><span class="fu">livy_query</span>(</span>
+<span id="cb2-14"><a href="#cb2-14" tabindex="-1"></a>  <span class="at">code =</span> <span class="st">&quot;SELECT * FROM external_sql_table&quot;</span>,</span>
+<span id="cb2-15"><a href="#cb2-15" tabindex="-1"></a>  <span class="at">kind =</span> <span class="st">&quot;sql&quot;</span>,</span>
+<span id="cb2-16"><a href="#cb2-16" tabindex="-1"></a>  <span class="at">audience =</span> livy_scopes</span>
+<span id="cb2-17"><a href="#cb2-17" tabindex="-1"></a>)</span></code></pre></div>
+<p>If discovery cannot retrieve the endpoint in your environment, copy
+the session-job connection string from <em>Lakehouse settings &gt; Livy
+endpoint</em> and pass that URL instead.</p>
+</div>
+<div id="run-one-piece-of-spark-code" class="section level2">
+<h2>Run one piece of Spark code</h2>
+<p><code>$livy_query()</code> (<code>fabric_livy_query()</code>) is the
+simplest method. It starts a temporary session, runs one statement,
+waits, and closes the session:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb3-1"><a href="#cb3-1" tabindex="-1"></a>result <span class="ot">&lt;-</span> lakehouse<span class="sc">$</span><span class="fu">livy_query</span>(</span>
+<span id="cb3-2"><a href="#cb3-2" tabindex="-1"></a>  <span class="at">kind =</span> <span class="st">&quot;sql&quot;</span>,</span>
+<span id="cb3-3"><a href="#cb3-3" tabindex="-1"></a>  <span class="at">code =</span> <span class="st">&quot;SELECT 1 AS id, &#39;hello from Spark&#39; AS message&quot;</span></span>
+<span id="cb3-4"><a href="#cb3-4" tabindex="-1"></a>)</span>
+<span id="cb3-5"><a href="#cb3-5" tabindex="-1"></a></span>
+<span id="cb3-6"><a href="#cb3-6" tabindex="-1"></a>result<span class="sc">$</span>output<span class="sc">$</span>parsed</span></code></pre></div>
+<p>The returned <code>output$parsed</code> value is usually a tibble for
+tabular results, an R object for JSON, or character output for printed
+text.</p>
+</div>
+<div id="choose-the-language-that-matches-the-code" class="section level2">
+<h2>Choose the language that matches the code</h2>
+<p>The <code>kind</code> argument tells Livy how to interpret
+<code>code</code>:</p>
+<p>Microsoft recommends the latest generally available runtime for
+production, currently <a href="https://learn.microsoft.com/en-us/fabric/data-engineering/runtime-2-0">Fabric
+Runtime 2.0 (Spark 4.1)</a>. SparkR still works, but SparkR is
+deprecated upstream in Spark 4.x and may be removed in a future Spark
+release. Microsoft Fabric distributes <a href="https://learn.microsoft.com/en-us/fabric/data-science/r-use-sparklyr"><code>sparklyr</code></a>
+for R-first workloads in notebooks and Spark job definitions. Microsoft
+does not currently document <code>sparklyr</code> over an item-scoped
+Livy session. Choose PySpark or Spark SQL when the remote workload must
+be independent of the current SparkR runtime bridge.</p>
+<table>
+<colgroup>
+<col width="50%" />
+<col width="50%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th><code>kind</code></th>
+<th>Code language</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>&quot;sql&quot;</code></td>
+<td>Spark SQL</td>
+</tr>
+<tr class="even">
+<td><code>&quot;sparkr&quot;</code></td>
+<td>R: SparkR; an experimental sparklyr bridge is described below</td>
+</tr>
+<tr class="odd">
+<td><code>&quot;pyspark&quot;</code></td>
+<td>Python with Spark</td>
+</tr>
+<tr class="even">
+<td><code>&quot;spark&quot;</code></td>
+<td>Scala</td>
+</tr>
+</tbody>
+</table>
+<p>For example, SparkR code can use the active Spark session and
+Lakehouse:</p>
+<p>This again uses <code>$livy_query()</code>
+(<code>fabric_livy_query()</code>):</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb4-1"><a href="#cb4-1" tabindex="-1"></a>result <span class="ot">&lt;-</span> lakehouse<span class="sc">$</span><span class="fu">livy_query</span>(</span>
+<span id="cb4-2"><a href="#cb4-2" tabindex="-1"></a>  <span class="at">kind =</span> <span class="st">&quot;sparkr&quot;</span>,</span>
+<span id="cb4-3"><a href="#cb4-3" tabindex="-1"></a>  <span class="at">code =</span> <span class="fu">paste</span>(</span>
+<span id="cb4-4"><a href="#cb4-4" tabindex="-1"></a>    <span class="st">&quot;df &lt;- sql(&#39;SELECT * FROM orders LIMIT 100&#39;)&quot;</span>,</span>
+<span id="cb4-5"><a href="#cb4-5" tabindex="-1"></a>    <span class="st">&quot;printSchema(df)&quot;</span>,</span>
+<span id="cb4-6"><a href="#cb4-6" tabindex="-1"></a>    <span class="st">&quot;showDF(df, numRows = 10)&quot;</span>,</span>
+<span id="cb4-7"><a href="#cb4-7" tabindex="-1"></a>    <span class="at">sep =</span> <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span></span>
+<span id="cb4-8"><a href="#cb4-8" tabindex="-1"></a>  )</span>
+<span id="cb4-9"><a href="#cb4-9" tabindex="-1"></a>)</span></code></pre></div>
+<p><code>sparklyr</code> is not another Livy <code>kind</code>. The
+following is an experimental adaptation of Fabric’s documented
+notebook/Spark-job <code>&quot;synapse&quot;</code> connection; Microsoft does not
+document it for item-scoped Livy, and ‘fabricQueryR’ does not currently
+live-test it. If you evaluate that bridge in your tenant, sparklyr code
+submitted through Livy still uses <code>kind = &quot;sparkr&quot;</code>:</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb5-1"><a href="#cb5-1" tabindex="-1"></a>result <span class="ot">&lt;-</span> lakehouse<span class="sc">$</span><span class="fu">livy_query</span>(</span>
+<span id="cb5-2"><a href="#cb5-2" tabindex="-1"></a>  <span class="at">kind =</span> <span class="st">&quot;sparkr&quot;</span>,</span>
+<span id="cb5-3"><a href="#cb5-3" tabindex="-1"></a>  <span class="at">code =</span> <span class="fu">paste</span>(</span>
+<span id="cb5-4"><a href="#cb5-4" tabindex="-1"></a>    <span class="st">&quot;library(sparklyr)&quot;</span>,</span>
+<span id="cb5-5"><a href="#cb5-5" tabindex="-1"></a>    <span class="st">&quot;spark_version &lt;- sparkR.version()&quot;</span>,</span>
+<span id="cb5-6"><a href="#cb5-6" tabindex="-1"></a>    <span class="st">&quot;config &lt;- spark_config()&quot;</span>,</span>
+<span id="cb5-7"><a href="#cb5-7" tabindex="-1"></a>    <span class="fu">paste0</span>(</span>
+<span id="cb5-8"><a href="#cb5-8" tabindex="-1"></a>      <span class="st">&quot;sc &lt;- spark_connect(master = &#39;yarn&#39;, version = spark_version, &quot;</span>,</span>
+<span id="cb5-9"><a href="#cb5-9" tabindex="-1"></a>      <span class="st">&quot;spark_home = &#39;/opt/spark&#39;, method = &#39;synapse&#39;, config = config)&quot;</span></span>
+<span id="cb5-10"><a href="#cb5-10" tabindex="-1"></a>    ),</span>
+<span id="cb5-11"><a href="#cb5-11" tabindex="-1"></a>    <span class="st">&quot;orders &lt;- dplyr::tbl(sc, &#39;orders&#39;)&quot;</span>,</span>
+<span id="cb5-12"><a href="#cb5-12" tabindex="-1"></a>    <span class="st">&quot;print(dplyr::collect(head(orders, 10)))&quot;</span>,</span>
+<span id="cb5-13"><a href="#cb5-13" tabindex="-1"></a>    <span class="st">&quot;spark_disconnect(sc)&quot;</span>,</span>
+<span id="cb5-14"><a href="#cb5-14" tabindex="-1"></a>    <span class="at">sep =</span> <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span></span>
+<span id="cb5-15"><a href="#cb5-15" tabindex="-1"></a>  )</span>
+<span id="cb5-16"><a href="#cb5-16" tabindex="-1"></a>)</span></code></pre></div>
+<p>Even when it works, this removes only the application-level
+dependency on SparkR’s DataFrame verbs. It remains dependent on the R
+interpreter and SparkR JVM bridge, so validate it after every runtime
+upgrade and do not treat this example as a supported production
+contract.</p>
+</div>
+<div id="reuse-a-session-for-several-statements" class="section level2">
+<h2>Reuse a session for several statements</h2>
+<p>Starting Spark can take time. Use <code>$livy_session()</code>
+(<code>fabric_livy_session()</code>) when sequential statements need to
+share variables or cached data:</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb6-1"><a href="#cb6-1" tabindex="-1"></a>answer <span class="ot">&lt;-</span> <span class="fu">local</span>({</span>
+<span id="cb6-2"><a href="#cb6-2" tabindex="-1"></a>  session <span class="ot">&lt;-</span> lakehouse<span class="sc">$</span><span class="fu">livy_session</span>()</span>
+<span id="cb6-3"><a href="#cb6-3" tabindex="-1"></a>  <span class="fu">on.exit</span>(session<span class="sc">$</span><span class="fu">close</span>(), <span class="at">add =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb6-4"><a href="#cb6-4" tabindex="-1"></a></span>
+<span id="cb6-5"><a href="#cb6-5" tabindex="-1"></a>  session<span class="sc">$</span><span class="fu">wait</span>()</span>
+<span id="cb6-6"><a href="#cb6-6" tabindex="-1"></a>  session<span class="sc">$</span><span class="fu">run</span>(<span class="st">&quot;shared_value = 40&quot;</span>, <span class="at">kind =</span> <span class="st">&quot;pyspark&quot;</span>)</span>
+<span id="cb6-7"><a href="#cb6-7" tabindex="-1"></a>  answer <span class="ot">&lt;-</span> session<span class="sc">$</span><span class="fu">run</span>(<span class="st">&quot;print(shared_value + 2)&quot;</span>, <span class="at">kind =</span> <span class="st">&quot;pyspark&quot;</span>)</span>
+<span id="cb6-8"><a href="#cb6-8" tabindex="-1"></a>  answer</span>
+<span id="cb6-9"><a href="#cb6-9" tabindex="-1"></a>})</span>
+<span id="cb6-10"><a href="#cb6-10" tabindex="-1"></a>answer<span class="sc">$</span>output<span class="sc">$</span>parsed</span></code></pre></div>
+<p>Always close a session explicitly. R object cleanup does not make a
+network request, so forgetting <code>$close()</code> can leave Spark
+running. The returned <code>FabricLivySession</code> lifecycle methods
+(<code>$wait()</code>, <code>$run()</code>, and <code>$close()</code>)
+do not have separate free-function wrappers.</p>
+<p>A standard session is right for one R process running a sequence.
+High concurrency is an advanced option for several isolated workloads
+that may share underlying compute; it is not needed for a few statements
+in order.</p>
+</div>
+<div id="submit-a-complete-application-file" class="section level2">
+<h2>Submit a complete application file</h2>
+<p>Use <code>$livy_batch_submit()</code>
+(<code>fabric_livy_batch_submit()</code>) when the work is a repeatable
+Python, R, or Java/Scala script stored in OneLake or ADLS.</p>
+<p>Python and Java batch applications have produced the expected output
+in the package’s persistent Fabric sandbox. Standalone R batches remain
+experimental: attempts have failed during Spark-context initialization,
+so successful R batch execution has not been established. Validate the
+application’s output in the target runtime before relying on it. Passing
+interactive SparkR statements does not verify this separate batch
+path.</p>
+<p>For example, submit a Python application and wait for completion:</p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb7-1"><a href="#cb7-1" tabindex="-1"></a>batch <span class="ot">&lt;-</span> lakehouse<span class="sc">$</span><span class="fu">livy_batch_submit</span>(</span>
+<span id="cb7-2"><a href="#cb7-2" tabindex="-1"></a>  <span class="at">file =</span> <span class="fu">paste0</span>(</span>
+<span id="cb7-3"><a href="#cb7-3" tabindex="-1"></a>    <span class="st">&quot;abfss://&quot;</span>, workspace<span class="sc">$</span>id,</span>
+<span id="cb7-4"><a href="#cb7-4" tabindex="-1"></a>    <span class="st">&quot;@onelake.dfs.fabric.microsoft.com/&quot;</span>,</span>
+<span id="cb7-5"><a href="#cb7-5" tabindex="-1"></a>    lakehouse<span class="sc">$</span>id,</span>
+<span id="cb7-6"><a href="#cb7-6" tabindex="-1"></a>    <span class="st">&quot;/Files/jobs/daily_transform.py&quot;</span></span>
+<span id="cb7-7"><a href="#cb7-7" tabindex="-1"></a>  ),</span>
+<span id="cb7-8"><a href="#cb7-8" tabindex="-1"></a>  <span class="at">name =</span> <span class="st">&quot;daily-transform&quot;</span>,</span>
+<span id="cb7-9"><a href="#cb7-9" tabindex="-1"></a>  <span class="at">wait =</span> <span class="cn">TRUE</span>,</span>
+<span id="cb7-10"><a href="#cb7-10" tabindex="-1"></a>  <span class="at">timeout =</span> <span class="dv">1800</span></span>
+<span id="cb7-11"><a href="#cb7-11" tabindex="-1"></a>)</span>
+<span id="cb7-12"><a href="#cb7-12" tabindex="-1"></a></span>
+<span id="cb7-13"><a href="#cb7-13" tabindex="-1"></a>batch<span class="sc">$</span><span class="fu">result</span>()</span></code></pre></div>
+<p>The application file must already be available through an ABFS or
+ABFSS path. Percent-encode spaces and other URL-reserved characters in
+file path segments; raw spaces and whitespace in the workspace or
+filesystem authority are invalid. Upload the file with
+<code>$onelake_upload()</code> (<code>fabric_onelake_upload()</code>)
+first when necessary. With <code>wait = FALSE</code>, the function
+returns a <code>FabricLivyBatch</code> object immediately; call its
+<code>$wait()</code>, <code>$result()</code>, or <code>$logs()</code>
+methods later.</p>
+<p>The <code>FabricLivyBatch</code> lifecycle methods
+(<code>$wait()</code>, <code>$result()</code>, <code>$logs()</code>,
+<code>$status()</code>, and <code>$cancel()</code>) do not have separate
+free-function wrappers.</p>
+<p>If a session, statement, or batch wait times out, the
+<code>fabric_livy_timeout_error</code> condition keeps the exact live
+object in its <code>handle</code> field. You can inspect
+<code>$status()</code> through that handle in the current R process. Use
+<code>$close()</code> for a session and <code>$cancel()</code> for a
+statement or batch. <code>fabric_livy_query()</code> attempts to close
+its temporary session on exit, including after a timeout, so that
+session may already be closed. The kind-specific <code>session</code>,
+<code>statement</code>, or <code>batch</code> field contains safe
+metadata for logging; after serialization, a handle intentionally no
+longer carries its credential.</p>
+<p>Livy SQL results have a service-side row limit. The Fabric sandbox
+returned 1,000 rows for <code>SELECT * FROM range(1001)</code> on 7
+September 2026, with a <code>truncated</code> flag. The package raises
+<code>fabric_livy_partial_error</code> for that flag and retains the
+returned rows in <code>partial_data</code>. The limit can vary by
+service configuration. Use bounded queries or write large results to
+OneLake and read them through the table/file APIs for complete
+extraction.</p>
+</div>
+<div id="use-an-environment-for-repeatable-configuration" class="section level2">
+<h2>Use an Environment for repeatable configuration</h2>
+<p>A published Fabric Environment can hold Spark settings and libraries
+shared by several runs. Discover it and pass its ID when the workload
+depends on that configuration:</p>
+<div class="sourceCode" id="cb8"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb8-1"><a href="#cb8-1" tabindex="-1"></a>environment <span class="ot">&lt;-</span> workspace<span class="sc">$</span><span class="fu">environments</span>()[[<span class="dv">1</span><span class="dt">L</span>]]</span>
+<span id="cb8-2"><a href="#cb8-2" tabindex="-1"></a></span>
+<span id="cb8-3"><a href="#cb8-3" tabindex="-1"></a>result <span class="ot">&lt;-</span> lakehouse<span class="sc">$</span><span class="fu">livy_query</span>(</span>
+<span id="cb8-4"><a href="#cb8-4" tabindex="-1"></a>  <span class="at">kind =</span> <span class="st">&quot;pyspark&quot;</span>,</span>
+<span id="cb8-5"><a href="#cb8-5" tabindex="-1"></a>  <span class="at">code =</span> <span class="st">&quot;print(spark.version)&quot;</span>,</span>
+<span id="cb8-6"><a href="#cb8-6" tabindex="-1"></a>  <span class="at">environment_id =</span> environment<span class="sc">$</span>id</span>
+<span id="cb8-7"><a href="#cb8-7" tabindex="-1"></a>)</span></code></pre></div>
+<p><code>$environments()</code> is the workspace method for
+<code>fabric_environments()</code>. The Lakehouse
+<code>$livy_query()</code> method calls
+<code>fabric_livy_query()</code>.</p>
+</div>
+
+
+
+<!-- code folding -->
+
+
+<!-- dynamically load mathjax for compatibility with self-contained -->
+<script>
+  (function () {
+    var script = document.createElement("script");
+    script.type = "text/javascript";
+    script.src  = "https://mathjax.rstudio.com/latest/MathJax.js?config=TeX-AMS-MML_HTMLorMML";
+    document.getElementsByTagName("head")[0].appendChild(script);
+  })();
+</script>
+
+</body>
+</html>
