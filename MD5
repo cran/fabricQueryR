@@ -1,7 +1,7 @@
-08d81507606b1eac62ad0d5c84859026 *DESCRIPTION
+ea52a23f9a615b6cdc3037fa73f213bb *DESCRIPTION
 92e68cf7cc0e717112bde3ebd9278ffc *LICENSE
 a5aad7121e86cc915458b9b34c681e07 *NAMESPACE
-6b98b26933a4fe55620343d4b948c1f6 *NEWS.md
+a9d93634d3cb92639a162463b6d6916d *NEWS.md
 d434aa85d96cbbdbfa2819dfc8f52c69 *R/auth.R
 b523ef201890741932c829521079d02b *R/connection_strings.R
 8345bc62e47757bd58bb3cd1db7a73ed *R/fabricQueryR-package.R
@@ -205,7 +205,7 @@ fa067c7c9720a5cbf738cd77867f6e75 *tests/testthat/test-delta-rs-oracle.R
 b814100fa403873018901ff4c6ca4591 *tests/testthat/test-fabric_catalog.R
 a24ccaddcc0387c5297949542064b94c *tests/testthat/test-fabric_discovery.R
 5d47fe2c8e967ee24e0e94bfdb53b341 *tests/testthat/test-fabric_function_invoke.R
-2cf7163e9badd9b1dec918a52e24aa16 *tests/testthat/test-fabric_graphql_query.R
+53fe84274ac620a7a2658cc644646315 *tests/testthat/test-fabric_graphql_query.R
 105fcff18fa2695d54010c5deda5924e *tests/testthat/test-fabric_item_r6.R
 daf1ea7c126af3d92e145f13ff43a084 *tests/testthat/test-fabric_job_scheduler.R
 14acbde75b482f2bf6d46656e4558244 *tests/testthat/test-fabric_jobs.R
